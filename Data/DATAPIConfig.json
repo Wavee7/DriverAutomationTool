@@ -1,0 +1,12 @@
+{
+  "version": "1.0.0",
+  "apiBaseUrl": "https://api.driverautomationtool.com/api",
+  "endpoints": {
+    "health": "health",
+    "driverReport": "telemetry/driver-report",
+    "biosReport": "telemetry/bios-report",
+    "summary": "telemetry/summary"
+  },
+  "telemetryEnabled": true,
+  "minimumDatVersion": "10.0.0.0"
+}

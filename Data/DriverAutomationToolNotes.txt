@@ -2,7 +2,57 @@ Release Notes
 -----------------------------------
 IMPORTANT
 - DAT Downloads have been moved to GitHub - https://github.com/maurice-daly/DriverAutomationTool
-- Latest build EXEs available from - https://github.com/maurice-daly/DriverAutomationTool/tree/master/Current%20Branch
+
+Version 10.0.21
+Bug Fix
+- Dell Flash64w removed from Dell Configuration Manager BIOS packages due to code change for all other scenarios. Restored.
+
+Version 10.0.20
+Bug Fix
+- Additional handling for Lenovo extract issues due to pre-existing folder path
+New Additions
+- Added warning for long temp file paths
+
+
+Version 10.0.19
+Bug Fixes
+- Known model matching fixes
+- Lenovo applicability/detection script fix
+New Additions
+- BIOS packages are now agnostic of the OS for their naming convention. Migration tool included.
+- Select known models button added
+- Driver Automation Tool API availability check on start up
+
+Version 10.0.18
+Bug fixes
+- Fixed Lenovo OS matching issue
+- Fixed Binary Differential Replication issue
+
+Version 10.0.17
+Microsoft download fixes (source compatibility)
+
+Version 10.0.16
+Update fixes
+
+Version 10.0.15
+Bug fix
+- Fix to auto-update function
+
+Version 10.0.14
+Bug fixes
+- Telemetry Version
+- WIM packaging temp folder / packaging folder not maintained in the temp location
+- HP CMSL PowerShellGet upgrade dependency
+- Dell Extraction - Incorrectly targeted against BIOS packages
+- Content Distribution - Distribution points not previously working, only DP groups.
+- Microsoft Model Selection & Downloads - Source replaced
+- Microsoft Model BIOS updates - blocked as this is controlled within the driver package itself
+
+Version 10.0.11
+Update to Telemetry OS values
+
+Version 10.0.10
+New version released with increased functionality
 
 Version 7.2.5
 Added support for Windows 11 24H2 - Stop gap while 8.0 release is due
