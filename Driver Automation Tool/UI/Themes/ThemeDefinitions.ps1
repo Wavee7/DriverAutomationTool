@@ -70,7 +70,17 @@ $script:Themes = @{
         StatusInfo             = "#0B84F1"
         StatusSuccess          = "#4ADE80"
         StatusWarning          = "#FFAA44"
+        StatusWarningBackground = "#1AFFAA44"
         StatusError            = "#E74856"
+
+        # Info box callouts (auth cards, notes)
+        InfoBoxGreen           = "#4ADE80"
+        InfoBoxGreenBg         = "#1A4ADE80"
+        InfoBoxAmber           = "#FBBF24"
+        InfoBoxAmberBg         = "#1AFBBF24"
+
+        # Driver "N/A" indicator (when no driver package is available for a model)
+        DriverNoPackForeground = "#FFAA44"
 
         # ScrollBar
         ScrollTrack            = "#0F172A"
@@ -128,8 +138,8 @@ $script:Themes = @{
         GridHeader             = "#E3E8EF"
         GridHeaderForeground   = "#1E293B"
         GridBorder             = "#CBD5E1"
-        GridSelection          = "#D0DAEA"
-        GridSelectionForeground = "#0F172A"
+        GridSelection          = "#B3D4F0"
+        GridSelectionForeground = "#0A1628"
 
         # Input -- subtle grey so fields are distinguishable
         InputBackground        = "#F5F7FA"
@@ -158,7 +168,17 @@ $script:Themes = @{
         StatusInfo             = "#0078D4"
         StatusSuccess          = "#107C10"
         StatusWarning          = "#FFAA44"
+        StatusWarningBackground = "#20FFAA44"
         StatusError            = "#E74856"
+
+        # Info box callouts (auth cards, notes)
+        InfoBoxGreen           = "#16A34A"
+        InfoBoxGreenBg         = "#2016A34A"
+        InfoBoxAmber           = "#D97706"
+        InfoBoxAmberBg         = "#20D97706"
+
+        # Driver "N/A" indicator (when no driver package is available for a model)
+        DriverNoPackForeground = "#DC2626"
 
         # ScrollBar
         ScrollTrack            = "#E8ECF1"

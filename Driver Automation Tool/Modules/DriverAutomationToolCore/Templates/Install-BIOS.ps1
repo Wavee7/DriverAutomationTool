@@ -217,7 +217,8 @@ function Compare-BIOSVersion {
     #>
     param (
         [Parameter(Mandatory)][string]$AvailableBIOSVersion,
-        [Parameter(Mandatory)][string]$Manufacturer
+        [Parameter(Mandatory)][string]$Manufacturer,
+        [string]$AvailableReleaseDate
     )
 
     $currentBIOS = $null
@@ -267,15 +268,23 @@ function Compare-BIOSVersion {
         }
         '*Lenovo*' {
             try {
-                # Lenovo uses BIOS release dates in yyyyMMdd or ddMMyyyy format
                 $currentReleaseDate = $currentBIOS.ReleaseDate.ToString('yyyyMMdd')
                 Write-CMTraceLog "Lenovo: Current BIOS release date: $currentReleaseDate"
                 Write-CMTraceLog "Lenovo: Available BIOS version: $AvailableBIOSVersion"
 
-                # Compare version strings -- Lenovo typically embeds date or incremental version
-                if ($AvailableBIOSVersion -gt $currentVersion) {
-                    Write-CMTraceLog "Lenovo: Newer BIOS available"
-                    return $true
+                # Use release date comparison when available (version strings like M43KT32A are not reliably sortable)
+                if (-not [string]::IsNullOrEmpty($AvailableReleaseDate)) {
+                    Write-CMTraceLog "Lenovo: Available BIOS release date: $AvailableReleaseDate"
+                    if ($AvailableReleaseDate -gt $currentReleaseDate) {
+                        Write-CMTraceLog "Lenovo: Newer BIOS available (release date $AvailableReleaseDate > $currentReleaseDate)"
+                        return $true
+                    }
+                } else {
+                    Write-CMTraceLog "Lenovo: No release date provided -- falling back to version string comparison" -Severity 2
+                    if ($AvailableBIOSVersion -gt $currentVersion) {
+                        Write-CMTraceLog "Lenovo: Newer BIOS available (version $AvailableBIOSVersion > $currentVersion)"
+                        return $true
+                    }
                 }
             } catch {
                 Write-CMTraceLog "WARNING: Lenovo BIOS version comparison failed -- $($_.Exception.Message). Proceeding with update." -Severity 2
@@ -372,7 +381,7 @@ try {
     # Compare versions BEFORE prompting the user -- no point showing a toast if
     # the BIOS is already current.
     Write-CMTraceLog "Performing BIOS version comparison..."
-    $updateNeeded = Compare-BIOSVersion -AvailableBIOSVersion '{{Version}}' -Manufacturer $Manufacturer
+    $updateNeeded = Compare-BIOSVersion -AvailableBIOSVersion '{{Version}}' -Manufacturer $Manufacturer -AvailableReleaseDate '{{ReleaseDate}}'
 
     if (-not $updateNeeded) {
         Write-CMTraceLog "BIOS is current -- no update will be applied"
@@ -801,9 +810,54 @@ try {
     } else {
         Write-CMTraceLog "BIOS firmware prestaged successfully"
         if ($flashExitCode -in @(2, 1, 3010)) {
-            $RestartDelaySeconds = 180
-            Write-CMTraceLog "Scheduling system restart in $RestartDelaySeconds seconds to apply BIOS update"
-            shutdown.exe /r /t $RestartDelaySeconds /c "BIOS firmware update prestaged by Driver Automation Tool. Your system will restart in $RestartDelaySeconds seconds to apply the update. Please save your work." /d p:1:18
+            $DisableRestart = {{DISABLE_RESTART}}
+            $RestartDelaySeconds = {{RESTART_DELAY_SECONDS}}
+            $RestartDelayMinutes = [math]::Round($RestartDelaySeconds / 60, 0)
+
+            # -- Admin-configured: Disable Automatic Restart --
+            # When enabled, the BIOS update is prestaged but no restart is initiated.
+            # BitLocker remains suspended until the user manually restarts.
+            if ($DisableRestart) {
+                Write-CMTraceLog "Automatic BIOS restart is DISABLED by admin policy. The update will apply on the next manual reboot."
+                Write-CMTraceLog "NOTE: BitLocker protection remains suspended until the device is restarted."
+                Write-CMTraceLog "=========================================="
+                exit 3010
+            }
+
+            # -- Focus Assist / DND Check Before Restart --
+            # If the user has Focus Assist (Do Not Disturb) active, we must NOT restart
+            # the device regardless of deferral count. The BIOS update is already prestaged
+            # and will apply on the next natural reboot.
+            $focusAssistBlocking = $false
+            try {
+                $focusAssistCSharp = 'using System; using System.Runtime.InteropServices; public class DATFocusAssistRestart { [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state); }'
+                Add-Type -TypeDefinition $focusAssistCSharp -ErrorAction SilentlyContinue
+                $focusState = 0
+                [void][DATFocusAssistRestart]::SHQueryUserNotificationState([ref]$focusState)
+                $focusStateNames = @{
+                    1 = 'QUNS_NOT_PRESENT'; 2 = 'QUNS_BUSY'; 3 = 'QUNS_RUNNING_D3D_FULL_SCREEN'
+                    4 = 'QUNS_PRESENTATION_MODE'; 5 = 'QUNS_ACCEPTS_NOTIFICATIONS'
+                    6 = 'QUNS_QUIET_TIME'; 7 = 'QUNS_APP'
+                }
+                $focusStateName = if ($focusStateNames.ContainsKey($focusState)) { $focusStateNames[$focusState] } else { "Unknown ($focusState)" }
+                Write-CMTraceLog "[FocusAssist] SHQueryUserNotificationState returned: $focusState ($focusStateName)"
+                if ($focusState -ne 5) {
+                    $focusAssistBlocking = $true
+                    Write-CMTraceLog "[FocusAssist] Focus Assist / DND is active -- suppressing automatic restart to avoid interrupting the user" -Severity 2
+                }
+            } catch {
+                Write-CMTraceLog "[FocusAssist] Check failed: $($_.Exception.Message) -- proceeding with restart" -Severity 2
+            }
+
+            if ($focusAssistBlocking) {
+                Write-CMTraceLog "BIOS update prestaged but restart suppressed due to Focus Assist. The update will apply on the next manual reboot."
+                Write-CMTraceLog "=========================================="
+                # Exit 3010 signals soft-reboot-needed to Intune without forcing a restart
+                exit 3010
+            }
+
+            Write-CMTraceLog "Scheduling system restart in $RestartDelayMinutes minute(s) ($RestartDelaySeconds seconds) to apply BIOS update"
+            shutdown.exe /r /t $RestartDelaySeconds /c "BIOS firmware update prestaged by Driver Automation Tool. Your system will restart in $RestartDelayMinutes minute(s) to apply the update. Please save your work." /d p:1:18
             Write-CMTraceLog "Restart scheduled -- shutdown.exe exit code: $LASTEXITCODE"
             Write-CMTraceLog "=========================================="
             exit 3010
