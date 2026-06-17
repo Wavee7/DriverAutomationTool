@@ -4,7 +4,7 @@
      Organization:  MSEndpointMgr / Patch My PC
      Filename:      DriverAutomationToolCore.psm1
      Purpose:       Core functions for Driver Automation Tool v2.0
-     Version:       10.1.1.0
+     Version:       10.1.0.0
     ===========================================================================
 #>
 
@@ -37,8 +37,8 @@ if ($PSVersionTable.PSVersion.Major -le 5) {
 
 #region Variables
 
-[version]$global:ScriptRelease = "10.1.1.0"
-$global:ScriptBuildDate = "17-06-2026"
+[version]$global:ScriptRelease = "10.1.0.0"
+$global:ScriptBuildDate = "11-06-2026"
 $global:ReleaseNotesURL = "https://raw.githubusercontent.com/maurice-daly/DriverAutomationTool/master/Data/DriverAutomationToolNotes.txt"
 $OEMLinksURL = "https://raw.githubusercontent.com/maurice-daly/DriverAutomationTool/master/Data/OEMLinks.xml"
 
@@ -249,11 +249,9 @@ $script:DATTrustedPublisherCNs = @(
     'Dynabook*'
 )
 
-# SHA-256 hash pin for the bundled curl.exe (security fix #23 / #809).
-# Leave empty to require Authenticode validation. Administrators can set a trusted hash
-# at runtime via the 'CurlSHA256Pin' registry value (Settings > External Utilities >
-# Third Party curl), which overrides this value. Official curl.se builds are unsigned,
-# so a pin is the supported way to use a bundled curl.exe.
+# SHA-256 hash pin for the bundled curl.exe (security fix #23).
+# Leave empty to require Authenticode validation; set to the hex hash to allow
+# a known-good unsigned build. Update whenever the bundled curl version changes.
 # Compute with: (Get-FileHash -Algorithm SHA256 -Path '.\Tools\curl.exe').Hash
 [string]$script:DATCurlSHA256Pin = ''
 
@@ -1043,30 +1041,22 @@ function Invoke-DATContentDownload {
             $CurlProcess = $null
             $useCurl = $false
         } else {
-            # Binary is not Authenticode-signed. Official curl.se builds ship unsigned (#809),
-            # so accept the binary only when the operator has pinned a trusted SHA-256 hash
-            # (set in Settings > External Utilities > Third Party curl, or the 'CurlSHA256Pin'
-            # registry value). Otherwise fall back to system curl (security fix #23).
+            # Binary is not Authenticode-signed. Accept only if operator has pinned
+            # an expected SHA-256 hash; otherwise fall back to system curl (security fix #23).
             $sigStatus = if ($curlSig) { $curlSig.Status } else { 'Unknown' }
-            $sigDetail = if ($curlSig -and -not [string]::IsNullOrWhiteSpace($curlSig.StatusMessage)) { $curlSig.StatusMessage } else { 'no additional detail available' }
-            $configuredPin = $script:DATCurlSHA256Pin
-            $regPin = (Get-ItemProperty -Path $global:RegPath -Name 'CurlSHA256Pin' -ErrorAction SilentlyContinue).CurlSHA256Pin
-            if (-not [string]::IsNullOrWhiteSpace($regPin)) { $configuredPin = $regPin }
-            # Normalise: strip spaces/colons admins may paste from hashing tools.
-            $configuredPin = ($configuredPin -replace '[\s:]', '')
-            if (-not [string]::IsNullOrEmpty($configuredPin)) {
+            if (-not [string]::IsNullOrEmpty($script:DATCurlSHA256Pin)) {
                 $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $CurlProcess -ErrorAction SilentlyContinue).Hash
-                if ($actualHash -and $actualHash -eq $configuredPin) {
-                    Write-DATLogEntry -Value "- Bundled CURL is unsigned (status: $sigStatus) but SHA-256 pin matches -- accepted" -Severity 1
+                if ($actualHash -eq $script:DATCurlSHA256Pin) {
+                    Write-DATLogEntry -Value "- Bundled CURL is unsigned ($sigStatus) but SHA-256 pin matches -- accepted" -Severity 1
                 } else {
-                    $pinPrefix    = $configuredPin.Substring(0, [Math]::Min(8, $configuredPin.Length))
+                    $pinPrefix    = $script:DATCurlSHA256Pin.Substring(0, [Math]::Min(8, $script:DATCurlSHA256Pin.Length))
                     $actualPrefix = if ($actualHash) { $actualHash.Substring(0, [Math]::Min(8, $actualHash.Length)) } else { 'n/a' }
                     Write-DATLogEntry -Value "[Warning] - Bundled CURL SHA-256 mismatch (pin: $pinPrefix`u{2026} actual: $actualPrefix`u{2026}) -- falling back to system curl" -Severity 2
                     $CurlProcess = $null
                     $useCurl = $false
                 }
             } else {
-                Write-DATLogEntry -Value "[Warning] - Bundled CURL signature not valid (status: $sigStatus -- $sigDetail). Official curl.se builds are not Authenticode signed; configure a trusted SHA-256 pin (Settings > External Utilities > Third Party curl) to use it. Falling back to system curl." -Severity 2
+                Write-DATLogEntry -Value "[Warning] - Bundled CURL is unsigned ($sigStatus) and no SHA-256 pin is configured -- falling back to system curl" -Severity 2
                 $CurlProcess = $null
                 $useCurl = $false
             }
@@ -1785,8 +1775,9 @@ function Invoke-DATDriverFilePackaging {
                 }
             }
 
+            Write-DATLogEntry -Value "[$OEM] WIM Engine: $wimEngine" -Severity 1 -UpdateUI
+
             # DISM-specific pre-flight: kill orphaned processes and clean stale mounts
-            # (the resolved engine is logged with a friendly name in each capture branch below)
             if ($wimEngine -eq 'dism') {
             # Kill any orphaned DISM/dismhost processes before starting.
             # dismhost.exe is the actual worker - it must be killed first, then dism.exe.
@@ -2777,9 +2768,6 @@ function New-DATConfigMgrPkg {
             $pkgWmi.Version = $Version
             $pkgWmi.Description = $pkgDescription
             $pkgWmi.Priority = $priorityValue
-            # Stamp SourceDate with the current time so the console / Package Management view
-            # reflects when the tool last updated the package, enabling sort/cleanup by age (#806).
-            $pkgWmi.SourceDate = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime((Get-Date))
             $pkgWmi.Put() | Out-Null
             Write-DATLogEntry -Value "- [ConfigMgr] Package $pkgId metadata updated (replication priority: $Priority)" -Severity 1
 
@@ -2886,10 +2874,6 @@ function New-DATConfigMgrPkg {
         $newPkg.MIFVersion = if ($PackageType -eq 'BIOS') { '' } else { "$OS $Architecture" }
         $newPkg.PkgSourceFlag = 2  # Direct source path
         $newPkg.Priority = $priorityValue
-        # Stamp SourceDate so the console / Package Management view shows when the package was
-        # created instead of a blank value, enabling sort/cleanup by age (#806). A directly
-        # created SMS_Package is not auto-stamped by ConfigMgr.
-        $newPkg.SourceDate = [System.Management.ManagementDateTimeConverter]::ToDmtfDateTime((Get-Date))
         $putResult = $newPkg.Put()
         $packageId = $putResult.RelativePath -replace '.*PackageID="([^"]+)".*', '$1'
 
@@ -3858,6 +3842,8 @@ function Start-DATModelProcessing {
                         Set-DATRegistryValue -Name "RunningMode" -Value "BiosNoMatch" -Type String
                     }
                 } else {
+                    Write-DATLogEntry -Value "[BIOS] Matched: $($biosEntry.DisplayName) , Version $($biosEntry.Version), Released $($biosEntry.ReleaseDate)" -Severity 1
+
                     $biosDownloadDir = Join-Path $StoragePath "$oem\$modelName\BIOS"
                     Set-DATRegistryValue -Name "RunningMode" -Value "Download" -Type String
                     $biosFilePath = @(Start-DATBiosDownload -BiosEntry $biosEntry -DownloadDestination $biosDownloadDir -OEM $oem)[-1]
@@ -4289,8 +4275,7 @@ function Export-DATBuildConfig {
         [hashtable]$ConfigMgr,
         [bool]$MaintenanceWindowEnabled = $false,
         [string]$MaintenanceWindowMode = 'Daily',
-        [array]$MaintenanceWindows,
-        [bool]$CleanTempOnExit = $true
+        [array]$MaintenanceWindows
     )
 
     $modelArray = foreach ($m in $Models) {
@@ -4312,7 +4297,6 @@ function Export-DATBuildConfig {
         '$schema'                  = 'BuildConfig schema for Driver Automation Tool headless builds'
         TempPath                   = if ($TempPath) { $TempPath } else { '' }
         PackagePath                = if ($PackagePath) { $PackagePath } else { '' }
-        CleanTempOnExit            = $CleanTempOnExit
         Platform                   = $Platform
         OS                         = if ($OS -match ';') { @($OS -split ';' | Where-Object { $_.Trim() } | ForEach-Object { $_.Trim() }) } else { $OS }
         Architecture               = $Architecture
@@ -4404,7 +4388,6 @@ function Import-DATBuildConfig {
         PackageType               = if ($config.PackageType) { $config.PackageType } else { 'Drivers' }
         TempPath                  = if (-not [string]::IsNullOrEmpty($config.TempPath)) { $config.TempPath } else { $null }
         PackagePath               = if (-not [string]::IsNullOrEmpty($config.PackagePath)) { $config.PackagePath } else { $null }
-        CleanTempOnExit           = if ($null -ne $config.CleanTempOnExit) { [bool]$config.CleanTempOnExit } else { $true }
         DisableToast              = [bool]$config.DisableToast
         ToastTimeoutAction        = if ($config.ToastTimeoutAction) { $config.ToastTimeoutAction } else { 'RemindMeLater' }
         MaxDeferrals              = if ($config.MaxDeferrals) { [int]$config.MaxDeferrals } else { 0 }
@@ -5206,23 +5189,6 @@ New-HPDriverPack -Platform "$PlatformID" -Os "$HPOS" -OSVer "$WindowsBuild" -For
                 throw "No HP SoftPaqs found for any platform ID: $($SKUList -join ', ')"
             }
 
-            # Deduplicate the discovered SoftPaq list, preserving first-seen order. HPCMSL's
-            # WhatIf output can list the same SoftPaq more than once (e.g. HP Hotkey Support,
-            # Intel Video Driver), which previously caused the same package to be downloaded
-            # and extracted twice, inflated the fingerprint, and broke the progress counter
-            # (the per-id process map collides on duplicate concurrent downloads). (#810)
-            $seenSoftPaqIds = [System.Collections.Generic.HashSet[string]]::new()
-            $dedupedSoftPaqIDs = [System.Collections.Generic.List[string]]::new()
-            foreach ($spId in $SoftPaqIDs) {
-                if ($seenSoftPaqIds.Add($spId)) { $dedupedSoftPaqIDs.Add($spId) }
-            }
-            $duplicateSoftPaqCount = $SoftPaqIDs.Count - $dedupedSoftPaqIDs.Count
-            if ($duplicateSoftPaqCount -gt 0) {
-                $dupNoun = if ($duplicateSoftPaqCount -eq 1) { 'entry' } else { 'entries' }
-                Write-DATLogEntry -Value "[HP] Removed $duplicateSoftPaqCount duplicate SoftPaq $dupNoun from discovery list (SP$($dedupedSoftPaqIDs -join ', SP'))" -Severity 2
-            }
-            $SoftPaqIDs = @($dedupedSoftPaqIDs)
-
             # ── SoftPaq fingerprint check: skip rebuild when the list is unchanged ──
             # The discovered SoftPaq set is fingerprinted and compared against the stored
             # manifest. If unchanged (and not forced), the existing package is retained and
@@ -5856,10 +5822,8 @@ New-HPDriverPack -Platform "$PlatformID" -Os "$HPOS" -OSVer "$WindowsBuild" -For
         $proxyParams = Get-DATWebRequestProxy
         $headCheck = Invoke-WebRequest -Uri $downloadURL -Method Head -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop @proxyParams
         if ($headCheck.Headers.'Content-Length') { $mainSizeBytes = [long]$headCheck.Headers.'Content-Length'[0] }
-        # Many OEM/CDN endpoints omit Content-Length on HEAD responses, so only report the
-        # size when the server actually provided one -- a misleading "size: 0 MB" otherwise. (#808)
-        $sizeSuffix = if ($mainSizeBytes -gt 0) { ", size: $([math]::Round($mainSizeBytes / 1MB, 2)) MB" } else { '' }
-        Write-DATLogEntry -Value "[$OEM] URL reachable - HTTP $($headCheck.StatusCode)$sizeSuffix" -Severity 1
+        $expectedSizeMB = if ($mainSizeBytes -gt 0) { [math]::Round($mainSizeBytes / 1MB, 2) } else { '(unknown)' }
+        Write-DATLogEntry -Value "[$OEM] URL reachable - HTTP $($headCheck.StatusCode), size: $expectedSizeMB MB" -Severity 1
     } catch {
         Write-DATLogEntry -Value "[Warning] - URL pre-check failed for $downloadURL : $($_.Exception.Message)" -Severity 2
         Write-DATLogEntry -Value "[$OEM] Proceeding with download attempt despite HEAD failure" -Severity 2
@@ -5873,8 +5837,8 @@ New-HPDriverPack -Platform "$PlatformID" -Os "$HPOS" -OSVer "$WindowsBuild" -For
             $proxyParams = Get-DATWebRequestProxy
             $gfxHeadCheck = Invoke-WebRequest -Uri $gfxDownloadURL -Method Head -UseBasicParsing -TimeoutSec 30 -ErrorAction Stop @proxyParams
             if ($gfxHeadCheck.Headers.'Content-Length') { $gfxSizeBytes = [long]$gfxHeadCheck.Headers.'Content-Length'[0] }
-            $gfxSizeSuffix = if ($gfxSizeBytes -gt 0) { ", size: $([math]::Round($gfxSizeBytes / 1MB, 2)) MB" } else { '' }
-            Write-DATLogEntry -Value "[$OEM] GFX URL reachable - HTTP $($gfxHeadCheck.StatusCode)$gfxSizeSuffix" -Severity 1
+            $gfxSizeMB = if ($gfxSizeBytes -gt 0) { [math]::Round($gfxSizeBytes / 1MB, 2) } else { '(unknown)' }
+            Write-DATLogEntry -Value "[$OEM] GFX URL reachable - HTTP $($gfxHeadCheck.StatusCode), size: $gfxSizeMB MB" -Severity 1
         } catch {
             Write-DATLogEntry -Value "[Warning] - GFX URL pre-check failed for $gfxDownloadURL : $($_.Exception.Message)" -Severity 2
         }
@@ -10690,15 +10654,10 @@ function Find-DATBiosPackage {
     $best = $matches | Sort-Object { try { [datetime]$_.ReleaseDate } catch { [datetime]::MinValue } } -Descending | Select-Object -First 1
     $fileName = ($best.DownloadURL -split '/')[-1]
 
-    # Collapse a duplicated leading family token in the catalog display name (e.g. Dell
-    # "Latitude Latitude 5540" -> "Latitude 5540"). Some upstream catalog entries repeat the
-    # model family; this keeps the match log and display name clean. (#808)
-    $bestDisplayName = [string]$best.DisplayName -replace '^(\S+)\s+\1\b', '$1'
-
-    Write-DATLogEntry -Value "[BIOS] Matched: $bestDisplayName -- Version $($best.Version), Released $($best.ReleaseDate)" -Severity 1
+    Write-DATLogEntry -Value "[BIOS] Matched: $($best.DisplayName) -- Version $($best.Version), Released $($best.ReleaseDate)" -Severity 1
 
     return [PSCustomObject]@{
-        DisplayName      = $bestDisplayName
+        DisplayName      = $best.DisplayName
         Version          = $best.Version
         DownloadURL      = $best.DownloadURL
         FileName         = $fileName

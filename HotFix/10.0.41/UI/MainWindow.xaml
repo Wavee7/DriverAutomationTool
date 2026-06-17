@@ -716,14 +716,6 @@
                     <Setter Property="Background" Value="Transparent"/>
                     <Setter Property="Foreground" Value="{DynamicResource GridSelectionForeground}"/>
                 </Trigger>
-                <!-- Known models (matched to Intune/ConfigMgr devices) render in an accent
-                     colour. Declared after IsSelected so it wins even when the row is selected.
-                     KnownModelForeground is green in light mode, softer blue in dark mode.
-                     The Build column keeps its own colour for the "All" value (its template
-                     DataTrigger overrides this inherited foreground). -->
-                <DataTrigger Binding="{Binding IsKnownModel}" Value="True">
-                    <Setter Property="Foreground" Value="{DynamicResource KnownModelForeground}"/>
-                </DataTrigger>
             </Style.Triggers>
         </Style>
 
@@ -815,7 +807,7 @@
         <!-- Vertical ScrollBar -->
         <ControlTemplate x:Key="VerticalScrollBar" TargetType="ScrollBar">
             <Border Background="{DynamicResource ScrollTrack}"
-                    CornerRadius="6" Width="14">
+                    CornerRadius="5" Width="10">
                 <Track x:Name="PART_Track" IsDirectionReversed="True">
                     <Track.DecreaseRepeatButton>
                         <RepeatButton Style="{StaticResource ScrollBarTrackButton}" Command="ScrollBar.PageUpCommand"/>
@@ -851,7 +843,7 @@
         <!-- Horizontal ScrollBar -->
         <ControlTemplate x:Key="HorizontalScrollBar" TargetType="ScrollBar">
             <Border Background="{DynamicResource ScrollTrack}"
-                    CornerRadius="6" Height="14">
+                    CornerRadius="5" Height="10">
                 <Track x:Name="PART_Track" IsDirectionReversed="False">
                     <Track.DecreaseRepeatButton>
                         <RepeatButton Style="{StaticResource ScrollBarTrackButton}" Command="ScrollBar.PageLeftCommand"/>
@@ -872,13 +864,13 @@
             <Setter Property="OverridesDefaultStyle" Value="True"/>
             <Style.Triggers>
                 <Trigger Property="Orientation" Value="Vertical">
-                    <Setter Property="Width" Value="14"/>
+                    <Setter Property="Width" Value="6"/>
                     <Setter Property="Height" Value="Auto"/>
                     <Setter Property="Template" Value="{StaticResource VerticalScrollBar}"/>
                 </Trigger>
                 <Trigger Property="Orientation" Value="Horizontal">
                     <Setter Property="Width" Value="Auto"/>
-                    <Setter Property="Height" Value="14"/>
+                    <Setter Property="Height" Value="6"/>
                     <Setter Property="Template" Value="{StaticResource HorizontalScrollBar}"/>
                 </Trigger>
             </Style.Triggers>
@@ -913,7 +905,7 @@
                                    Foreground="{DynamicResource AccentColor}" VerticalAlignment="Center" Margin="0,0,8,0"/>
                         <TextBlock Text="Driver Automation Tool" FontSize="13" FontWeight="SemiBold"
                                    Foreground="{DynamicResource WindowForeground}" VerticalAlignment="Center"/>
-                        <TextBlock x:Name="txt_Version" Text=" Version 10.1.1" FontSize="11"
+                        <TextBlock x:Name="txt_Version" Text=" Version 10.0.41" FontSize="11"
                                    Foreground="{DynamicResource InputPlaceholder}" VerticalAlignment="Center" Margin="4,0"/>
                     </StackPanel>
 
@@ -1033,10 +1025,6 @@
                                         Style="{StaticResource SubNavButton}">
                                     <TextBlock><Run Text="&#xE72E;" FontFamily="Segoe MDL2 Assets"/><Run Text="  BIOS Security"/></TextBlock>
                                 </Button>
-                                <Button x:Name="nav_MaintenanceWindow"
-                                        Style="{StaticResource SubNavButton}">
-                                    <TextBlock><Run Text="&#xE823;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Maintenance Window"/></TextBlock>
-                                </Button>
                             </StackPanel>
                             <Button x:Name="nav_CommonSettings"
                                     Style="{StaticResource NavButton}">
@@ -1093,7 +1081,6 @@
                                         <ColumnDefinition Width="Auto"/>
                                     </Grid.ColumnDefinitions>
                                     <Grid.RowDefinitions>
-                                        <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
                                         <RowDefinition Height="Auto"/>
                                     </Grid.RowDefinitions>
@@ -1328,52 +1315,6 @@
                                             VerticalAlignment="Top" Margin="12,0,0,0" Height="34">
                                         <TextBlock><Run Text="&#xE72C;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Refresh"/></TextBlock>
                                     </Button>
-
-                                    <!-- Row 3: Profiles bar -->
-                                    <Border Grid.Row="2" Grid.ColumnSpan="6" BorderThickness="0,1,0,0"
-                                            BorderBrush="{DynamicResource CardBorder}" Margin="0,12,0,0" Padding="0,12,0,0">
-                                        <Grid>
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition Width="Auto"/>
-                                                <ColumnDefinition Width="*" MaxWidth="320"/>
-                                                <ColumnDefinition Width="Auto"/>
-                                                <ColumnDefinition Width="Auto"/>
-                                                <ColumnDefinition Width="Auto"/>
-                                                <ColumnDefinition Width="Auto"/>
-                                                <ColumnDefinition Width="*"/>
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock Grid.Column="0" Text="Profile" FontSize="12" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource InputPlaceholder}"
-                                                       VerticalAlignment="Center" Margin="0,0,12,0"/>
-                                            <ComboBox x:Name="cmb_Profiles" Grid.Column="1" Height="32"
-                                                      VerticalAlignment="Center"
-                                                      ToolTip="Load a saved selection profile"/>
-                                            <Button x:Name="btn_SaveProfile" Grid.Column="2"
-                                                    Style="{StaticResource SecondaryButton}" Height="32"
-                                                    Margin="8,0,0,0" Cursor="Hand" IsEnabled="False"
-                                                    ToolTip="Overwrite the selected profile with the current selections">
-                                                <TextBlock FontSize="12"><Run Text="&#xE74E;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Save"/></TextBlock>
-                                            </Button>
-                                            <Button x:Name="btn_SaveAsProfile" Grid.Column="3"
-                                                    Style="{StaticResource SecondaryButton}" Height="32"
-                                                    Margin="8,0,0,0" Cursor="Hand"
-                                                    ToolTip="Save the current selections as a new profile">
-                                                <TextBlock FontSize="12"><Run Text="&#xE792;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Save As"/></TextBlock>
-                                            </Button>
-                                            <Button x:Name="btn_RenameProfile" Grid.Column="4"
-                                                    Style="{StaticResource SecondaryButton}" Height="32"
-                                                    Margin="8,0,0,0" Cursor="Hand" IsEnabled="False"
-                                                    ToolTip="Rename the selected profile">
-                                                <TextBlock FontSize="12"><Run Text="&#xE8AC;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Rename"/></TextBlock>
-                                            </Button>
-                                            <Button x:Name="btn_DeleteProfile" Grid.Column="5"
-                                                    Style="{StaticResource SecondaryButton}" Height="32"
-                                                    Margin="8,0,0,0" Cursor="Hand" IsEnabled="False"
-                                                    ToolTip="Delete the selected profile">
-                                                <TextBlock FontSize="12"><Run Text="&#xE74D;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Delete"/></TextBlock>
-                                            </Button>
-                                        </Grid>
-                                    </Border>
                                 </Grid>
                             </Border>
 
@@ -1992,7 +1933,7 @@
                                         <DataGridTextColumn Header="Name" Width="*" Binding="{Binding Name}" IsReadOnly="True"/>
                                         <DataGridTextColumn Header="Version" Width="90" Binding="{Binding Version}" IsReadOnly="True"/>
                                         <DataGridTextColumn Header="Package ID" Width="95" Binding="{Binding PackageID}" IsReadOnly="True"/>
-                                        <DataGridTextColumn Header="Last Updated" Width="155" Binding="{Binding LastUpdated}" IsReadOnly="True"/>
+                                        <DataGridTextColumn Header="Source Date" Width="155" Binding="{Binding SourceDate}" IsReadOnly="True"/>
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </Border>
@@ -2301,23 +2242,23 @@
                                         in the model selection list, making it easy to target only the devices you manage.
                                     </TextBlock>
                                     <TextBlock FontSize="12" FontStyle="Italic"
-                                               Foreground="{DynamicResource StatusWarning}" Margin="0,0,0,4">
-                                        <Run Text="Note:" FontWeight="Bold"/> Requires the following WMI classes enabled in client hardware inventory:
+                                               Foreground="{DynamicResource InputPlaceholder}" Margin="0,0,0,4">
+                                        Note: Requires the following WMI classes enabled in client hardware inventory:
                                     </TextBlock>
                                     <StackPanel Margin="12,0,0,16">
-                                        <TextBlock FontSize="12" FontStyle="Italic" Foreground="{DynamicResource StatusWarning}">
+                                        <TextBlock FontSize="12" FontStyle="Italic" Foreground="{DynamicResource InputPlaceholder}">
                                             <Run Text="&#x2022;  Win32_ComputerSystem"/>
                                         </TextBlock>
                                         <TextBlock FontSize="11" FontStyle="Italic" Foreground="{DynamicResource StatusWarning}" Margin="20,0,0,0">
                                             <Run Text="&#x25E6;  Model, Manufacturer"/>
                                         </TextBlock>
-                                        <TextBlock FontSize="12" FontStyle="Italic" Foreground="{DynamicResource StatusWarning}">
+                                        <TextBlock FontSize="12" FontStyle="Italic" Foreground="{DynamicResource InputPlaceholder}">
                                             <Run Text="&#x2022;  MS_SystemInformation"/>
                                         </TextBlock>
                                         <TextBlock FontSize="11" FontStyle="Italic" Foreground="{DynamicResource StatusWarning}" Margin="20,0,0,0">
                                             <Run Text="&#x25E6;  SystemSKU"/>
                                         </TextBlock>
-                                        <TextBlock FontSize="12" FontStyle="Italic" Foreground="{DynamicResource StatusWarning}">
+                                        <TextBlock FontSize="12" FontStyle="Italic" Foreground="{DynamicResource InputPlaceholder}">
                                             <Run Text="&#x2022;  Win32_BaseBoard"/>
                                         </TextBlock>
                                         <TextBlock FontSize="11" FontStyle="Italic" Foreground="{DynamicResource StatusWarning}" Margin="20,0,0,0">
@@ -3874,13 +3815,6 @@
                                                       Foreground="{DynamicResource WindowForeground}"
                                                       FontSize="13" Margin="0,0,0,12"/>
 
-                                            <CheckBox x:Name="chk_CriticalNotification" Content="Critical Notification (bypass Focus Assist)"
-                                                      Style="{StaticResource ToggleSwitch}"
-                                                      Foreground="{DynamicResource WindowForeground}"
-                                                      FontSize="13" Margin="0,0,0,4"/>
-                                            <TextBlock Text="Displays the update prompt even when Focus Assist / Do Not Disturb is active, and plays an audible alarm sound when the prompt appears. Use for forced-reboot or security-critical updates."
-                                                       FontSize="11" Foreground="{DynamicResource InputPlaceholder}" TextWrapping="Wrap" Margin="0,0,0,12" LineHeight="16"/>
-
                                             <!-- On timeout action -->
                                             <Grid Margin="0,0,0,10">
                                                 <Grid.ColumnDefinitions>
@@ -4574,135 +4508,6 @@
                             </ScrollViewer>
                         </Grid>
 
-                        <!-- View: Maintenance Window -->
-                        <Grid x:Name="view_MaintenanceWindow" Visibility="Collapsed">
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto"/>
-                                <RowDefinition Height="*"/>
-                            </Grid.RowDefinitions>
-
-                            <TextBlock Grid.Row="0" Style="{StaticResource SectionHeader}">
-                                <Run Text="&#xE823;" FontFamily="Segoe MDL2 Assets" FontSize="20"/><Run Text="  Maintenance Window"/>
-                            </TextBlock>
-
-                            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
-                            <StackPanel>
-
-                                <!-- Overview / enable card -->
-                                <Border Style="{StaticResource CardPanel}" Margin="0,0,0,12">
-                                    <StackPanel>
-                                        <TextBlock FontSize="14" FontWeight="SemiBold"
-                                                   Foreground="{DynamicResource WindowForeground}" Margin="0,0,0,4">
-                                            <Run Text="&#xE823;" FontFamily="Segoe MDL2 Assets" FontSize="14"/><Run Text="  Maintenance Window"/>
-                                        </TextBlock>
-                                        <TextBlock TextWrapping="Wrap" FontSize="12"
-                                                   Foreground="{DynamicResource InputPlaceholder}" Margin="0,0,0,12" LineHeight="18">
-                                            Restrict when driver and BIOS packages may install on managed devices. When enabled, each
-                                            package's Intune requirement rule only reports as applicable while the device local time falls
-                                            inside one of the configured windows. Outside the window the install is deferred and retried on
-                                            the next Intune evaluation cycle. Windows that cross midnight (e.g. 22:00 to 05:00) are supported.
-                                        </TextBlock>
-
-                                        <StackPanel Orientation="Horizontal" Margin="0,0,0,4">
-                                            <CheckBox x:Name="chk_MaintenanceWindowEnabled"
-                                                      Style="{StaticResource ToggleSwitch}"
-                                                      VerticalAlignment="Center"/>
-                                            <TextBlock Text="Enable maintenance window" FontSize="13"
-                                                       Foreground="{DynamicResource WindowForeground}"
-                                                       VerticalAlignment="Center" Margin="12,0,0,0"/>
-                                            <TextBlock x:Name="txt_MaintenanceWindowState" Text="Off" FontSize="12"
-                                                       Foreground="{DynamicResource InputPlaceholder}"
-                                                       VerticalAlignment="Center" Margin="12,0,0,0"/>
-                                        </StackPanel>
-                                    </StackPanel>
-                                </Border>
-
-                                <!-- Schedule configuration card -->
-                                <Border x:Name="panel_MaintenanceWindowConfig" Style="{StaticResource CardPanel}" Margin="0,0,0,12">
-                                    <StackPanel>
-                                        <TextBlock FontSize="14" FontWeight="SemiBold"
-                                                   Foreground="{DynamicResource WindowForeground}" Margin="0,0,0,12">
-                                            <Run Text="&#xE787;" FontFamily="Segoe MDL2 Assets" FontSize="14"/><Run Text="  Schedule"/>
-                                        </TextBlock>
-
-                                        <!-- Mode selector -->
-                                        <StackPanel Orientation="Horizontal" Margin="0,0,0,16">
-                                            <TextBlock Text="Mode" FontSize="12"
-                                                       Foreground="{DynamicResource WindowForeground}"
-                                                       VerticalAlignment="Center" Width="80"/>
-                                            <ComboBox x:Name="cmb_MaintenanceWindowMode" Height="30" Width="180">
-                                                <ComboBoxItem Content="Daily" IsSelected="True"/>
-                                                <ComboBoxItem Content="Weekly"/>
-                                            </ComboBox>
-                                            <TextBlock x:Name="txt_MaintenanceWindowModeHint" FontSize="11"
-                                                       Foreground="{DynamicResource InputPlaceholder}"
-                                                       VerticalAlignment="Center" Margin="12,0,0,0"
-                                                       Text="Windows apply every day."/>
-                                        </StackPanel>
-
-                                        <!-- Column headers -->
-                                        <Grid Margin="0,0,0,6">
-                                            <Grid.ColumnDefinitions>
-                                                <ColumnDefinition x:Name="col_MWDayHeader" Width="140"/>
-                                                <ColumnDefinition Width="120"/>
-                                                <ColumnDefinition Width="120"/>
-                                                <ColumnDefinition Width="Auto"/>
-                                            </Grid.ColumnDefinitions>
-                                            <TextBlock x:Name="hdr_MWDay" Grid.Column="0" Text="Day" FontSize="11" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource InputPlaceholder}"/>
-                                            <TextBlock Grid.Column="1" Text="Start (HH:mm)" FontSize="11" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource InputPlaceholder}"/>
-                                            <TextBlock Grid.Column="2" Text="End (HH:mm)" FontSize="11" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource InputPlaceholder}"/>
-                                        </Grid>
-
-                                        <!-- Dynamic window rows are added here at runtime -->
-                                        <StackPanel x:Name="panel_MWWindowList"/>
-
-                                        <!-- Empty-state message -->
-                                        <TextBlock x:Name="txt_MWEmptyState" Text="No windows configured. Add at least one window."
-                                                   FontSize="12" Foreground="{DynamicResource InputPlaceholder}"
-                                                   Margin="0,4,0,4" Visibility="Collapsed"/>
-
-                                        <!-- Add window button -->
-                                        <Button x:Name="btn_AddMaintenanceWindow"
-                                                Height="32" Width="150" HorizontalAlignment="Left" Margin="0,8,0,0"
-                                                Style="{StaticResource RoundedButton}">
-                                            <TextBlock FontSize="12">
-                                                <Run Text="&#xE710;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Add Window"/>
-                                            </TextBlock>
-                                        </Button>
-
-                                        <!-- Separator + Save / Reset actions -->
-                                        <Border Height="1" Background="{DynamicResource CardBorder}" Margin="0,20,0,0"/>
-                                        <StackPanel Orientation="Horizontal" Margin="0,16,0,0">
-                                            <Button x:Name="btn_SaveMaintenanceWindow"
-                                                    Height="34" MinWidth="150" HorizontalAlignment="Left"
-                                                    Style="{StaticResource RoundedButton}">
-                                                <TextBlock FontSize="12">
-                                                    <Run Text="&#xE74E;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Save Configuration"/>
-                                                </TextBlock>
-                                            </Button>
-                                            <Button x:Name="btn_ResetMaintenanceWindow"
-                                                    Height="34" MinWidth="110" HorizontalAlignment="Left" Margin="10,0,0,0"
-                                                    Style="{StaticResource SecondaryButton}">
-                                                <TextBlock FontSize="12">
-                                                    <Run Text="&#xE777;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Reset"/>
-                                                </TextBlock>
-                                            </Button>
-                                        </StackPanel>
-
-                                        <!-- Validation message -->
-                                        <TextBlock x:Name="txt_MaintenanceWindowValidation" Text="" FontSize="11"
-                                                   Foreground="{DynamicResource StatusError}" Margin="0,10,0,0"
-                                                   TextWrapping="Wrap" Visibility="Collapsed"/>
-                                    </StackPanel>
-                                </Border>
-
-                            </StackPanel>
-                            </ScrollViewer>
-                        </Grid>
-
                         <!-- View: Common Settings -->
                         <Grid x:Name="view_CommonSettings" Visibility="Collapsed">
                             <Grid.RowDefinitions>
@@ -4995,32 +4800,17 @@
                                                 </Grid>
                                             </Border>
 
-                                            <!-- HP Driver Pack Source -->
-                                            <TextBlock Text="Driver Pack Source" FontSize="13" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource WindowForeground}" Margin="0,0,0,4"/>
-                                            <TextBlock Text="Choose how HP drivers are obtained. SCCM Driver Pack downloads a single monolithic pack from HP's catalog. Individual SoftPaqs downloads each driver component separately using HPCMSL, giving more granular and up-to-date drivers."
-                                                       FontSize="12" Foreground="{DynamicResource InputPlaceholder}" Margin="0,0,0,8" TextWrapping="Wrap" LineHeight="18"/>
-                                            <Grid Margin="0,0,0,16">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="250"/>
-                                                </Grid.ColumnDefinitions>
-                                                <ComboBox x:Name="cmb_HPDriverPackSource" Grid.Column="0" Height="34">
-                                                    <ComboBoxItem Content="SCCM Driver Pack" Tag="DriverPack" IsSelected="True"/>
-                                                    <ComboBoxItem Content="Individual SoftPaqs" Tag="SoftPaqs"/>
-                                                </ComboBox>
-                                            </Grid>
-
                                             <!-- HP Concurrent SoftPaq Downloads -->
-                                            <TextBlock x:Name="lbl_HPConcurrentTitle" Text="Concurrent SoftPaq Downloads" FontSize="13" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource WindowForeground}" Margin="0,0,0,4" Opacity="0.4"/>
-                                            <TextBlock x:Name="lbl_HPConcurrentDesc" Text="Number of HP SoftPaq files downloaded simultaneously during driver pack creation. Higher values speed up downloads but increase network and memory usage."
-                                                       FontSize="12" Foreground="{DynamicResource InputPlaceholder}" Margin="0,0,0,8" TextWrapping="Wrap" LineHeight="18" Opacity="0.4"/>
+                                            <TextBlock Text="Concurrent SoftPaq Downloads" FontSize="13" FontWeight="SemiBold"
+                                                       Foreground="{DynamicResource WindowForeground}" Margin="0,0,0,4"/>
+                                            <TextBlock Text="Number of HP SoftPaq files downloaded simultaneously during driver pack creation. Higher values speed up downloads but increase network and memory usage."
+                                                       FontSize="12" Foreground="{DynamicResource InputPlaceholder}" Margin="0,0,0,8" TextWrapping="Wrap" LineHeight="18"/>
                                             <Grid Margin="0,0,0,16">
                                                 <Grid.ColumnDefinitions>
                                                     <ColumnDefinition Width="200"/>
                                                     <ColumnDefinition Width="Auto"/>
                                                 </Grid.ColumnDefinitions>
-                                                <ComboBox x:Name="cmb_HPConcurrentDownloads" Grid.Column="0" Height="34" IsEnabled="False">
+                                                <ComboBox x:Name="cmb_HPConcurrentDownloads" Grid.Column="0" Height="34">
                                                     <ComboBoxItem Content="1 (Sequential)" Tag="1"/>
                                                     <ComboBoxItem Content="2 (Default)" Tag="2" IsSelected="True"/>
                                                     <ComboBoxItem Content="3" Tag="3"/>
@@ -5029,7 +4819,7 @@
                                                 <TextBlock Grid.Column="1" FontSize="11"
                                                            Foreground="{DynamicResource InputPlaceholder}"
                                                            VerticalAlignment="Center" Margin="12,0,0,0"
-                                                           Text="Recommended: 2 for most connections" x:Name="lbl_HPConcurrentHint" Opacity="0.4"/>
+                                                           Text="Recommended: 2 for most connections"/>
                                             </Grid>
 
                                             <!-- Divider -->
@@ -5071,26 +4861,6 @@
                                                                Text="Checking curl status..."/>
                                                 </Grid>
                                             </Border>
-
-                                            <!-- Trusted SHA-256 hash pin for unsigned curl builds (#809) -->
-                                            <TextBlock Text="Trusted SHA-256 Hash (optional)" FontSize="12" FontWeight="SemiBold"
-                                                       Foreground="{DynamicResource InputPlaceholder}" Margin="0,0,0,6"/>
-                                            <TextBlock TextWrapping="Wrap" FontSize="12" LineHeight="20"
-                                                       Foreground="{DynamicResource InputPlaceholder}" Margin="0,0,0,8">
-                                                Official curl.se builds are not Authenticode signed, so by default an unsigned bundled curl.exe is rejected and the system curl is used instead. To trust a known-good binary, paste its SHA-256 hash here (or click Compute to read it from the file in the Tools folder). The bundled binary is used only when its hash matches this value.
-                                            </TextBlock>
-                                            <Grid Margin="0,0,0,14">
-                                                <Grid.ColumnDefinitions>
-                                                    <ColumnDefinition Width="*"/>
-                                                    <ColumnDefinition Width="Auto"/>
-                                                </Grid.ColumnDefinitions>
-                                                <TextBox x:Name="txt_CurlSHA256Pin" Grid.Column="0"
-                                                         Style="{StaticResource RoundedTextBox}" Height="36"
-                                                         FontFamily="Cascadia Code,Consolas,monospace" FontSize="12"/>
-                                                <Button x:Name="btn_CurlComputeHash" Grid.Column="1" Content="Compute"
-                                                        Style="{StaticResource SecondaryButton}" Height="36" MinWidth="90"
-                                                        Margin="8,0,0,0"/>
-                                            </Grid>
                                             </StackPanel>
 
                                             <!-- CURL Source -->
@@ -5989,7 +5759,7 @@
                                     <StackPanel>
                                         <TextBlock Text="Driver Automation Tool" FontSize="22" FontWeight="Bold"
                                                    Foreground="{DynamicResource AccentColor}" Margin="0,0,0,4"/>
-                                        <TextBlock x:Name="txt_AboutVersion" Text="Version 10.1.1" FontSize="14"
+                                        <TextBlock x:Name="txt_AboutVersion" Text="Version 10.0.41" FontSize="14"
                                                    Foreground="{DynamicResource WindowForeground}" Margin="0,0,0,16"/>
 
                                         <TextBlock TextWrapping="Wrap" FontSize="13"

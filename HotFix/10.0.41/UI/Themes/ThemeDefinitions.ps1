@@ -73,9 +73,6 @@ $script:Themes = @{
         StatusWarningBackground = "#1AFFAA44"
         StatusError            = "#E74856"
 
-        # Known model row text -- cyan-blue in dark mode (green is too harsh)
-        KnownModelForeground   = "#22D3EE"
-
         # Info box callouts (auth cards, notes)
         InfoBoxGreen           = "#4ADE80"
         InfoBoxGreenBg         = "#1A4ADE80"
@@ -173,9 +170,6 @@ $script:Themes = @{
         StatusWarning          = "#FFAA44"
         StatusWarningBackground = "#20FFAA44"
         StatusError            = "#E74856"
-
-        # Known model row text -- green reads well on the light surface
-        KnownModelForeground   = "#107C10"
 
         # Info box callouts (auth cards, notes)
         InfoBoxGreen           = "#16A34A"

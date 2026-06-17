@@ -72,7 +72,7 @@ function Write-CMTraceLog {
     $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss.fff"
     $Time = Get-Date -Format "HH:mm:ss.fff"
     $Date = Get-Date -Format "MM-dd-yyyy"
-    $LogEntry = "<![LOG[$Timestamp $Message]LOG]!><time=""$Time+000"" date=""$Date"" component=""$Component"" context="""" type=""$Severity"" thread=""$PID"" file="""">"
+    $LogEntry = "<![LOG[$Message]LOG]!><time=""$Time+000"" date=""$Date"" component=""$Component"" context="""" type=""$Severity"" thread=""$PID"" file="""">"
     $LogDir = Split-Path $LogFile -Parent
     if (-not (Test-Path $LogDir)) { New-Item -Path $LogDir -ItemType Directory -Force | Out-Null }
     Add-Content -Path $LogFile -Value $LogEntry -Encoding UTF8 -ErrorAction SilentlyContinue
@@ -217,8 +217,7 @@ function Compare-BIOSVersion {
     #>
     param (
         [Parameter(Mandatory)][string]$AvailableBIOSVersion,
-        [Parameter(Mandatory)][string]$Manufacturer,
-        [string]$AvailableReleaseDate
+        [Parameter(Mandatory)][string]$Manufacturer
     )
 
     $currentBIOS = $null
@@ -268,23 +267,15 @@ function Compare-BIOSVersion {
         }
         '*Lenovo*' {
             try {
+                # Lenovo uses BIOS release dates in yyyyMMdd or ddMMyyyy format
                 $currentReleaseDate = $currentBIOS.ReleaseDate.ToString('yyyyMMdd')
                 Write-CMTraceLog "Lenovo: Current BIOS release date: $currentReleaseDate"
                 Write-CMTraceLog "Lenovo: Available BIOS version: $AvailableBIOSVersion"
 
-                # Use release date comparison when available (version strings like M43KT32A are not reliably sortable)
-                if (-not [string]::IsNullOrEmpty($AvailableReleaseDate)) {
-                    Write-CMTraceLog "Lenovo: Available BIOS release date: $AvailableReleaseDate"
-                    if ($AvailableReleaseDate -gt $currentReleaseDate) {
-                        Write-CMTraceLog "Lenovo: Newer BIOS available (release date $AvailableReleaseDate > $currentReleaseDate)"
-                        return $true
-                    }
-                } else {
-                    Write-CMTraceLog "Lenovo: No release date provided -- falling back to version string comparison" -Severity 2
-                    if ($AvailableBIOSVersion -gt $currentVersion) {
-                        Write-CMTraceLog "Lenovo: Newer BIOS available (version $AvailableBIOSVersion > $currentVersion)"
-                        return $true
-                    }
+                # Compare version strings -- Lenovo typically embeds date or incremental version
+                if ($AvailableBIOSVersion -gt $currentVersion) {
+                    Write-CMTraceLog "Lenovo: Newer BIOS available"
+                    return $true
                 }
             } catch {
                 Write-CMTraceLog "WARNING: Lenovo BIOS version comparison failed -- $($_.Exception.Message). Proceeding with update." -Severity 2
@@ -381,7 +372,7 @@ try {
     # Compare versions BEFORE prompting the user -- no point showing a toast if
     # the BIOS is already current.
     Write-CMTraceLog "Performing BIOS version comparison..."
-    $updateNeeded = Compare-BIOSVersion -AvailableBIOSVersion '{{Version}}' -Manufacturer $Manufacturer -AvailableReleaseDate '{{ReleaseDate}}'
+    $updateNeeded = Compare-BIOSVersion -AvailableBIOSVersion '{{Version}}' -Manufacturer $Manufacturer
 
     if (-not $updateNeeded) {
         Write-CMTraceLog "BIOS is current -- no update will be applied"
@@ -548,25 +539,6 @@ try {
 
             Write-CMTraceLog "HP flash utility found: $($flashUtil.FullName)"
 
-            # -- AC power check -- HP BIOS updaters may refuse to flash on battery --
-            if (-not $WhatIf) {
-                try {
-                    $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($battery) {
-                        # BatteryStatus 2 = AC power connected
-                        if ($battery.BatteryStatus -ne 2) {
-                            Write-CMTraceLog "AC power adapter not detected (BatteryStatus=$($battery.BatteryStatus)). HP BIOS updates require AC power -- will retry on next Intune cycle." -Severity 2
-                            exit 1618  # ERROR_INSTALL_ALREADY_RUNNING -- tells Intune to retry
-                        }
-                        Write-CMTraceLog "AC power confirmed (BatteryStatus=$($battery.BatteryStatus))"
-                    } else {
-                        Write-CMTraceLog "No battery detected -- assuming desktop, skipping AC power check"
-                    }
-                } catch {
-                    Write-CMTraceLog "WARNING: Could not check AC power status -- $($_.Exception.Message). Proceeding with flash." -Severity 2
-                }
-            }
-
             # Build arguments: -s = silent, -r = do not reboot, -b = suspend BitLocker if needed
             # -f = folder containing firmware update files
             $flashArgs = "-s -r -b -f`"$($flashUtil.DirectoryName)`""
@@ -589,7 +561,7 @@ try {
                     # Check for HP CMSL module availability
                     if (-not (Get-Command -Name 'Write-HPFirmwarePasswordFile' -ErrorAction SilentlyContinue)) {
                         Write-CMTraceLog "HP CMSL module not found -- attempting to install HPCMSL" -Severity 2
-                        Install-Module -Name 'HPCMSL' -Force -Scope AllUsers -ErrorAction Stop
+                        Install-Module -Name 'HPCMSL' -Force -AcceptLicense -Scope AllUsers -ErrorAction Stop
                         Import-Module -Name 'HPCMSL' -ErrorAction Stop
                         Write-CMTraceLog "HPCMSL module installed and imported successfully"
                     }
@@ -633,25 +605,6 @@ try {
         # -- Lenovo --------------------------------------------------------------
         '*Lenovo*' {
             Write-CMTraceLog "Lenovo BIOS update detected -- searching for flash utility"
-
-            # -- AC power check -- Lenovo BIOS updaters may refuse to flash on battery --
-            if (-not $WhatIf) {
-                try {
-                    $battery = Get-CimInstance -ClassName Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($battery) {
-                        # BatteryStatus 2 = AC power connected
-                        if ($battery.BatteryStatus -ne 2) {
-                            Write-CMTraceLog "AC power adapter not detected (BatteryStatus=$($battery.BatteryStatus)). Lenovo BIOS updates require AC power -- will retry on next Intune cycle." -Severity 2
-                            exit 1618  # ERROR_INSTALL_ALREADY_RUNNING -- tells Intune to retry
-                        }
-                        Write-CMTraceLog "AC power confirmed (BatteryStatus=$($battery.BatteryStatus))"
-                    } else {
-                        Write-CMTraceLog "No battery detected -- assuming desktop, skipping AC power check"
-                    }
-                } catch {
-                    Write-CMTraceLog "WARNING: Could not check AC power status -- $($_.Exception.Message). Proceeding with flash." -Severity 2
-                }
-            }
 
             # Lenovo ThinkPad uses WinUPTP64.exe (64-bit) or WinUPTP.exe (32-bit)
             $flashUtil = $null
@@ -810,54 +763,9 @@ try {
     } else {
         Write-CMTraceLog "BIOS firmware prestaged successfully"
         if ($flashExitCode -in @(2, 1, 3010)) {
-            $DisableRestart = {{DISABLE_RESTART}}
-            $RestartDelaySeconds = {{RESTART_DELAY_SECONDS}}
-            $RestartDelayMinutes = [math]::Round($RestartDelaySeconds / 60, 0)
-
-            # -- Admin-configured: Disable Automatic Restart --
-            # When enabled, the BIOS update is prestaged but no restart is initiated.
-            # BitLocker remains suspended until the user manually restarts.
-            if ($DisableRestart) {
-                Write-CMTraceLog "Automatic BIOS restart is DISABLED by admin policy. The update will apply on the next manual reboot."
-                Write-CMTraceLog "NOTE: BitLocker protection remains suspended until the device is restarted."
-                Write-CMTraceLog "=========================================="
-                exit 3010
-            }
-
-            # -- Focus Assist / DND Check Before Restart --
-            # If the user has Focus Assist (Do Not Disturb) active, we must NOT restart
-            # the device regardless of deferral count. The BIOS update is already prestaged
-            # and will apply on the next natural reboot.
-            $focusAssistBlocking = $false
-            try {
-                $focusAssistCSharp = 'using System; using System.Runtime.InteropServices; public class DATFocusAssistRestart { [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state); }'
-                Add-Type -TypeDefinition $focusAssistCSharp -ErrorAction SilentlyContinue
-                $focusState = 0
-                [void][DATFocusAssistRestart]::SHQueryUserNotificationState([ref]$focusState)
-                $focusStateNames = @{
-                    1 = 'QUNS_NOT_PRESENT'; 2 = 'QUNS_BUSY'; 3 = 'QUNS_RUNNING_D3D_FULL_SCREEN'
-                    4 = 'QUNS_PRESENTATION_MODE'; 5 = 'QUNS_ACCEPTS_NOTIFICATIONS'
-                    6 = 'QUNS_QUIET_TIME'; 7 = 'QUNS_APP'
-                }
-                $focusStateName = if ($focusStateNames.ContainsKey($focusState)) { $focusStateNames[$focusState] } else { "Unknown ($focusState)" }
-                Write-CMTraceLog "[FocusAssist] SHQueryUserNotificationState returned: $focusState ($focusStateName)"
-                if ($focusState -ne 5) {
-                    $focusAssistBlocking = $true
-                    Write-CMTraceLog "[FocusAssist] Focus Assist / DND is active -- suppressing automatic restart to avoid interrupting the user" -Severity 2
-                }
-            } catch {
-                Write-CMTraceLog "[FocusAssist] Check failed: $($_.Exception.Message) -- proceeding with restart" -Severity 2
-            }
-
-            if ($focusAssistBlocking) {
-                Write-CMTraceLog "BIOS update prestaged but restart suppressed due to Focus Assist. The update will apply on the next manual reboot."
-                Write-CMTraceLog "=========================================="
-                # Exit 3010 signals soft-reboot-needed to Intune without forcing a restart
-                exit 3010
-            }
-
-            Write-CMTraceLog "Scheduling system restart in $RestartDelayMinutes minute(s) ($RestartDelaySeconds seconds) to apply BIOS update"
-            shutdown.exe /r /t $RestartDelaySeconds /c "BIOS firmware update prestaged by Driver Automation Tool. Your system will restart in $RestartDelayMinutes minute(s) to apply the update. Please save your work." /d p:1:18
+            $RestartDelaySeconds = 180
+            Write-CMTraceLog "Scheduling system restart in $RestartDelaySeconds seconds to apply BIOS update"
+            shutdown.exe /r /t $RestartDelaySeconds /c "BIOS firmware update prestaged by Driver Automation Tool. Your system will restart in $RestartDelaySeconds seconds to apply the update. Please save your work." /d p:1:18
             Write-CMTraceLog "Restart scheduled -- shutdown.exe exit code: $LASTEXITCODE"
             Write-CMTraceLog "=========================================="
             exit 3010
