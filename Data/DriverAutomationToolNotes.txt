@@ -3,6 +3,37 @@ Release Notes
 IMPORTANT
 - DAT Downloads have been moved to GitHub - https://github.com/maurice-daly/DriverAutomationTool
 
+Version 10.1.5
+What's New & Fixed
+- **Windows 10 Support** — Added Windows 10 22H2 and 21H2 across the OS picker and all deployment/packaging views. Windows 10 driver packages are now sourced directly from the OEM catalogs. When the DAT API catalog is active, Windows 10 and Windows 11 selections are kept mutually exclusive, with a clear prompt explaining the switch to OEM-direct sourcing.
+- **Architecture Awareness** — The model list now shows an **Arch** column, and a new **All** architecture option lists both x64 and Arm64 devices in a single pass. Each model carries its own native architecture through selection, saved selections, and packaging — so x64 and Arm64 variants of the same model are tracked independently.
+- **Custom Intune Package Icon** — You can now select a custom PNG icon for the driver and BIOS apps created in Intune, with a live preview, square-image validation, and the choice persisted between sessions. The bundled Driver Automation Tool logo is used when no custom icon is set.
+- **Driver Packaging** — Added an **All** package type that returns both Drivers and BIOS packages in one action, and renamed the **BIOS Update** option to **BIOS** for clarity across the Configuration Manager and Intune package views.
+- **OEM Support** — Cleaned up Dell BIOS model names that previously duplicated the product family (for example "Precision Precision 5280" now displays as "Precision 5280"), so they match the Dell driver catalog and pair correctly.
+- **UI / Theme Fixes** — Model list columns can now be drag-resized via invisible grips on each column header, and the OS selection checkboxes handle their change events more reliably.
+
+Version 10.1.4
+What's New & Fixed
+- Intune Packaging — Added a new "Create IntuneWin file only (skip upload)" option. When enabled, each driver and BIOS package is built and the .intunewin file is saved locally for inspection or manual publishing, without uploading to Intune (automatic deployment and assignment filters are skipped). Available in the UI, scheduled tasks, and headless builds.
+- Driver Packaging — Administrators can now disable WIM compression for Configuration Manager, staging the full expanded driver content instead of a compressed WIM. WIM compression remains recommended for faster task-sequence deployments.
+- Build Failures Report — After a build, a new "View Failures" button opens a scrollable summary listing each model and package type that did not complete, along with the reason (e.g. no BIOS match in catalog, package not created), so issues can be reviewed without opening the log file.
+- BIOS Management — BIOS installs now report descriptive failure reasons instead of a generic error code, making troubleshooting easier across Dell, HP, Lenovo, and Surface. Devices also show a toast notification when a BIOS update is blocked because the AC power adapter is not connected, and the update automatically retries on the next Intune cycle.
+- Self-Update Reliability — The in-place updater now retries briefly and skips locked files (such as the application icon) instead of aborting and rolling back the entire update. The window icon is also loaded into memory so it no longer holds a file lock during updates (issue #819).
+- Package Detection — Improved timestamp and version sorting so the most recent driver/BIOS package is reliably identified across the different date and version formats used by OEM catalogs.
+
+Version 10.1.3
+Internal Test Build
+
+Version 10.1.2
+What's New & Fixed
+- Driver Packaging (ConfigMgr) — Added the new XML Logic Package generator. It enumerates your existing DAT driver packages and writes a consolidated DriverPackages.xml, then optionally creates, replaces, and re-distributes the MSEndpointMgr XML Logic Package on the site server automatically. Available from the ConfigMgr Package Options screen and in headless/scheduled builds via BuildConfig.json.
+- ConfigMgr OS Deployment — Shipped a new Invoke-CMApplyDriverPackage task-sequence script that matches and applies driver packages during BareMetal, DriverUpdate, OSUpgrade, PreCache, and the new XML-package deployment modes via the AdminService endpoint.
+- Scheduled Tasks / Headless Builds — Fixed redundant re-downloads of drivers and BIOS that were already current (#817). The tool now resolves the authoritative catalog driver and BIOS version up front with a lightweight catalog lookup, so the skip-if-current check works reliably even when the model definition carries no version (as is normal in headless mode).
+- Reporting / Telemetry — Driver package reports now include the package version across all output modes (Download Only, WIM Package Only, and Intune), not just ConfigMgr — so the version column on the Reports page fills in correctly.
+- Feedback Submission — Fixed an Unauthorized (401) error when submitting feedback with non-English or special characters (accents, emoji, smart quotes) on Windows PowerShell 5.1. Signed request payloads are now transmitted as UTF-8, matching the signature exactly.
+- Security — Added a SHA-256 pin and one-click Compute Hash control for validating the bundled curl.exe from the settings screen.
+- Compatibility — Resolved a Windows PowerShell 5.1 issue where piped catalog JSON collapsed into a single element, which could break downstream driver/BIOS catalog lookups.
+
 Version 10.1.1
 What's New & Fixed
 - Driver Packaging — ConfigMgr packages now stamp a date when created or updated, and the Package Management view shows a Last Updated column (previously blank), so you can sort and clean up packages by age. (#806)

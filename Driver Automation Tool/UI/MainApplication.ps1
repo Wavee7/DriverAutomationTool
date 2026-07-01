@@ -52,6 +52,7 @@ public class ModelItem : INotifyPropertyChanged {
     public string OEM        { get; set; }
     public string Model      { get; set; }
     public string OS         { get; set; }
+    public string Architecture { get; set; }
     public string Build      { get; set; }
     public string Baseboards { get; set; }
     public bool   HasGFX     { get; set; }
@@ -113,11 +114,20 @@ $Reader = New-Object System.Xml.XmlNodeReader $Xaml
 $Window = [System.Windows.Markup.XamlReader]::Load($Reader)
 
 # Set window icon from DATLogo.ico (#11 -- corrupted icon crash)
+# Load via an in-memory stream with OnLoad caching so the file handle is released
+# immediately. A delay-loaded BitmapFrame (Create([Uri])) keeps DATLogo.ico open for
+# the process lifetime, which blocks in-place self-updates from overwriting it (#819).
 $icoPath = Join-Path $AppRoot "Branding\DATLogo.ico"
 if (Test-Path $icoPath) {
     try {
-        $Window.Icon = [System.Windows.Media.Imaging.BitmapFrame]::Create(
-            [Uri]::new($icoPath, [UriKind]::Absolute))
+        $icoBytes  = [System.IO.File]::ReadAllBytes($icoPath)
+        $icoStream = New-Object System.IO.MemoryStream(,$icoBytes)
+        $iconFrame = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+            $icoStream,
+            [System.Windows.Media.Imaging.BitmapCreateOptions]::None,
+            [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad)
+        $iconFrame.Freeze()
+        $Window.Icon = $iconFrame
     } catch {
         Write-Warning "Failed to load application icon: $($_.Exception.Message)"
     }
@@ -2315,6 +2325,344 @@ function Show-DATLenovoFlashKilledModal {
     $script:LenovoFlashAutoCloseTimer.Start()
 }
 
+function Get-DATArrayElement {
+    <# Returns element $Index of $Array, falling back to the last element (or '' when empty). #>
+    param($Array, [int]$Index)
+    $a = @($Array)
+    if ($a.Count -eq 0) { return '' }
+    if ($Index -lt $a.Count) { return $a[$Index] }
+    return $a[$a.Count - 1]
+}
+
+function Get-DATCollapseRepeats {
+    <#
+        Collapses a phrase that repeats consecutively (e.g. "Dell Dell Dell" -> "Dell",
+        or a reason sentence duplicated many times) down to a single occurrence, while
+        leaving any non-repeating prefix intact.
+    #>
+    param([AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $t = ($Text -replace '\s+', ' ').Trim()
+    try {
+        $t = [System.Text.RegularExpressions.Regex]::Replace($t, '(?<p>.{3,}?)(?:\s*\k<p>)+', '${p}')
+    } catch { }
+    return $t.Trim()
+}
+
+function ConvertTo-DATFailureGroups {
+    <#
+        Normalises raw build-failure records into one clean entry per model. Handles both a
+        list of individual failure objects and a single object whose fields are parallel
+        arrays (which the build summary can produce), de-duplicating repeated text so the
+        UI shows a tidy "list of models that failed" rather than concatenated values.
+    #>
+    param($Failures)
+
+    # Step 1: unzip any parallel-array records into individual failure rows.
+    $records = [System.Collections.Generic.List[object]]::new()
+    foreach ($f in @($Failures)) {
+        if ($null -eq $f) { continue }
+        $oemArr    = @($f.OEM)
+        $modelArr  = @($f.Model)
+        $pkgArr    = @($f.PackageType)
+        $osArr     = @($f.OS)
+        $reasonArr = @($f.Reason)
+        $n = (@($oemArr.Count, $modelArr.Count, $pkgArr.Count, $osArr.Count, $reasonArr.Count) |
+              Measure-Object -Maximum).Maximum
+        if ($n -le 1) {
+            $records.Add($f) | Out-Null
+            continue
+        }
+        for ($i = 0; $i -lt $n; $i++) {
+            $records.Add([pscustomobject]@{
+                OEM         = Get-DATArrayElement $oemArr $i
+                Model       = Get-DATArrayElement $modelArr $i
+                PackageType = Get-DATArrayElement $pkgArr $i
+                OS          = Get-DATArrayElement $osArr $i
+                Reason      = Get-DATArrayElement $reasonArr $i
+            }) | Out-Null
+        }
+    }
+
+    # Step 2: group the individual rows by model, de-duplicating package types / OS / reasons.
+    $map = [ordered]@{}
+    foreach ($r in $records) {
+        $oem    = Get-DATCollapseRepeats ([string]$r.OEM)
+        $model  = Get-DATCollapseRepeats ([string]$r.Model)
+        $pkg    = Get-DATCollapseRepeats ([string]$r.PackageType)
+        $os     = Get-DATCollapseRepeats ([string]$r.OS)
+        $reason = Get-DATCollapseRepeats ([string]$r.Reason)
+
+        $name = Get-DATCollapseRepeats ((($oem, $model) -join ' ').Trim())
+        if ([string]::IsNullOrWhiteSpace($name)) { $name = 'Unknown model' }
+        $key = $name.ToLowerInvariant()
+
+        if (-not $map.Contains($key)) {
+            $map[$key] = [pscustomobject]@{
+                Name         = $name
+                PackageTypes = [System.Collections.Generic.List[string]]::new()
+                OSList       = [System.Collections.Generic.List[string]]::new()
+                Reasons      = [System.Collections.Generic.List[string]]::new()
+            }
+        }
+        $g = $map[$key]
+        if (-not [string]::IsNullOrWhiteSpace($pkg)    -and -not $g.PackageTypes.Contains($pkg))    { $g.PackageTypes.Add($pkg) }
+        if (-not [string]::IsNullOrWhiteSpace($os)     -and -not $g.OSList.Contains($os))           { $g.OSList.Add($os) }
+        if (-not [string]::IsNullOrWhiteSpace($reason) -and -not $g.Reasons.Contains($reason))      { $g.Reasons.Add($reason) }
+    }
+
+    return @($map.Values)
+}
+
+function Show-DATBuildFailuresDialog {
+    <#
+    .SYNOPSIS
+        Shows a scrollable modal listing the models that failed to build, each with an
+        expandable detail section (package types, OS and reason) so an administrator can
+        review failures without opening the log file.
+    #>
+    param (
+        [Parameter(Mandatory)]$Failures,
+        $Owner
+    )
+
+    $failureList = @($Failures)
+    if ($failureList.Count -eq 0) { return }
+
+    # Normalise into one clean entry per failed model (de-duplicates repeated text).
+    $groups = @(ConvertTo-DATFailureGroups -Failures $failureList)
+    if ($groups.Count -eq 0) { return }
+
+    $theme = Get-DATTheme -ThemeName $script:CurrentTheme
+    $bgColor = [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBackground'])
+
+    $fgBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['WindowForeground']))
+    $dimBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
+    $errorBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusError']))
+    $rowBgColor = [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBorder'])
+
+    $dlg = [System.Windows.Window]::new()
+    $dlg.WindowStyle = 'None'
+    $dlg.AllowsTransparency = $true
+    $dlg.Background = [System.Windows.Media.Brushes]::Transparent
+    $dlg.Width = 580
+    $dlg.SizeToContent = 'Height'
+    $dlg.Topmost = $true
+    $dlg.ResizeMode = 'NoResize'
+    $dlg.ShowInTaskbar = $false
+    try {
+        if ($Owner) { $dlg.Owner = $Owner } else { $dlg.Owner = $Window }
+        $dlg.WindowStartupLocation = 'CenterOwner'
+    } catch {
+        $dlg.WindowStartupLocation = 'CenterScreen'
+    }
+
+    $border = [System.Windows.Controls.Border]::new()
+    $border.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.Color]::FromArgb(245, $bgColor.R, $bgColor.G, $bgColor.B))
+    $border.CornerRadius = [System.Windows.CornerRadius]::new(16)
+    $border.Padding = [System.Windows.Thickness]::new(28, 24, 28, 24)
+    $border.BorderBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBorder']))
+    $border.BorderThickness = [System.Windows.Thickness]::new(1)
+    $shadow = [System.Windows.Media.Effects.DropShadowEffect]::new()
+    $shadow.BlurRadius = 30; $shadow.ShadowDepth = 0; $shadow.Opacity = 0.5
+    $shadow.Color = [System.Windows.Media.Colors]::Black
+    $border.Effect = $shadow
+
+    $panel = [System.Windows.Controls.StackPanel]::new()
+
+    # Icon
+    $iconText = [System.Windows.Controls.TextBlock]::new()
+    $iconText.Text = [string][char]0xEA39
+    $iconText.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+    $iconText.FontSize = 30
+    $iconText.Foreground = $errorBrush
+    $iconText.HorizontalAlignment = 'Center'
+    $iconText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 10)
+    $panel.Children.Add($iconText) | Out-Null
+
+    # Title
+    $titleText = [System.Windows.Controls.TextBlock]::new()
+    $titleText.Text = "Build Failures"
+    $titleText.FontSize = 16
+    $titleText.FontWeight = [System.Windows.FontWeights]::Bold
+    $titleText.Foreground = $fgBrush
+    $titleText.HorizontalAlignment = 'Center'
+    $titleText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 4)
+    $panel.Children.Add($titleText) | Out-Null
+
+    # Subtitle / count
+    $subText = [System.Windows.Controls.TextBlock]::new()
+    $subText.Text = "$($groups.Count) model$(if ($groups.Count -ne 1) { 's' }) failed to build -- expand a row for details"
+    $subText.FontSize = 12
+    $subText.Foreground = $dimBrush
+    $subText.HorizontalAlignment = 'Center'
+    $subText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
+    $panel.Children.Add($subText) | Out-Null
+
+    # Scrollable failures list
+    $scroll = [System.Windows.Controls.ScrollViewer]::new()
+    $scroll.VerticalScrollBarVisibility = 'Auto'
+    $scroll.HorizontalScrollBarVisibility = 'Disabled'
+    $scroll.MaxHeight = 360
+    $scroll.Margin = [System.Windows.Thickness]::new(0, 0, 0, 18)
+
+    $listPanel = [System.Windows.Controls.StackPanel]::new()
+
+    $chevronRight = [string][char]0xE76C
+    $chevronDown  = [string][char]0xE70D
+
+    foreach ($g in $groups) {
+        $card = [System.Windows.Controls.Border]::new()
+        $card.Background = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.Color]::FromArgb(60, $rowBgColor.R, $rowBgColor.G, $rowBgColor.B))
+        $card.CornerRadius = [System.Windows.CornerRadius]::new(8)
+        $card.Padding = [System.Windows.Thickness]::new(12, 8, 12, 8)
+        $card.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+        $card.BorderBrush = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.Color]::FromArgb(90, $errorBrush.Color.R, $errorBrush.Color.G, $errorBrush.Color.B))
+        $card.BorderThickness = [System.Windows.Thickness]::new(1)
+
+        $cardPanel = [System.Windows.Controls.StackPanel]::new()
+
+        # Clickable header row (chevron + model name + package-type badges)
+        $header = [System.Windows.Controls.Border]::new()
+        $header.Background = [System.Windows.Media.Brushes]::Transparent
+        $header.Cursor = [System.Windows.Input.Cursors]::Hand
+
+        $headerGrid = [System.Windows.Controls.Grid]::new()
+        $hc0 = [System.Windows.Controls.ColumnDefinition]::new(); $hc0.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Auto)
+        $hc1 = [System.Windows.Controls.ColumnDefinition]::new(); $hc1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $hc2 = [System.Windows.Controls.ColumnDefinition]::new(); $hc2.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Auto)
+        $headerGrid.ColumnDefinitions.Add($hc0) | Out-Null
+        $headerGrid.ColumnDefinitions.Add($hc1) | Out-Null
+        $headerGrid.ColumnDefinitions.Add($hc2) | Out-Null
+
+        $chevron = [System.Windows.Controls.TextBlock]::new()
+        $chevron.Text = $chevronRight
+        $chevron.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+        $chevron.FontSize = 11
+        $chevron.Foreground = $dimBrush
+        $chevron.VerticalAlignment = 'Center'
+        $chevron.Margin = [System.Windows.Thickness]::new(0, 0, 8, 0)
+        [System.Windows.Controls.Grid]::SetColumn($chevron, 0)
+        $headerGrid.Children.Add($chevron) | Out-Null
+
+        $nameText = [System.Windows.Controls.TextBlock]::new()
+        $nameText.Text = "$($g.Name)"
+        $nameText.FontSize = 13
+        $nameText.FontWeight = [System.Windows.FontWeights]::SemiBold
+        $nameText.Foreground = $fgBrush
+        $nameText.TextTrimming = 'CharacterEllipsis'
+        $nameText.VerticalAlignment = 'Center'
+        [System.Windows.Controls.Grid]::SetColumn($nameText, 1)
+        $headerGrid.Children.Add($nameText) | Out-Null
+
+        $badgePanel = [System.Windows.Controls.StackPanel]::new()
+        $badgePanel.Orientation = 'Horizontal'
+        $badgePanel.VerticalAlignment = 'Center'
+        [System.Windows.Controls.Grid]::SetColumn($badgePanel, 2)
+        foreach ($pt in $g.PackageTypes) {
+            $badge = [System.Windows.Controls.Border]::new()
+            $badge.CornerRadius = [System.Windows.CornerRadius]::new(4)
+            $badge.Padding = [System.Windows.Thickness]::new(8, 2, 8, 2)
+            $badge.Margin = [System.Windows.Thickness]::new(6, 0, 0, 0)
+            $badge.VerticalAlignment = 'Center'
+            $badge.Background = [System.Windows.Media.SolidColorBrush]::new(
+                [System.Windows.Media.Color]::FromArgb(40, $errorBrush.Color.R, $errorBrush.Color.G, $errorBrush.Color.B))
+            $badgeText = [System.Windows.Controls.TextBlock]::new()
+            $badgeText.Text = "$pt"
+            $badgeText.FontSize = 11
+            $badgeText.FontWeight = [System.Windows.FontWeights]::SemiBold
+            $badgeText.Foreground = $errorBrush
+            $badge.Child = $badgeText
+            $badgePanel.Children.Add($badge) | Out-Null
+        }
+        $headerGrid.Children.Add($badgePanel) | Out-Null
+        $header.Child = $headerGrid
+        $cardPanel.Children.Add($header) | Out-Null
+
+        # Collapsible detail (OS + reason), hidden until the row is expanded
+        $detail = [System.Windows.Controls.StackPanel]::new()
+        $detail.Visibility = 'Collapsed'
+        $detail.Margin = [System.Windows.Thickness]::new(19, 8, 0, 2)
+
+        if ($g.OSList.Count -gt 0) {
+            $osText = [System.Windows.Controls.TextBlock]::new()
+            $osText.Text = ($g.OSList -join ', ')
+            $osText.FontSize = 11
+            $osText.FontWeight = [System.Windows.FontWeights]::SemiBold
+            $osText.Foreground = $dimBrush
+            $osText.TextWrapping = 'Wrap'
+            $osText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 4)
+            $detail.Children.Add($osText) | Out-Null
+        }
+
+        $reasonsToShow = if ($g.Reasons.Count -gt 0) { $g.Reasons } else { @('No additional detail -- see log for details') }
+        foreach ($rsn in $reasonsToShow) {
+            $reasonText = [System.Windows.Controls.TextBlock]::new()
+            $reasonText.Text = "$rsn"
+            $reasonText.FontSize = 12
+            $reasonText.Foreground = $dimBrush
+            $reasonText.TextWrapping = 'Wrap'
+            $reasonText.Margin = [System.Windows.Thickness]::new(0, 2, 0, 0)
+            $detail.Children.Add($reasonText) | Out-Null
+        }
+        $cardPanel.Children.Add($detail) | Out-Null
+
+        # Toggle detail visibility on header click (captures this row's detail + chevron only)
+        $header.Add_MouseLeftButtonUp({
+            if ($detail.Visibility -eq 'Visible') {
+                $detail.Visibility = 'Collapsed'
+                $chevron.Text = $chevronRight
+            } else {
+                $detail.Visibility = 'Visible'
+                $chevron.Text = $chevronDown
+            }
+        }.GetNewClosure())
+
+        $card.Child = $cardPanel
+        $listPanel.Children.Add($card) | Out-Null
+    }
+
+    $scroll.Content = $listPanel
+    $panel.Children.Add($scroll) | Out-Null
+
+    # Close button
+    $btnClose = [System.Windows.Controls.Button]::new()
+    $btnClose.Height = 36
+    $btnClose.HorizontalAlignment = 'Stretch'
+    $btnClose.Cursor = [System.Windows.Input.Cursors]::Hand
+    $closeTemplate = [System.Windows.Markup.XamlReader]::Parse(@"
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+    <Border x:Name="bd" Background="$($theme['ButtonPrimary'])" CornerRadius="8" Padding="16,8">
+        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+    <ControlTemplate.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="$($theme['ButtonPrimaryHover'])"/>
+        </Trigger>
+    </ControlTemplate.Triggers>
+</ControlTemplate>
+"@)
+    $btnClose.Template = $closeTemplate
+    $btnClose.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['ButtonPrimaryForeground']))
+    $btnClose.FontSize = 13
+    $btnClose.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $btnClose.Content = 'Close'
+    $btnClose.Add_Click({ $dlg.Close() }.GetNewClosure())
+    $panel.Children.Add($btnClose) | Out-Null
+
+    $border.Child = $panel
+    $dlg.Content = $border
+    $dlg.ShowDialog() | Out-Null
+}
+
 function Show-DATBuildSummaryDialog {
     <#
     .SYNOPSIS
@@ -2531,6 +2879,49 @@ function Show-DATBuildSummaryDialog {
         $elapsedText.HorizontalAlignment = 'Center'
         $elapsedText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
         $panel.Children.Add($elapsedText) | Out-Null
+    }
+
+    # View Failures button (only when the core module recorded package failures)
+    $failuresJson = $null
+    try {
+        $failuresJson = (Get-ItemProperty -Path $global:RegPath -Name 'BuildFailures' -ErrorAction SilentlyContinue).BuildFailures
+    } catch { $failuresJson = $null }
+    $buildFailures = @()
+    if (-not [string]::IsNullOrEmpty($failuresJson)) {
+        try { $buildFailures = @($failuresJson | ConvertFrom-Json) } catch { $buildFailures = @() }
+    }
+    if ($buildFailures.Count -gt 0) {
+        $btnFailures = [System.Windows.Controls.Button]::new()
+        $btnFailures.Height = 36
+        $btnFailures.HorizontalAlignment = 'Stretch'
+        $btnFailures.Margin = [System.Windows.Thickness]::new(0, 0, 0, 10)
+        $btnFailures.Cursor = [System.Windows.Input.Cursors]::Hand
+        $failTemplate = [System.Windows.Markup.XamlReader]::Parse(@"
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+    <Border x:Name="bd" Background="Transparent" BorderBrush="$($theme['StatusError'])" BorderThickness="1" CornerRadius="8" Padding="16,8">
+        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+    <ControlTemplate.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="#22E74856"/>
+        </Trigger>
+    </ControlTemplate.Triggers>
+</ControlTemplate>
+"@)
+        $btnFailures.Template = $failTemplate
+        $btnFailures.Foreground = $errorBrush
+        $btnFailures.FontSize = 13
+        $btnFailures.FontWeight = [System.Windows.FontWeights]::SemiBold
+        $btnFailures.Content = "View Failures ($($buildFailures.Count))"
+        # Stash the captured data in script scope and use a plain (non-closure) handler.
+        # A GetNewClosure() scriptblock is rebound to a new dynamic module session state,
+        # which cannot see script-level functions like Show-DATBuildFailuresDialog (the
+        # function call would fail with "is not recognized"). A normal scriptblock keeps
+        # this script's session state, so the function resolves correctly.
+        $script:LastBuildFailures = $buildFailures
+        $script:LastBuildCompleteDlg = $dlg
+        $btnFailures.Add_Click({ Show-DATBuildFailuresDialog -Failures $script:LastBuildFailures -Owner $script:LastBuildCompleteDlg })
+        $panel.Children.Add($btnFailures) | Out-Null
     }
 
     # OK button
@@ -5898,6 +6289,8 @@ $script:OSCheckboxes = [ordered]@{
     'Windows 11 23H2' = $Window.FindName('chk_OS_Win11_23H2')
     'Windows 11 22H2' = $Window.FindName('chk_OS_Win11_22H2')
     'Windows 11 21H2' = $Window.FindName('chk_OS_Win11_21H2')
+    'Windows 10 22H2' = $Window.FindName('chk_OS_Win10_22H2')
+    'Windows 10 21H2' = $Window.FindName('chk_OS_Win10_21H2')
 }
 $script:OSBorders = [ordered]@{
     'Windows 11 25H2' = $Window.FindName('border_OS_Win11_25H2')
@@ -5905,6 +6298,8 @@ $script:OSBorders = [ordered]@{
     'Windows 11 23H2' = $Window.FindName('border_OS_Win11_23H2')
     'Windows 11 22H2' = $Window.FindName('border_OS_Win11_22H2')
     'Windows 11 21H2' = $Window.FindName('border_OS_Win11_21H2')
+    'Windows 10 22H2' = $Window.FindName('border_OS_Win10_22H2')
+    'Windows 10 21H2' = $Window.FindName('border_OS_Win10_21H2')
 }
 
 # Backing store for selected OS values -- survives regardless of popup/checkbox state
@@ -5948,7 +6343,11 @@ function Update-DATOSSelectionHighlight {
 # Wire OS checkbox change events -- deferred refresh on popup close (like OEM)
 $script:OSSelectionDirty = $false
 $osSelectionChangedHandler = {
+    param($eventSender, $eArgs)
     if ($script:SuppressOSSync) { return }
+    # Resolve the originating checkbox -- depending on how the event delegate is invoked the
+    # sender may arrive as a positional argument or via the automatic $this variable.
+    if ($null -eq $eventSender) { $eventSender = $this }
     # Rebuild backing store from checkbox state
     $script:SelectedOSValues.Clear()
     foreach ($entry in $script:OSCheckboxes.GetEnumerator()) {
@@ -5956,6 +6355,58 @@ $osSelectionChangedHandler = {
             $script:SelectedOSValues.Add($entry.Key)
         }
     }
+
+    # Legacy OS guard: Windows 10 support is served only from the OEM-direct catalogs,
+    # so Windows 10 and Windows 11 builds are mutually exclusive while the DAT API catalog
+    # is the active source. Whichever family the user just checked wins; the other family
+    # is deselected. Selecting a Windows 10 build also informs the user that the OEM-direct
+    # catalogs are used. Selecting a Windows 11 build switches back to the API silently.
+    if ($chk_UseDATAPICatalog.IsChecked -eq $true -and
+        $eventSender -is [System.Windows.Controls.CheckBox] -and
+        $eventSender.IsChecked -eq $true) {
+        $changedOS = ($script:OSCheckboxes.GetEnumerator() | Where-Object { $_.Value -eq $eventSender } | Select-Object -First 1).Key
+        if ($changedOS -like 'Windows 10*') {
+            $conflicting = @($script:SelectedOSValues | Where-Object { $_ -like 'Windows 11*' })
+            if ($conflicting.Count -gt 0) {
+                $script:SuppressOSSync = $true
+                foreach ($osName in $conflicting) {
+                    $cb = $script:OSCheckboxes[$osName]
+                    if ($null -ne $cb) { $cb.IsChecked = $false }
+                    [void]$script:SelectedOSValues.Remove($osName)
+                }
+                $script:SuppressOSSync = $false
+                Write-DATActivityLog "Windows 10 selected with DAT API catalog enabled -- deselected Windows 11 builds; Windows 10 models are sourced from OEM-direct catalogs." -Level Warn
+                Show-DATInfoDialog -Title 'Legacy OS Support' -Type 'Warning' -Message ("Windows 10 driver support is provided through the OEM direct catalogs rather than the DAT API catalog.`n`nThe selected Windows 11 builds have been deselected so the model list shows the correct devices with Windows 10 support. Windows 10 packages will be sourced directly from each OEM.")
+                # The Legacy OS modal steals focus and closes the OS popup before the
+                # deferred (popup-close) refresh can run, so refresh the model list
+                # explicitly now that the user has acknowledged the change.
+                Update-DATOSDisplayText
+                Update-DATOSSelectionHighlight
+                Set-DATRegistryValue -Name "OS" -Value ((Get-DATSelectedOSes) -join ';') -Type String
+                $script:OSSelectionDirty = $false
+                if ($popup_OS.IsOpen) { $popup_OS.IsOpen = $false }
+                if (-not $script:SuppressModelRefresh -and (Get-DATSelectedOEMs).Count -gt 0 -and (Get-DATSelectedOSes).Count -gt 0) {
+                    if ($script:ModelData.Count -gt 0) { Save-DATModelSelections }
+                    Invoke-DATRefreshModelsClick
+                }
+                return
+            }
+        }
+        elseif ($changedOS -like 'Windows 11*') {
+            $conflicting = @($script:SelectedOSValues | Where-Object { $_ -like 'Windows 10*' })
+            if ($conflicting.Count -gt 0) {
+                $script:SuppressOSSync = $true
+                foreach ($osName in $conflicting) {
+                    $cb = $script:OSCheckboxes[$osName]
+                    if ($null -ne $cb) { $cb.IsChecked = $false }
+                    [void]$script:SelectedOSValues.Remove($osName)
+                }
+                $script:SuppressOSSync = $false
+                Write-DATActivityLog "Windows 11 selected with DAT API catalog enabled -- deselected Windows 10 builds; models will be sourced from the DAT API catalog." -Level Info
+            }
+        }
+    }
+
     Update-DATOSDisplayText
     Update-DATOSSelectionHighlight
     if (-not $script:SuppressModelRefresh) {
@@ -6382,16 +6833,27 @@ $btn_RefreshModels.Add_Click({
 
                     $OSList = $OS -split ';' | Where-Object { $_ }
                     $OEMSupportedModels = @()
+                    # "All" architecture: include both x64 and Arm64 entries (do not filter by arch);
+                    # each model is tagged with its own native architecture below.
+                    $IsAllArch = ($Architecture -eq 'All')
 
                     foreach ($entry in $driverCatalogRaw) {
                         # Filter by selected OEMs
                         if ($entry.Manufacturer -notin $RequiredOEMs) { continue }
 
-                        # Filter by architecture (normalize amd64 -> x64)
+                        # Determine the entry's native architecture (normalize amd64 -> x64)
                         $entryArch = $entry.SupportedArchitecture
+                        $entryArchNorm = 'x64'
                         if ($entryArch) {
-                            $normalizedArch = $entryArch -replace 'amd64', 'x64'
-                            if ($normalizedArch -notmatch [regex]::Escape($Architecture)) { continue }
+                            if ($entryArch -match 'arm') { $entryArchNorm = 'Arm64' } else { $entryArchNorm = 'x64' }
+                            # Filter by architecture unless "All" is selected
+                            if (-not $IsAllArch) {
+                                $normalizedArch = $entryArch -replace 'amd64', 'x64'
+                                if ($normalizedArch -notmatch [regex]::Escape($Architecture)) { continue }
+                            }
+                        } else {
+                            # No architecture metadata -- treat as x64 and respect a specific Arm64 filter
+                            if (-not $IsAllArch -and $Architecture -eq 'Arm64') { continue }
                         }
 
                         # Match OS: API returns various formats like "win11 25H2", "Windows 11 64-bit, 25H2", "Windows11", "Windows 11"
@@ -6414,6 +6876,7 @@ $btn_RefreshModels.Add_Click({
                                     OS         = "$($firstOS[0]) $($firstOS[1])"
                                     'OS Build' = 'All'
                                     Version    = $dellVer
+                                    Architecture = $entryArchNorm
                                     DownloadURL = if ($entry.DownloadURL) { $entry.DownloadURL } else { '' }
                                 }
                                 continue
@@ -6444,6 +6907,7 @@ $btn_RefreshModels.Add_Click({
                                     'OS Build' = $WindowsBuild
                                     Version    = $displayVersion
                                     DriverPackVersion = $hpPackVersion
+                                    Architecture = $entryArchNorm
                                     DownloadURL = if ($entry.DownloadURL) { $entry.DownloadURL } else { '' }
                                 }
                             }
@@ -6502,6 +6966,7 @@ $btn_RefreshModels.Add_Click({
                                     'OS Build' = $WindowsBuild
                                     Version    = $displayVersion
                                     DriverPackVersion = $hpPackVersion
+                                    Architecture = $entryArchNorm
                                     DownloadURL = if ($entry.DownloadURL) { $entry.DownloadURL } else { '' }
                                 }
                             }
@@ -6523,6 +6988,7 @@ $btn_RefreshModels.Add_Click({
                                 OS         = "$($firstOS[0]) $($firstOS[1])"
                                 'OS Build' = 'All'
                                 Version    = $dellDisplayVersion
+                                Architecture = $entryArchNorm
                                 DownloadURL = if ($entry.DownloadURL) { $entry.DownloadURL } else { '' }
                             }
                         }
@@ -6662,9 +7128,21 @@ $btn_RefreshModels.Add_Click({
         # Support multiple OS values separated by semicolons
         $OSList = $OS -split ';' | Where-Object { $_ }
         $OEMSupportedModels = @()
+        # "All" architecture: iterate both x64 and Arm64. Only OEMs whose catalogs are
+        # architecture-aware (Dell, Microsoft) are processed in the Arm64 pass to avoid
+        # duplicating x64-only models as fake Arm64 rows. Each model is stamped with the
+        # iteration's architecture after the OEM loop completes.
+        $OriginalArchitecture = $Architecture
+        $ArchList = if ($Architecture -eq 'All') { @('x64', 'Arm64') } else { @($Architecture) }
+
+        foreach ($ArchIter in $ArchList) {
+        # Reassign $Architecture so existing per-OEM arch filters operate on a concrete value
+        $Architecture = $ArchIter
+        $preArchCount = @($OEMSupportedModels).Count
 
         foreach ($OEM in $RequiredOEMs) {
-            Write-Log "--- Processing $OEM ---"
+            if ($OriginalArchitecture -eq 'All' -and $ArchIter -eq 'Arm64' -and $OEM -notin @('Dell', 'Microsoft')) { continue }
+            Write-Log "--- Processing $OEM ($ArchIter) ---"
             $LogQueue.Enqueue("[SOURCE:${OEM}:Loading]")
             switch ($OEM) {
                 "HP" {
@@ -7065,6 +7543,13 @@ $btn_RefreshModels.Add_Click({
             }
         } # end foreach ($OEM in $RequiredOEMs)
 
+        # Stamp newly-added models with this iteration's architecture
+        for ($archStampIdx = $preArchCount; $archStampIdx -lt @($OEMSupportedModels).Count; $archStampIdx++) {
+            try { $OEMSupportedModels[$archStampIdx] | Add-Member -NotePropertyName 'Architecture' -NotePropertyValue $ArchIter -Force } catch { }
+        }
+        } # end foreach ($ArchIter in $ArchList)
+        $Architecture = $OriginalArchitecture
+
         $totalCount = @($OEMSupportedModels).Count
         Write-Log "=== Complete: $totalCount total models found ===" -Level Success
 
@@ -7211,6 +7696,19 @@ $btn_RefreshModels.Add_Click({
                     if ($latest.Manufacturer -eq 'HP') {
                         $displayName = $displayName -replace '^(HP|Hewlett-Packard|COMPAQ|Compaq)\s+', ''
                     }
+                    if ($latest.Manufacturer -eq 'Dell') {
+                        # Dell BIOS catalog DisplayName prefixes the brand line before the
+                        # actual model, sometimes duplicating the family token
+                        # (e.g. "Precision Precision 5280 XE Compact", "XPS Notebook XPS 13 9340",
+                        # "Latitude Latitude 7455"). The real model name -- matching the Dell
+                        # driver catalog -- begins at the LAST family keyword, so trim everything
+                        # before it.
+                        $dellFamilyPattern = '\b(Latitude|Precision|OptiPlex|XPS|Inspiron|Vostro|Venue|Wyse)\b'
+                        $dellFamilyMatches = [regex]::Matches($displayName, $dellFamilyPattern)
+                        if ($dellFamilyMatches.Count -gt 1) {
+                            $displayName = $displayName.Substring($dellFamilyMatches[$dellFamilyMatches.Count - 1].Index).Trim()
+                        }
+                    }
 
                     $key = "$($latest.Manufacturer)|$displayName"
                     if ($existingKeys.Contains($key) -or $existingNorm.Contains($key)) { continue }
@@ -7254,6 +7752,7 @@ $btn_RefreshModels.Add_Click({
                         'OS Build'  = $WindowsBuild
                         Version     = ''
                         BIOSVersion = $latest.Version
+                        Architecture = 'x64'
                         BIOSOnly    = $true
                     }
                     [void]$existingKeys.Add($key)
@@ -7276,7 +7775,13 @@ $btn_RefreshModels.Add_Click({
     [void]$script:RefreshPS.AddArgument($selectedArch)
     [void]$script:RefreshPS.AddArgument($selectedPackageType)
     [void]$script:RefreshPS.AddArgument($refreshTempDir)
-    [void]$script:RefreshPS.AddArgument(($chk_UseDATAPICatalog.IsChecked -eq $true))
+    # Windows 10 support is only available from OEM-direct catalogs (the DAT API catalog
+    # does not carry reliable Windows 10 data). When any Windows 10 build is selected,
+    # force OEM catalog mode for this refresh regardless of the API toggle, so the model
+    # list reflects the OEM Windows 10 catalogs.
+    $anyWin10Selected = @($selectedOSes | Where-Object { $_ -like 'Windows 10*' }).Count -gt 0
+    $effectiveUseDATAPICatalog = ($chk_UseDATAPICatalog.IsChecked -eq $true) -and (-not $anyWin10Selected)
+    [void]$script:RefreshPS.AddArgument($effectiveUseDATAPICatalog)
     [void]$script:RefreshPS.AddArgument($script:WebRequestTimeoutSec)
     $hpSourceMode = (Get-ItemProperty -Path $global:RegPath -Name 'HPDriverPackSource' -ErrorAction SilentlyContinue).HPDriverPackSource
     if ([string]::IsNullOrEmpty($hpSourceMode)) { $hpSourceMode = 'DriverPack' }
@@ -7312,7 +7817,7 @@ $btn_RefreshModels.Add_Click({
                     Write-DATActivityLog "Fatal error: $($errorResult._Error)" -Level Error
                     $txt_Status.Text = "Error: $($errorResult._Error)"
                 } else {
-                    foreach ($model in ($models | Sort-Object OEM, Model)) {
+                    foreach ($model in ($models | Sort-Object OEM, Model, Architecture)) {
                         if ($null -ne $model -and -not [string]::IsNullOrEmpty($model.Model) -and $null -eq $model._Error) {
                             $modelItem = [ModelItem]@{
                                 Selected   = $false
@@ -7326,6 +7831,7 @@ $btn_RefreshModels.Add_Click({
                                 Version    = if ($model.Version) { $model.Version } else { '' }
                             }
                             # BIOSVersion / BIOSOnly / DownloadURL set separately -- property may not exist on stale cached type
+                            try { $modelItem.Architecture = if ($model.Architecture) { $model.Architecture } else { 'x64' } } catch { }
                             try { $modelItem.BIOSVersion = if ($model.BIOSVersion) { $model.BIOSVersion } else { '' } } catch { }
                             try { $modelItem.BIOSOnly = if ($model.BIOSOnly) { $true } else { $false } } catch { }
                             try { $modelItem.DownloadURL = if ($model.DownloadURL) { $model.DownloadURL } else { '' } } catch { }
@@ -7447,6 +7953,13 @@ function ConvertTo-DATNormalizedModel {
     # HP: strip manufacturer prefix and common suffixes (matches catalog regex strip)
     if ($Make -match '^(HP|Hewlett-Packard|COMPAQ|Compaq)') {
         $m = $m -replace '^(HP|Hewlett-Packard|COMPAQ|Hp|Compaq)\s*', ''
+        # Newer HP "AI PC" / "Next Gen AI PC" inventory names embed a form-factor word
+        # (Notebook/Desktop) immediately before the AI-PC suffix that the OEM driver catalog
+        # omits, e.g. inventory "EliteBook 8 G1i 16 inch Notebook Next Gen AI PC" vs catalog
+        # "EliteBook 8 G1i 16 inch Next Gen AI PC", and "EliteStudio 8 All-in-One G1i 23.8 inch
+        # Desktop AI PC" vs "... 23.8 inch AI PC". Drop the form-factor token so both the device
+        # and catalog names normalize identically and the name fallback match succeeds.
+        $m = $m -replace '\s+(Notebook|Desktop)\s+(Next\s+Gen\s+)?AI\s+PC\b', ' $2AI PC'
         $m = $m -replace '\s+2-in-1\s+Notebook\s+PC$', ''
         $m = $m -replace '\s+Mobile\s+Workstation\s+PC$', ''
         $m = $m -replace '\s+Notebook\s+PC$', ''
@@ -7641,7 +8154,7 @@ function Save-DATModelSelections {
     $jsonPath = Join-Path $settingsDir 'SelectedModels.json'
 
     $selections = @($script:ModelData | Where-Object { $_.Selected } | ForEach-Object {
-        @{ OEM = $_.OEM; Model = $_.Model; Baseboards = $_.Baseboards; OS = $_.OS; Build = $_.Build }
+        @{ OEM = $_.OEM; Model = $_.Model; Baseboards = $_.Baseboards; OS = $_.OS; Build = $_.Build; Architecture = $_.Architecture }
     })
     $json = if ($selections.Count -eq 0) { '[]' } else { $selections | ConvertTo-Json -Depth 2 -Compress }
     Set-Content -Path $jsonPath -Value $json -Encoding UTF8 -Force
@@ -7671,7 +8184,10 @@ function Restore-DATModelSelections {
         foreach ($entry in $saved) {
             $hasBuild = -not [string]::IsNullOrEmpty($entry.Build)
             if ($hasBuild) {
-                [void]$savedExactSet.Add("$($entry.OEM)|$($entry.Model)|$($entry.OS)|$($entry.Build)")
+                # Architecture-aware key: entries saved without an Architecture (legacy)
+                # use '*' so they match any architecture row on restore.
+                $archPart = if (-not [string]::IsNullOrEmpty($entry.Architecture)) { $entry.Architecture } else { '*' }
+                [void]$savedExactSet.Add("$($entry.OEM)|$($entry.Model)|$($entry.OS)|$($entry.Build)|$archPart")
                 $bbKey = "$($entry.OEM)|$($entry.OS)|$($entry.Build)"
             } else {
                 [void]$savedLegacySet.Add("$($entry.OEM)|$($entry.Model)")
@@ -7690,8 +8206,10 @@ function Restore-DATModelSelections {
 
         $matchCount = 0
         foreach ($item in $script:ModelData) {
-            # Primary (new format): exact OEM + Model + OS + Build match
-            if ($savedExactSet.Contains("$($item.OEM)|$($item.Model)|$($item.OS)|$($item.Build)")) {
+            # Primary (new format): exact OEM + Model + OS + Build + Architecture match.
+            # Also accept the '*' architecture wildcard saved by legacy entries.
+            if ($savedExactSet.Contains("$($item.OEM)|$($item.Model)|$($item.OS)|$($item.Build)|$($item.Architecture)") -or
+                $savedExactSet.Contains("$($item.OEM)|$($item.Model)|$($item.OS)|$($item.Build)|*")) {
                 $item.Selected = $true
                 $matchCount++
                 continue
@@ -8376,7 +8894,7 @@ $btn_Build.Add_Click({
             Model            = $model.Model
             Baseboards       = $model.Baseboards
             OS               = $osForPackage
-            Architecture     = $selectedArch
+            Architecture     = if (-not [string]::IsNullOrEmpty($model.Architecture)) { $model.Architecture } else { $selectedArch }
             CustomDriverPath = $model.CustomDriverPath
             Version          = $model.Version
             BIOSVersion      = $(try { $model.BIOSVersion } catch { '' })
@@ -8448,7 +8966,7 @@ $btn_Build.Add_Click({
     $script:BuildPS = [powershell]::Create()
     $script:BuildPS.Runspace = $script:BuildRunspace
     [void]$script:BuildPS.AddScript({
-        param($ModulePath, $ScriptDir, $RegPath, $RunningMode, $SelectedModels, $StoragePath, $PackagePath, $IntuneToken, $IntuneRefreshTok, $IntuneAuthClientIdParam, $IntuneTokenExpSec, $DisableToast, $DisableRestart, $SiteServer, $SiteCode, $PackageType, $DPGroups, $DPs, $DistPriority, $EnableBDR, $DebugBuildPath, $CustomBrandingPath, $HPPasswordBinPath, $ToastTimeoutAction, $MaxDeferrals, $BIOSRestartDelayMinutes, $TeamsWebhookUrl, $TeamsNotificationsEnabled, $CustomToastTextsJson, $ConsoleFolderID, $MaintenanceWindowsJson, $AlarmMode)
+        param($ModulePath, $ScriptDir, $RegPath, $RunningMode, $SelectedModels, $StoragePath, $PackagePath, $IntuneToken, $IntuneRefreshTok, $IntuneAuthClientIdParam, $IntuneTokenExpSec, $DisableToast, $DisableRestart, $SiteServer, $SiteCode, $PackageType, $DPGroups, $DPs, $DistPriority, $EnableBDR, $DebugBuildPath, $CustomBrandingPath, $HPPasswordBinPath, $ToastTimeoutAction, $MaxDeferrals, $BIOSRestartDelayMinutes, $TeamsWebhookUrl, $TeamsNotificationsEnabled, $CustomToastTextsJson, $ConsoleFolderID, $MaintenanceWindowsJson, $AlarmMode, $CreateIntuneWinOnly)
         try {
         Import-Module $ModulePath -Force
         $procParams = @{
@@ -8466,6 +8984,7 @@ $btn_Build.Add_Click({
         if ($DisableToast) { $procParams['DisableToast'] = $true }
         if ($DisableRestart) { $procParams['DisableRestart'] = $true }
         if ($AlarmMode) { $procParams['AlarmMode'] = $true }
+        if ($CreateIntuneWinOnly) { $procParams['CreateIntuneWinOnly'] = $true }
         if ($ToastTimeoutAction -ne 'RemindMeLater') { $procParams['ToastTimeoutAction'] = $ToastTimeoutAction }
         if ($MaxDeferrals -gt 0) { $procParams['MaxDeferrals'] = $MaxDeferrals }
         if ($BIOSRestartDelayMinutes -gt 0 -and $BIOSRestartDelayMinutes -ne 10) { $procParams['RestartDelaySeconds'] = $BIOSRestartDelayMinutes * 60 }
@@ -8534,6 +9053,9 @@ $btn_Build.Add_Click({
 
     # Read the Critical Notification (alarm mode) state (Intune only) -- bypasses Focus Assist / DND
     $alarmMode = ($selectedPlatform -eq 'Intune') -and ($chk_CriticalNotification.IsChecked -eq $true)
+
+    # Read the Create IntuneWin Only state (Intune only) -- builds .intunewin without uploading
+    $createIntuneWinOnly = ($selectedPlatform -eq 'Intune') -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
 
     # Read toast behaviour settings (Intune only)
     $biosTimeoutAction = if ($cmb_BIOSTimeoutAction.SelectedIndex -eq 1) { 'InstallNow' } else { 'RemindMeLater' }
@@ -8632,6 +9154,9 @@ $btn_Build.Add_Click({
 
     # Critical Notification / alarm mode (Intune only) -- last positional argument
     [void]$script:BuildPS.AddArgument($alarmMode)
+
+    # Create IntuneWin Only (Intune only) -- build .intunewin without uploading to Intune
+    [void]$script:BuildPS.AddArgument($createIntuneWinOnly)
 
     $script:BuildAsyncResult = $script:BuildPS.BeginInvoke()
 
@@ -8942,7 +9467,8 @@ $btn_Build.Add_Click({
                     $modelKeys = @()
                     if ($null -ne $script:SelectedModels) {
                         $modelKeys = @($script:SelectedModels | ForEach-Object {
-                            "$($_.OEM)|$($_.Model)|$selectedOS|$selectedArch|$($_.PackageType)"
+                            $keyArch = if (-not [string]::IsNullOrEmpty($_.Architecture)) { $_.Architecture } else { $selectedArch }
+                            "$($_.OEM)|$($_.Model)|$selectedOS|$keyArch|$($_.PackageType)"
                         })
                     }
                     if ($modelKeys.Count -gt 0) {
@@ -10056,7 +10582,10 @@ function Update-DATKnownModelSelection {
         Write-DATActivityLog "Known model match summary: $matchedUnique of $uniqueCount queried device models matched a catalog entry; $($unmatchedDevices.Count) unmatched (no driver package for the selected OS/architecture):" -Level Warn
         foreach ($dev in ($unmatchedDevices | Sort-Object Make, Model)) {
             $bbInfo = if (-not [string]::IsNullOrWhiteSpace($dev.Baseboard)) { " (SKU: $($dev.Baseboard))" } else { '' }
-            Write-DATActivityLog "    - $($dev.Make) $($dev.Model)$bbInfo" -Level Info
+            # Collapse a duplicated leading manufacturer token -- some inventory Model values
+            # already include the Make, which otherwise renders as "HP HP EliteBook ...".
+            $devLine = "$($dev.Make) $($dev.Model)".Trim() -replace '^(\S+)\s+\1\b', '$1'
+            Write-DATActivityLog "    - $devLine$bbInfo" -Level Info
         }
     } elseif ($uniqueCount -gt 0) {
         Write-DATActivityLog "Known model match summary: all $uniqueCount queried device models matched a catalog entry." -Level Success
@@ -10507,6 +11036,140 @@ $cmb_DistPriority.Add_SelectionChanged({
         Set-DATRegistryValue -Name 'DistributionPriority' -Value $cmb_DistPriority.SelectedItem.Content -Type String
     }
 })
+
+# --- XML Logic Package controls ---
+$chk_XmlLogicCreatePackage = $Window.FindName('chk_XmlLogicCreatePackage')
+$txt_XmlLogicCreatePackageState = $Window.FindName('txt_XmlLogicCreatePackageState')
+$btn_GenerateXmlLogicPackage = $Window.FindName('btn_GenerateXmlLogicPackage')
+$txt_XmlLogicStatus = $Window.FindName('txt_XmlLogicStatus')
+
+if ($null -ne $chk_XmlLogicCreatePackage) {
+    $chk_XmlLogicCreatePackage.Add_Checked({
+        Set-DATRegistryValue -Name 'XmlLogicCreatePackage' -Value 1 -Type DWord
+        if ($null -ne $txt_XmlLogicCreatePackageState) {
+            $txt_XmlLogicCreatePackageState.Text = 'Create & distribute as package'
+            $txt_XmlLogicCreatePackageState.Foreground = $Window.FindResource('AccentColor')
+        }
+    })
+    $chk_XmlLogicCreatePackage.Add_Unchecked({
+        Set-DATRegistryValue -Name 'XmlLogicCreatePackage' -Value 0 -Type DWord
+        if ($null -ne $txt_XmlLogicCreatePackageState) {
+            $txt_XmlLogicCreatePackageState.Text = 'Write XML file only'
+            $txt_XmlLogicCreatePackageState.Foreground = $Window.FindResource('InputPlaceholder')
+        }
+    })
+}
+
+if ($null -ne $btn_GenerateXmlLogicPackage) {
+    $btn_GenerateXmlLogicPackage.Add_Click({
+        # Validate ConfigMgr connection
+        if ([string]::IsNullOrEmpty($global:SiteServer) -or [string]::IsNullOrEmpty($global:SiteCode)) {
+            $txt_XmlLogicStatus.Text = 'Connect to a ConfigMgr site server first (ConfigMgr > Environment).'
+            $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusWarning')
+            return
+        }
+
+        # Resolve the package storage path used for the XML output folder
+        $regConfig = Get-ItemProperty -Path $global:RegPath -ErrorAction SilentlyContinue
+        $pkgStoragePath = if ($regConfig -and -not [string]::IsNullOrEmpty($regConfig.PackageStoragePath)) { $regConfig.PackageStoragePath } else { $null }
+        if ([string]::IsNullOrEmpty($pkgStoragePath)) {
+            $txt_XmlLogicStatus.Text = 'Set a package storage path in Common Settings first.'
+            $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusWarning')
+            return
+        }
+
+        # Gather distribution selections (only used when wrapping as a package)
+        $createPkg = ($chk_XmlLogicCreatePackage.IsChecked -eq $true)
+        $dpGroups = @($script:DPGroupData | Where-Object { $_.Selected } | Select-Object -ExpandProperty Name)
+        $dps = @($script:DPData | Where-Object { $_.Selected } | Select-Object -ExpandProperty Name)
+        $distPriority = if ($null -ne $cmb_DistPriority.SelectedItem) { $cmb_DistPriority.SelectedItem.Content } else { 'Normal' }
+        $enableBDR = ($chk_BinaryDiffReplication.IsChecked -eq $true)
+
+        $btn_GenerateXmlLogicPackage.IsEnabled = $false
+        $txt_XmlLogicStatus.Text = 'Generating XML Logic Package...'
+        $txt_XmlLogicStatus.Foreground = $Window.FindResource('InputPlaceholder')
+
+        # Run generation in a background runspace to keep the UI responsive. State and timer
+        # MUST be script-scoped: a DispatcherTimer Tick handler runs in its own scope and cannot
+        # see variables declared locally inside this Click handler (they would be $null at tick
+        # time, throwing "cannot call a method on a null-valued expression").
+        $script:XmlLogicState = [hashtable]::Synchronized(@{
+            Status = 'Running'; Result = $null; Error = $null; PS = $null; AsyncResult = $null
+        })
+
+        $xmlPS = [powershell]::Create()
+        [void]$xmlPS.AddScript({
+            param ($CoreModulePath, $SiteServer, $SiteCode, $PackagePath, $CreatePkg, $DPGroups, $DPs, $Priority, $EnableBDR, $State)
+            try {
+                Import-Module $CoreModulePath -Force
+                $params = @{
+                    SiteServer  = $SiteServer
+                    SiteCode    = $SiteCode
+                    PackagePath = $PackagePath
+                    Priority    = $Priority
+                }
+                if ($CreatePkg) {
+                    $params['CreatePackage'] = $true
+                    if ($DPGroups -and $DPGroups.Count -gt 0) { $params['DistributionPointGroups'] = $DPGroups }
+                    if ($DPs -and $DPs.Count -gt 0) { $params['DistributionPoints'] = $DPs }
+                    if ($EnableBDR) { $params['EnableBinaryDeltaReplication'] = $true }
+                }
+                $State.Result = New-DATXmlLogicPackage @params
+                $State.Status = 'Complete'
+            } catch {
+                $State.Error = $_.Exception.Message
+                $State.Status = 'Failed'
+            }
+        })
+        [void]$xmlPS.AddArgument((Resolve-Path $CoreModulePath).Path)
+        [void]$xmlPS.AddArgument($global:SiteServer)
+        [void]$xmlPS.AddArgument($global:SiteCode)
+        [void]$xmlPS.AddArgument($pkgStoragePath)
+        [void]$xmlPS.AddArgument($createPkg)
+        [void]$xmlPS.AddArgument($dpGroups)
+        [void]$xmlPS.AddArgument($dps)
+        [void]$xmlPS.AddArgument($distPriority)
+        [void]$xmlPS.AddArgument($enableBDR)
+        [void]$xmlPS.AddArgument($script:XmlLogicState)
+        $script:XmlLogicState.PS = $xmlPS
+        $script:XmlLogicState.AsyncResult = $xmlPS.BeginInvoke()
+
+        # Poll for completion. Timer is script-scoped so the Tick closure can stop it.
+        $script:XmlLogicTimer = [System.Windows.Threading.DispatcherTimer]::new()
+        $script:XmlLogicTimer.Interval = [TimeSpan]::FromMilliseconds(400)
+        $script:XmlLogicTimer.Add_Tick({
+            if ($script:XmlLogicState.Status -ne 'Running') {
+                $script:XmlLogicTimer.Stop()
+                try { $script:XmlLogicState.PS.EndInvoke($script:XmlLogicState.AsyncResult) } catch { }
+                try { $script:XmlLogicState.PS.Dispose() } catch { }
+                $btn_GenerateXmlLogicPackage.IsEnabled = $true
+
+                if ($script:XmlLogicState.Status -eq 'Complete' -and $null -ne $script:XmlLogicState.Result) {
+                    $r = $script:XmlLogicState.Result
+                    switch ($r.Status) {
+                        'NoPackages' {
+                            $txt_XmlLogicStatus.Text = 'No matching driver packages found in ConfigMgr.'
+                            $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusWarning')
+                        }
+                        'Failed' {
+                            $txt_XmlLogicStatus.Text = "Failed: $($r.Error)"
+                            $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusError')
+                        }
+                        default {
+                            $pkgNote = if ($r.PackageID) { " | Package $($r.PackageID) ($($r.Status))" } else { '' }
+                            $txt_XmlLogicStatus.Text = "Done. $($r.PackageCount) package(s) written to DriverPackages.xml$pkgNote"
+                            $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusSuccess')
+                        }
+                    }
+                } else {
+                    $txt_XmlLogicStatus.Text = "Failed: $($script:XmlLogicState.Error)"
+                    $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusError')
+                }
+            }
+        })
+        $script:XmlLogicTimer.Start()
+    })
+}
 
 # --- Source Folder Cleanup toggle ---
 $chk_DeleteSourceFolder = $Window.FindName('chk_DeleteSourceFolder')
@@ -11342,7 +12005,7 @@ function Invoke-DATPackageRefresh {
 
     # Build the name prefix: "Drivers -", "Drivers Pilot -", "BIOS Update Retired -", etc.
     $typePrefix = switch ($pkgType) {
-        'BIOS Update'    { 'BIOS Update' }
+        'BIOS'           { 'BIOS Update' }
         'Drivers Pilot'  { 'Drivers Pilot' }
         'BIOS Pilot'     { 'BIOS Update Pilot' }
         default          { 'Drivers' }
@@ -11356,10 +12019,15 @@ function Invoke-DATPackageRefresh {
             default   { '' }
         }
     }
-    # Handle "All Pilot" - query both prefixes
+    # Handle "All Pilot" - query both pilot prefixes
     if ($pkgType -eq 'All Pilot') {
         $namePrefix = $null  # Signal to query both
         $namePrefixes = @('Drivers Pilot -*', 'BIOS Update Pilot -*')
+    } elseif ($pkgType -eq 'All') {
+        # "All" returns both Drivers and BIOS packages (for the selected deployment state),
+        # but never the Pilot package types.
+        $namePrefix = $null  # Signal to query both
+        $namePrefixes = @("Drivers$stateInfix -*", "BIOS Update$stateInfix -*")
     } else {
         $namePrefix = "$typePrefix$stateInfix -*"
         $namePrefixes = @($namePrefix)
@@ -13025,6 +13693,7 @@ $btn_ScheduleSave.Add_Click({
 
     $schedDisableToast = ($schedPlatform -eq 'Intune') -and ($chk_DisableToastPrompt.IsChecked -eq $true)
     $schedDisableRestart = ($schedPlatform -eq 'Intune') -and ($chk_DisableBIOSRestart.IsChecked -eq $true)
+    $schedCreateWinOnly = ($schedPlatform -eq 'Intune') -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
     $schedTimeoutAction = if ($cmb_BIOSTimeoutAction.SelectedIndex -eq 1) { 'InstallNow' } else { 'RemindMeLater' }
     $schedMaxDeferrals = if (($chk_EnableMaxDeferrals.IsChecked -eq $true) -and ($txt_MaxDeferrals.Text -match '^\d+$')) { [int]$txt_MaxDeferrals.Text } else { 0 }
     $schedBIOSRestartDelay = if (($txt_BIOSRestartDelay.Text -match '^\d+$')) { [int]$txt_BIOSRestartDelay.Text } else { 10 }
@@ -13065,7 +13734,8 @@ $btn_ScheduleSave.Add_Click({
             -TeamsWebhookUrl $schedTeamsUrl -TeamsNotificationsEnabled $schedTeamsEnabled -ConfigMgr $schedCM `
             -Intune $schedIntune `
             -MaintenanceWindowEnabled $schedMWEnabled -MaintenanceWindowMode $schedMWMode -MaintenanceWindows $schedMWindows `
-            -CleanTempOnExit $schedCleanTemp
+            -CleanTempOnExit $schedCleanTemp `
+            -CreateIntuneWinOnly $schedCreateWinOnly
     } catch {
         Show-DATInfoDialog -Title 'Schedule Error' `
             -Message "Failed to export build config:`n`n$($_.Exception.Message)" `
@@ -13410,6 +14080,22 @@ $cmb_DismCompression.Add_SelectionChanged({
         }
         Set-DATRegistryValue -Name 'DismCompression' -Value $val -Type String
     }
+})
+
+# Disable WIM Compression for Configuration Manager
+$chk_DisableConfigMgrWim      = $Window.FindName('chk_DisableConfigMgrWim')
+$txt_DisableConfigMgrWimState = $Window.FindName('txt_DisableConfigMgrWimState')
+$chk_DisableConfigMgrWim.Add_Checked({
+    Set-DATRegistryValue -Name 'DisableConfigMgrWim' -Value 1 -Type DWord
+    $txt_DisableConfigMgrWimState.Text       = 'On'
+    $txt_DisableConfigMgrWimState.Foreground = $Window.FindResource('AccentColor')
+    Write-DATActivityLog 'WIM Packaging: ConfigMgr WIM compression disabled (expanded driver content)' -Level Info
+})
+$chk_DisableConfigMgrWim.Add_Unchecked({
+    Set-DATRegistryValue -Name 'DisableConfigMgrWim' -Value 0 -Type DWord
+    $txt_DisableConfigMgrWimState.Text       = 'Off'
+    $txt_DisableConfigMgrWimState.Foreground = $Window.FindResource('InputPlaceholder')
+    Write-DATActivityLog 'WIM Packaging: ConfigMgr WIM compression enabled' -Level Info
 })
 
 #endregion WIM Packaging Options
@@ -13998,6 +14684,9 @@ $btn_CustomBuild.Add_Click({
     # Read the Critical Notification (alarm mode) state (Intune only) -- bypasses Focus Assist / DND
     $alarmMode = ($platform -eq 'Intune') -and ($chk_CriticalNotification.IsChecked -eq $true)
 
+    # Read the Create IntuneWin Only state (Intune only) -- builds .intunewin without uploading
+    $createIntuneWinOnly = ($platform -eq 'Intune') -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
+
     # Read the Debug Package Build state (Intune only)
     $debugBuildPath = if (($platform -eq 'Intune') -and ($chk_DebugPackageBuild.IsChecked -eq $true) -and
         (-not [string]::IsNullOrEmpty($txt_DebugBuildPath.Text))) { $txt_DebugBuildPath.Text } else { $null }
@@ -14023,7 +14712,7 @@ $btn_CustomBuild.Add_Click({
     [void]$script:CustomBuildPS.AddScript({
         param($ModulePath, $Make, $Model, $BaseBoard, $Platform, $TempStorage, $PackageStorage, $RegPath,
               $OSLabel, $Architecture, $Version, $ScriptDir, $IntuneToken, $SiteServer, $SiteCode, $DisableToast, $TotalSteps,
-              $Method, $DriverFolderPath, $DPGroups, $DPs, $DistPriority, $DebugBuildPath, $CustomBrandingPath, $AlarmMode)
+              $Method, $DriverFolderPath, $DPGroups, $DPs, $DistPriority, $DebugBuildPath, $CustomBrandingPath, $AlarmMode, $CreateIntuneWinOnly)
 
         Import-Module $ModulePath -Force
         $global:ScriptDirectory = $ScriptDir
@@ -14514,16 +15203,21 @@ $btn_CustomBuild.Add_Click({
                 if (-not [string]::IsNullOrEmpty($DebugBuildPath)) { $intuneCreateParams['DebugBuildPath'] = $DebugBuildPath }
                 if (-not [string]::IsNullOrEmpty($CustomBrandingPath)) { $intuneCreateParams['CustomBrandingPath'] = $CustomBrandingPath }
                 if ($AlarmMode) { $intuneCreateParams['AlarmMode'] = $true }
+                if ($CreateIntuneWinOnly) { $intuneCreateParams['CreateIntuneWinOnly'] = $true }
                 $packageResult = Invoke-DATIntunePackageCreation @intuneCreateParams
-                Write-DATLogEntry -Value "- [Intune] - Package uploaded successfully" -Severity 1
+                if ($CreateIntuneWinOnly) {
+                    Write-DATLogEntry -Value "- [Intune] - IntuneWin file created (upload skipped)" -Severity 1
+                } else {
+                    Write-DATLogEntry -Value "- [Intune] - Package uploaded successfully" -Severity 1
+                }
                 # Remove the staging WIM folder now that the Intune package has been created
                 if (Test-Path $pkgFolder) {
                     Remove-Item $pkgFolder -Recurse -Force -ErrorAction SilentlyContinue
                     Write-DATLogEntry -Value "- [Intune] - Removed staging WIM folder: $pkgFolder" -Severity 1
                 }
                 Set-Phase -Phase "Complete" -Percent 100 `
-                          -Message "Intune package uploaded successfully" `
-                          -Step "Step 3 of 3 -- Package uploaded to Intune"
+                          -Message $(if ($CreateIntuneWinOnly) { "IntuneWin file created (upload skipped)" } else { "Intune package uploaded successfully" }) `
+                          -Step $(if ($CreateIntuneWinOnly) { "Step 3 of 3 -- IntuneWin file created (upload skipped)" } else { "Step 3 of 3 -- Package uploaded to Intune" })
             } else {
                 # Configuration Manager
                 if (-not [string]::IsNullOrEmpty($SiteServer) -and -not [string]::IsNullOrEmpty($SiteCode)) {
@@ -14623,6 +15317,7 @@ $btn_CustomBuild.Add_Click({
     [void]$script:CustomBuildPS.AddArgument($debugBuildPath)
     [void]$script:CustomBuildPS.AddArgument($script:CustomBrandingImagePath)
     [void]$script:CustomBuildPS.AddArgument($alarmMode)
+    [void]$script:CustomBuildPS.AddArgument($createIntuneWinOnly)
     $script:CustomBuildAsyncResult = $script:CustomBuildPS.BeginInvoke()
 
     # Poll registry for progress updates
@@ -15292,6 +15987,21 @@ $chk_DeployAllDevices.Add_Unchecked({
     $txt_DeployAllState.Text = 'Off'
     $txt_DeployAllState.Foreground = $Window.FindResource('InputPlaceholder')
     Write-DATActivityLog "Package Deployment: Deploy to All Devices disabled" -Level Info
+})
+
+$chk_CreateIntuneWinOnly = $Window.FindName('chk_CreateIntuneWinOnly')
+$txt_CreateIntuneWinOnlyState = $Window.FindName('txt_CreateIntuneWinOnlyState')
+$chk_CreateIntuneWinOnly.Add_Checked({
+    Set-DATRegistryValue -Name "IntuneCreateWinOnly" -Value 1 -Type DWord
+    $txt_CreateIntuneWinOnlyState.Text = 'On'
+    $txt_CreateIntuneWinOnlyState.Foreground = $Window.FindResource('AccentColor')
+    Write-DATActivityLog "Package Output: Create IntuneWin file only (skip upload) enabled" -Level Info
+})
+$chk_CreateIntuneWinOnly.Add_Unchecked({
+    Set-DATRegistryValue -Name "IntuneCreateWinOnly" -Value 0 -Type DWord
+    $txt_CreateIntuneWinOnlyState.Text = 'Off'
+    $txt_CreateIntuneWinOnlyState.Foreground = $Window.FindResource('InputPlaceholder')
+    Write-DATActivityLog "Package Output: Create IntuneWin file only (skip upload) disabled" -Level Info
 })
 
 # Assignment Filter settings
@@ -16064,6 +16774,100 @@ $btn_ClearCustomBranding.Add_Click({
     # then remove the property entirely (Remove-ItemProperty can silently fail depending on permissions)
     Set-DATRegistryValue -Name 'CustomBrandingPath' -Value '' -Type String
     Remove-ItemProperty -Path $global:RegPath -Name 'CustomBrandingPath' -ErrorAction SilentlyContinue
+})
+
+# Intune Package Icon -- custom PNG used as the Win32 app large icon
+$txt_IntunePackageIconPath    = $Window.FindName('txt_IntunePackageIconPath')
+$btn_BrowseIntunePackageIcon  = $Window.FindName('btn_BrowseIntunePackageIcon')
+$btn_ClearIntunePackageIcon   = $Window.FindName('btn_ClearIntunePackageIcon')
+$img_IntunePackageIconPreview = $Window.FindName('img_IntunePackageIconPreview')
+$txt_IntuneIconPlaceholder    = $Window.FindName('txt_IntuneIconPlaceholder')
+$panel_IntuneIconValidation   = $Window.FindName('panel_IntuneIconValidation')
+$txt_IntuneIconValidationIcon = $Window.FindName('txt_IntuneIconValidationIcon')
+$txt_IntuneIconValidationText = $Window.FindName('txt_IntuneIconValidationText')
+
+function Set-DATIntuneIconPreview {
+    param([Parameter()][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrEmpty($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        $img_IntunePackageIconPreview.Source = $null
+        $img_IntunePackageIconPreview.Visibility = 'Collapsed'
+        $txt_IntuneIconPlaceholder.Visibility = 'Visible'
+        return
+    }
+    try {
+        # OnLoad caching reads the file fully then releases the handle, so the PNG is
+        # not locked for the process lifetime (allows Clear/overwrite later).
+        $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
+        $bmp.BeginInit()
+        $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
+        $bmp.UriSource = [Uri]::new($Path)
+        $bmp.EndInit()
+        $img_IntunePackageIconPreview.Source = $bmp
+        $img_IntunePackageIconPreview.Visibility = 'Visible'
+        $txt_IntuneIconPlaceholder.Visibility = 'Collapsed'
+    } catch {
+        $img_IntunePackageIconPreview.Source = $null
+        $img_IntunePackageIconPreview.Visibility = 'Collapsed'
+        $txt_IntuneIconPlaceholder.Visibility = 'Visible'
+    }
+}
+
+function Show-DATIntuneIconValidation {
+    param([string]$Glyph, [string]$Message, [string]$ColorHex)
+    $panel_IntuneIconValidation.Visibility = 'Visible'
+    $txt_IntuneIconValidationIcon.Text = $Glyph
+    $txt_IntuneIconValidationIcon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($ColorHex))
+    $txt_IntuneIconValidationText.Text = $Message
+    $txt_IntuneIconValidationText.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($ColorHex))
+}
+
+# Restore persisted custom package icon
+$savedIconPath = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneCustomIconPath' -ErrorAction SilentlyContinue).IntuneCustomIconPath
+if (-not [string]::IsNullOrEmpty($savedIconPath) -and (Test-Path -LiteralPath $savedIconPath)) {
+    $txt_IntunePackageIconPath.Text = $savedIconPath
+    Set-DATIntuneIconPreview -Path $savedIconPath
+    try {
+        Add-Type -AssemblyName System.Drawing
+        $img = [System.Drawing.Image]::FromFile($savedIconPath)
+        $w = $img.Width; $h = $img.Height; $img.Dispose()
+        Show-DATIntuneIconValidation -Glyph ([string][char]0xE73E) -Message "Custom icon active -- ${w} x ${h} pixels" -ColorHex '#2ECC40'
+    } catch { }
+}
+
+$btn_BrowseIntunePackageIcon.Add_Click({
+    $ofd = [Microsoft.Win32.OpenFileDialog]::new()
+    $ofd.Title = "Select custom package icon"
+    $ofd.Filter = "PNG Images (*.png)|*.png"
+    if ($ofd.ShowDialog() -eq $true) {
+        $filePath = $ofd.FileName
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $img = [System.Drawing.Image]::FromFile($filePath)
+            $w = $img.Width; $h = $img.Height; $img.Dispose()
+
+            $txt_IntunePackageIconPath.Text = $filePath
+            Set-DATIntuneIconPreview -Path $filePath
+            Set-DATRegistryValue -Name 'IntuneCustomIconPath' -Value $filePath -Type String
+
+            if ($w -eq $h) {
+                Show-DATIntuneIconValidation -Glyph ([string][char]0xE73E) -Message "Perfect -- ${w} x ${h} pixels (square)" -ColorHex '#2ECC40'
+            } else {
+                Show-DATIntuneIconValidation -Glyph ([string][char]0xE7BA) -Message "Image is ${w} x ${h} -- a square image is recommended. Intune will adjust it to fit." -ColorHex '#E8A035'
+            }
+        } catch {
+            Show-DATIntuneIconValidation -Glyph ([string][char]0xEA39) -Message "Invalid image file: $($_.Exception.Message)" -ColorHex '#E74C3C'
+        }
+    }
+})
+
+$btn_ClearIntunePackageIcon.Add_Click({
+    $txt_IntunePackageIconPath.Text = ''
+    Set-DATIntuneIconPreview -Path ''
+    $panel_IntuneIconValidation.Visibility = 'Collapsed'
+    Set-DATRegistryValue -Name 'IntuneCustomIconPath' -Value '' -Type String
+    Remove-ItemProperty -Path $global:RegPath -Name 'IntuneCustomIconPath' -ErrorAction SilentlyContinue
 })
 
 # Custom Toast Text -- Per notification type customization
@@ -17797,14 +18601,14 @@ function Update-DATIntuneAppFilter {
 
     # Build the display name prefix to match: "Drivers -" or "BIOS -"
     $typePrefix = switch ($pkgType) {
-        'BIOS Update'    { 'BIOS ' }
+        'BIOS'           { 'BIOS ' }
         'Drivers Pilot'  { 'Drivers Pilot ' }
         'BIOS Pilot'     { 'BIOS Pilot ' }
         'All Pilot'      { $null }
         default          { 'Drivers ' }
     }
 
-    $isBios = ($pkgType -in @('BIOS Update', 'BIOS Pilot'))
+    $isBios = ($pkgType -in @('BIOS', 'BIOS Pilot'))
     $hasOem = ($oemFilter -ne 'All')
     $hasOs = (-not $isBios -and $osFilter -ne 'All')
 
@@ -18337,12 +19141,22 @@ $btn_VerifyIntunePermissions.Add_Click({
     # Permission rows container
     $permItemsPanel = [System.Windows.Controls.StackPanel]::new()
 
-    # Create placeholder rows for the three permissions (pending state)
+    # Create placeholder rows for the required permissions (pending state).
+    # This list MUST mirror the permission checks performed by Test-DATIntunePermissions
+    # in the core module -- otherwise a permission returned by the backend has no
+    # placeholder icon row and is silently skipped when results are applied.
     $requiredPerms = @(
         @{ Name = 'DeviceManagementApps.ReadWrite.All'; Description = 'Create and manage Win32 app packages' }
         @{ Name = 'DeviceManagementManagedDevices.Read.All'; Description = 'Read managed devices for model lookup' }
         @{ Name = 'GroupMember.Read.All'; Description = 'Read group memberships for deployment targeting' }
     )
+
+    # Assignment filter automation requires an extra permission. The backend only checks
+    # it when AutoAssignmentFilter is enabled, so add the matching placeholder row here.
+    $autoFilterReg = (Get-ItemProperty -Path $global:RegPath -Name 'AutoAssignmentFilter' -ErrorAction SilentlyContinue).AutoAssignmentFilter
+    if ($null -ne $autoFilterReg -and $autoFilterReg -eq 1) {
+        $requiredPerms += @{ Name = 'DeviceManagementConfiguration.ReadWrite.All'; Description = 'Create and manage assignment filters' }
+    }
     $script:PermDlgIcons = @{}
     foreach ($rp in $requiredPerms) {
         $rpRow = [System.Windows.Controls.Grid]::new()
@@ -19957,6 +20771,26 @@ $script:btn_ApplyUpdate.Add_Click({
             try { Write-DATLogEntry -Value "[Update] $Message" -Severity $severity } catch { }
         }
 
+        # Resilient copy -- the running app may hold a read lock on files such as
+        # Branding\DATLogo.ico (the WPF window icon). Retry briefly, then skip the
+        # locked file with a warning rather than aborting the whole update (#819).
+        function Copy-UpdateFileSafe {
+            param([string]$Source, [string]$Destination)
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+                try {
+                    Copy-Item -Path $Source -Destination $Destination -Force -ErrorAction Stop
+                    return $true
+                } catch {
+                    if ($attempt -lt 3) {
+                        Start-Sleep -Milliseconds 400
+                    } else {
+                        Write-UpdateLog "Could not replace locked file '$Destination' -- $($_.Exception.Message). Skipping (refreshes on next launch)." -Level Warn
+                        return $false
+                    }
+                }
+            }
+        }
+
         try {
             Write-UpdateLog "Loading core module..."
             Import-Module $CoreModulePath -Force -ErrorAction Stop
@@ -20073,14 +20907,14 @@ $script:btn_ApplyUpdate.Add_Click({
                         if (-not (Test-Path $destFileDir)) {
                             New-Item -Path $destFileDir -ItemType Directory -Force | Out-Null
                         }
-                        Copy-Item -Path $srcFile.FullName -Destination $destFile -Force
+                        Copy-UpdateFileSafe -Source $srcFile.FullName -Destination $destFile | Out-Null
                         $filesCopied++
                         Write-UpdateLog "  $($item.Name)$relativePath"
                     }
                     $copiedCount++
                     Write-UpdateLog "Replaced folder: $($item.Name) ($($sourceFiles.Count) files)"
                 } else {
-                    Copy-Item -Path $item.FullName -Destination $destPath -Force
+                    Copy-UpdateFileSafe -Source $item.FullName -Destination $destPath | Out-Null
                     $copiedCount++
                     $filesCopied++
                     Write-UpdateLog "Replaced file: $($item.Name)"
@@ -20768,6 +21602,18 @@ try {
             Write-Host "Disabled" -ForegroundColor DarkYellow
         }
 
+        # Restore Create IntuneWin Only
+        Write-Host "  IntuneWin Only: " -NoNewline -ForegroundColor DarkGray
+        if ($null -ne $savedConfig.IntuneCreateWinOnly -and $savedConfig.IntuneCreateWinOnly -eq 1) {
+            $chk_CreateIntuneWinOnly.IsChecked = $true
+            $txt_CreateIntuneWinOnlyState.Text = 'On'
+            $txt_CreateIntuneWinOnlyState.Foreground = $Window.FindResource('AccentColor')
+            Write-Host "Enabled" -ForegroundColor Green
+        } else {
+            $txt_CreateIntuneWinOnlyState.Text = 'Off'
+            Write-Host "Disabled" -ForegroundColor DarkYellow
+        }
+
         # Restore Assignment Filter settings
         Write-Host "  Auto Filters  : " -NoNewline -ForegroundColor DarkGray
         if ($null -ne $savedConfig.AutoAssignmentFilter -and $savedConfig.AutoAssignmentFilter -eq 1) {
@@ -20815,6 +21661,18 @@ try {
         } else {
             $txt_PackageRetentionState.Text = 'Off'
             Write-Host "Disabled" -ForegroundColor DarkYellow
+        }
+
+        # Restore Disable WIM Compression for Configuration Manager
+        Write-Host "  CM WIM Comp   : " -NoNewline -ForegroundColor DarkGray
+        if ($null -ne $savedConfig.DisableConfigMgrWim -and $savedConfig.DisableConfigMgrWim -eq 1) {
+            $chk_DisableConfigMgrWim.IsChecked       = $true
+            $txt_DisableConfigMgrWimState.Text       = 'On'
+            $txt_DisableConfigMgrWimState.Foreground = $Window.FindResource('AccentColor')
+            Write-Host "Disabled (expanded driver content)" -ForegroundColor DarkYellow
+        } else {
+            $txt_DisableConfigMgrWimState.Text = 'Off'
+            Write-Host "Enabled (compressed WIM)" -ForegroundColor Green
         }
 
         # Restore Code Signing
@@ -21533,7 +22391,7 @@ if (Test-Path $logoPath) {
 
 # Read version from module manifest
 $manifestPath = Join-Path $AppRoot "Modules\DriverAutomationToolCore\DriverAutomationToolCore.psd1"
-$script:versionString = "v10.1.1"
+$script:versionString = "v10.1.5"
 if (Test-Path $manifestPath) {
     $manifestData = Import-PowerShellDataFile $manifestPath
     $ver = [version]$manifestData.ModuleVersion
