@@ -3,6 +3,44 @@ Release Notes
 IMPORTANT
 - DAT Downloads have been moved to GitHub - https://github.com/maurice-daly/DriverAutomationTool
 
+Version 10.1.8
+What's New & Fixed
+- BIOS Management — BIOS requirement, detection and install now share one manufacturer-aware version comparison (Dell/HP/Surface/Acer compare by version, Lenovo by release date), so a device already on the latest BIOS is no longer wrongly flagged as "update required" when the firmware build date predates the catalogue publish date.
+- BIOS Management — During a user's "Remind Me Later" snooze the package now reports Not applicable instead of exiting 1618, so it no longer burns Intune's 3-attempt retry budget; detection is untouched so a device is never falsely shown as installed. (#843)
+- OEM Support — Acer BIOS now works end-to-end: discovered, listed and packaged by matching the platform product code, with the Acer XML catalogue kept as an automatic fallback and integrity hashes carried through.
+- Intune Package Management — New "Republish Metadata" action refreshes an app's description, information URL, notes and logo in place without re-uploading content, and detection/requirement rule scripts can be regenerated and updated on existing apps in bulk. Metadata was also corrected: proper information URL, notes now record the tool version/build, and the description includes the package release date.
+- Download Engine — You can now skip curl entirely and download via .NET HttpClient, with a "Restore Download Engine" control, and downloaded size is verified against Content-Length. (#876)
+- Download Engine — The trusted curl SHA-256 pin is normalised (spaces/colons stripped) and persisted correctly. (#809)
+- Download Engine — Fixed a case where a stalled download could outlast the timeout guard. (#874)
+- Build Experience — The build progress modal now shows live statistics and available disk space with summary tiles, and the model grid keeps selected models sorted to the top. Fixed the build summary inheriting stale counts when all of the current build's models are skipped. (#862)
+- Reporting & Diagnostics — Driver and BIOS install scripts are more verbose and write per-device status to the registry (last result, tool/script exit codes, failure phase and message, attempt count); the driver install log is now DriverAutomationTool-Drivers.log, and an INF-level "drivers added" report is produced for patch reporting.
+- UI / Theme Fixes — Right-clicking a package row now selects it so single-package actions target the correct row; Assign Package is now a green check and Remove Assignments a red X.
+
+Version 10.1.7
+What's New & Fixed
+- Lenovo BIOS Cleanup (#863) — Lenovo BIOS updates no longer leave residual C:\SWTOOLS\FLASH and C:\DRIVERS\FLASH folders on the system drive. Because Lenovo's BIOS installers extract to hardcoded system-drive locations regardless of the target path, the build now snapshots those folders beforehand and removes only what the installer newly created (on both success and failure), leaving any pre-existing content untouched.
+- Package Retention (ConfigMgr) — Fixed automatic cleanup of superseded packages silently doing nothing. The site code was being read from a status-display field instead of the resolved site connection, producing an invalid WMI namespace so the retention query failed quietly. It now uses the same site globals as every other ConfigMgr operation.
+- Intune Applicability — Reworked how driver and BIOS packages decide which devices they apply to. Applicability is now based purely on the hardware identifier (manufacturer + system SKU/baseboard) and OS, with the "is a newer version already installed?" decision moved to the detection rule. This fixes devices on older BIOS/driver versions wrongly showing as Not Applicable, and makes up-to-date devices report as Installed instead of inflating the Not Applicable count.
+- BIOS Management — Hardened all BIOS release-date handling. Dates are now parsed culture-invariantly against explicit formats and compared as strict 8-digit values, so a catalog date can no longer be misread on a non-US machine and flip a whole model's fleet to Not Applicable. Null/absent BIOS dates are guarded, and unparseable dates fall back safely to the registry version marker.
+- Assignment Filters — Fixed an error when opening the Update / Remove Assignment Filter dialog. Resolved a PowerShell 5.1 incompatibility in the button rendering, gave the dialog its own isolated theme resources, and added clear error reporting so any issue is shown rather than crashing.
+- Startup Connectivity Check — Added retry with backoff so a one-off slow endpoint (e.g. Microsoft Graph cold-start) no longer produces a false "connectivity issues" warning. The overlay now shows live retry progress instead of appearing frozen, and a failsafe deadline ensures the check can never hang startup.
+- Driver Packaging — The WIM compression level options are now hidden when 7-Zip is selected as the packaging engine, since 7-Zip doesn't support WIM compression.
+- Stability — The model search box no longer errors when typing wildcard characters (e.g. [), and unhandled UI exceptions are now written to the log rather than surfaced as raw error text in the status bar.
+
+
+Version 10.1.6
+What's New & Fixed
+- Authentication — Added support for national/sovereign clouds (GCC, GCC High, DoD, and China 21Vianet) via a new Tenant Environment selector. Fixed device-code sign-in failing with a 400 error by fully qualifying Microsoft Graph permission scopes, and added an optional Tenant ID field so single-tenant custom app registrations can authenticate. The interactive app-source selection is now correctly ignored when using App Registration (Client Credentials), so it no longer blocks a client-credentials connection.
+- Package Supersedence / Cleanup — New automated cleanup of superseded driver and BIOS packages after a build: keep a configurable number of recent versions and remove or unassign the older ones across both Intune and ConfigMgr. Cleanup runs in the background with a live progress display and clear start/complete logging, and is also available for scheduled/headless builds via config.
+- Update Available Indicator — The model list now highlights which selected models have a newer package available compared with what's already deployed, with a right-click option to select all models that have updates.
+- Intune Packaging — Added a "Create .intunewin only (skip upload)" mode with an on-screen banner and build-summary messaging, so it's obvious when a package was built but intentionally not uploaded.
+- OEM Support — Fixed Dell Flash64W BIOS utility downloads returning a 403 error by switching to a more resilient download path. (#852)
+- Driver Packaging — Fixed invalid package source folder paths when a model or OS name ended in a dot or space, which could break ConfigMgr package creation. (#861)
+- Intune Assignment Filters — Fixed duplicate assignment filters being created when a matching filter already existed. (#862)
+- Selection Profiles — Fixed a race condition where applying a selection profile could be overwritten by a background refresh; profile selections now apply reliably.
+- Reliability — Added timeouts and automatic retries to Microsoft Graph calls to prevent hangs, made the background cleanup/progress dialogs always cancellable and self-closing, and hardened saving of model selections against a file-write error.
+- Build Counters — Fixed package counters not resetting between builds, which previously showed stale totals.
+
 Version 10.1.5
 What's New & Fixed
 - **Windows 10 Support** — Added Windows 10 22H2 and 21H2 across the OS picker and all deployment/packaging views. Windows 10 driver packages are now sourced directly from the OEM catalogs. When the DAT API catalog is active, Windows 10 and Windows 11 selections are kept mutually exclusive, with a clear prompt explaining the switch to OEM-direct sourcing.

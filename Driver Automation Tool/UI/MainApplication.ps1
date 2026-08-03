@@ -28,7 +28,7 @@ Add-Type -AssemblyName System.Windows.Forms
 # ModelItem implements INotifyPropertyChanged so that WPF bindings update automatically
 # when Selected changes -- no manual visual-tree walking required.
 $_existingType = ([System.Management.Automation.PSTypeName]'ModelItem').Type
-$_needsCompile = (-not $_existingType) -or (-not $_existingType.GetProperty('BIOSVersion'))
+$_needsCompile = (-not $_existingType) -or (-not $_existingType.GetProperty('BIOSVersion')) -or (-not $_existingType.GetProperty('DriverStatus'))
 if ($_needsCompile) {
     if ($_existingType) {
         Write-Warning "ModelItem type is stale (missing BIOSVersion). Recompiling with a new name is not possible in the same AppDomain. BIOSVersion column may be empty until a fresh PowerShell process is used."
@@ -84,6 +84,54 @@ public class ModelItem : INotifyPropertyChanged {
             }
         }
     }
+    // Deployment-comparison state, populated when connected to Intune/ConfigMgr. Status is one
+    // of "" (unknown/not evaluated), "NotDeployed", "Current" or "UpdateAvailable".
+    public string DeployedDriverVersion { get; set; }
+    public string DeployedBIOSVersion { get; set; }
+    private string _driverStatus = "";
+    public string DriverStatus {
+        get { return _driverStatus; }
+        set {
+            if (_driverStatus != value) {
+                _driverStatus = value;
+                var h = PropertyChanged;
+                if (h != null) h(this, new PropertyChangedEventArgs("DriverStatus"));
+            }
+        }
+    }
+    private string _biosStatus = "";
+    public string BIOSStatus {
+        get { return _biosStatus; }
+        set {
+            if (_biosStatus != value) {
+                _biosStatus = value;
+                var h = PropertyChanged;
+                if (h != null) h(this, new PropertyChangedEventArgs("BIOSStatus"));
+            }
+        }
+    }
+    private string _driverTooltip = "";
+    public string DriverTooltip {
+        get { return _driverTooltip; }
+        set {
+            if (_driverTooltip != value) {
+                _driverTooltip = value;
+                var h = PropertyChanged;
+                if (h != null) h(this, new PropertyChangedEventArgs("DriverTooltip"));
+            }
+        }
+    }
+    private string _biosTooltip = "";
+    public string BIOSTooltip {
+        get { return _biosTooltip; }
+        set {
+            if (_biosTooltip != value) {
+                _biosTooltip = value;
+                var h = PropertyChanged;
+                if (h != null) h(this, new PropertyChangedEventArgs("BIOSTooltip"));
+            }
+        }
+    }
 }
 '@
     } catch {
@@ -97,6 +145,35 @@ if (-not (Test-Path $CoreModulePath)) {
     throw "Core module not found at: $CoreModulePath"
 }
 Import-Module $CoreModulePath -Force -ErrorAction Stop
+
+function Add-DATCoreRunspaceBootstrap {
+    param (
+        [Parameter(Mandatory)][System.Management.Automation.PowerShell]$PowerShell,
+        [object]$IntuneAuthContext = $null,
+        [switch]$CaptureIntuneAuthContext,
+        [switch]$OptionalIntuneAuthContext,
+        [string]$ModulePath = $CoreModulePath
+    )
+
+    if ($CaptureIntuneAuthContext -and $null -eq $IntuneAuthContext) {
+        try {
+            $IntuneAuthContext = Get-DATIntuneAuthContext
+        } catch {
+            if (-not $OptionalIntuneAuthContext) { throw }
+            $IntuneAuthContext = $null
+        }
+    }
+
+    [void]$PowerShell.AddScript({
+        param ($DATCoreModulePath, $DATIntuneAuthContext)
+        Import-Module $DATCoreModulePath -Force
+        if ($null -ne $DATIntuneAuthContext) {
+            Set-DATIntuneAuthContext -AuthContext $DATIntuneAuthContext | Out-Null
+        }
+    })
+    [void]$PowerShell.AddArgument($ModulePath)
+    [void]$PowerShell.AddArgument($IntuneAuthContext)
+}
 
 # Load theme definitions (#7 -- dot-source failure)
 $ThemePath = Join-Path $UIPath "Themes\ThemeDefinitions.ps1"
@@ -178,8 +255,10 @@ try {
 
             $msg = "Unhandled UI exception: $errMsg"
             Write-Warning $msg
-            $statusCtrl = $Window.FindName('txt_Status')
-            if ($statusCtrl) { $statusCtrl.Text = $msg }
+            # Route to the CMTrace log file rather than the UI. Surfacing raw exception
+            # text in the status bar confuses users and can trigger further layout/redraw
+            # errors while the dispatcher is already unwinding an exception.
+            try { Write-DATLogEntry -Value $msg -Severity 3 } catch { }
         } catch { }
     }
 
@@ -1473,13 +1552,15 @@ function Test-DATConnectivity {
     #>
     [OutputType([PSCustomObject[]])]
     param(
-        [scriptblock]$OnProgress
+        [scriptblock]$OnProgress,
+        [int]$MaxAttempts = 3
     )
 
     # Ensure TLS 1.2 is available (PS 5.1 defaults to TLS 1.0)
     [System.Net.ServicePointManager]::SecurityProtocol =
         [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
 
+    $intuneEnvironment = Get-DATIntuneEnvironment
     $endpoints = @(
         @{ URL = 'https://raw.githubusercontent.com'; Description = 'GitHub Raw Content (OEM catalogs, updates, release notes)' }
         @{ URL = 'https://github.com';                Description = 'GitHub (self-update, Intune packaging tools)' }
@@ -1489,36 +1570,51 @@ function Test-DATConnectivity {
         @{ URL = 'https://ftp.hp.com';                 Description = 'HP driver catalog and SoftPaqs' }
         @{ URL = 'https://download.lenovo.com';        Description = 'Lenovo driver catalog' }
         @{ URL = 'https://global-download.acer.com';   Description = 'Acer driver and BIOS catalog' }
-        @{ URL = 'https://login.microsoftonline.com';  Description = 'Microsoft Entra ID (Intune authentication)' }
-        @{ URL = 'https://graph.microsoft.com';        Description = 'Microsoft Graph API (Intune management)' }
+        @{ URL = $intuneEnvironment.AuthorityHost;     Description = 'Microsoft Entra ID (Intune authentication)' }
+        @{ URL = $intuneEnvironment.GraphResource;     Description = 'Microsoft Graph API (Intune management)' }
     )
+
+    if ($MaxAttempts -lt 1) { $MaxAttempts = 1 }
 
     $total = $endpoints.Count
     $current = 0
     $results = foreach ($ep in $endpoints) {
         $current++
         $reachable = $false
-        try {
-            $request = [System.Net.HttpWebRequest]::Create($ep.URL)
-            $request.Method = 'HEAD'
-            $request.Timeout = 8000
-            $request.AllowAutoRedirect = $true
+        # Retry transient failures. The first attempt to a host pays the full DNS + TCP + TLS
+        # cold-start cost (which can exceed the timeout on startup or behind a proxy); subsequent
+        # attempts reuse cached DNS/connections, so a single retry usually clears a false failure.
+        # Any HTTP response (including 4xx/5xx) counts as reachable -- only DNS/TCP/TLS/timeout
+        # failures are treated as unreachable, and only after every attempt has failed.
+        for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
             try {
-                $response = $request.GetResponse()
-                $response.Close()
-                $reachable = $true
-            } catch [System.Net.WebException] {
-                # A WebException with an HTTP response means the server IS reachable
-                # (e.g. 400, 403, 404, 500) -- only connection/DNS failures are truly unreachable
-                if ($null -ne $_.Exception.Response) {
+                $request = [System.Net.HttpWebRequest]::Create($ep.URL)
+                $request.Method = 'HEAD'
+                $request.Timeout = 8000
+                $request.AllowAutoRedirect = $true
+                # Some CDNs/WAFs reject requests with no User-Agent; set a benign one.
+                $request.UserAgent = 'DriverAutomationTool/ConnectivityCheck'
+                try {
+                    $response = $request.GetResponse()
+                    $response.Close()
                     $reachable = $true
-                    $_.Exception.Response.Close()
-                } else {
-                    $reachable = $false
+                } catch [System.Net.WebException] {
+                    # A WebException with an HTTP response means the server IS reachable
+                    # (e.g. 400, 403, 404, 405, 500) -- only connection/DNS failures are truly unreachable
+                    if ($null -ne $_.Exception.Response) {
+                        $reachable = $true
+                        $_.Exception.Response.Close()
+                    } else {
+                        $reachable = $false
+                    }
                 }
+            } catch {
+                $reachable = $false
             }
-        } catch {
-            $reachable = $false
+            if ($reachable) { break }
+            # Short, escalating backoff between attempts (400 ms, 800 ms ...). Only failing
+            # endpoints incur this cost, so a fully-reachable environment is unaffected.
+            if ($attempt -lt $MaxAttempts) { Start-Sleep -Milliseconds (400 * $attempt) }
         }
         if ($null -ne $OnProgress) {
             try { & $OnProgress $current $total $ep.URL $reachable } catch { }
@@ -2674,7 +2770,8 @@ function Show-DATBuildSummaryDialog {
         [int]$BiosSuccess,
         [string]$PackageType = 'Drivers',
         [string]$Elapsed = '',
-        [bool]$HadErrors = $false
+        [bool]$HadErrors = $false,
+        [bool]$UploadSkipped = $false
     )
 
     $theme = Get-DATTheme -ThemeName $script:CurrentTheme
@@ -2685,6 +2782,11 @@ function Show-DATBuildSummaryDialog {
         $iconChar = [string][char]0xE7BA
         $iconColor = $theme['StatusWarning']
         $title = "Build Completed with Errors"
+    } elseif ($UploadSkipped) {
+        # Packages were built locally but intentionally not uploaded to Intune
+        $iconChar = [string][char]0xE896   # Download / saved-to-disk glyph
+        $iconColor = $theme['StatusWarning']
+        $title = "Packages Built -- Upload Skipped"
     } else {
         $iconChar = [string][char]0xE73E
         $iconColor = $theme['StatusSuccess']
@@ -2879,6 +2981,27 @@ function Show-DATBuildSummaryDialog {
         $elapsedText.HorizontalAlignment = 'Center'
         $elapsedText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
         $panel.Children.Add($elapsedText) | Out-Null
+    }
+
+    # Upload-skipped note: packages were built as .intunewin only and NOT published to Intune.
+    if ($UploadSkipped) {
+        $noteBorder = [System.Windows.Controls.Border]::new()
+        $noteBorder.CornerRadius = [System.Windows.CornerRadius]::new(8)
+        $noteBorder.Padding = [System.Windows.Thickness]::new(12, 10, 12, 10)
+        $noteBorder.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
+        $noteBorder.Background = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.Color]::FromArgb(34, 245, 158, 11))  # amber @ ~13% alpha
+        $noteBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+        $noteBorder.BorderBrush = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusWarning']))
+        $noteText = [System.Windows.Controls.TextBlock]::new()
+        $noteText.Text = "Packages were built locally as .intunewin files and were NOT uploaded to Intune, because 'Create .intunewin file only (skip upload)' is enabled in Intune Settings > Package Options. Turn that option off and rebuild to publish to Intune."
+        $noteText.TextWrapping = 'Wrap'
+        $noteText.FontSize = 12
+        $noteText.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusWarning']))
+        $noteBorder.Child = $noteText
+        $panel.Children.Add($noteBorder) | Out-Null
     }
 
     # View Failures button (only when the core module recorded package failures)
@@ -3418,12 +3541,9 @@ function Show-DATBiosNameRepairModal {
 
     $dlg.Add_Loaded({
         $repairPS = [powershell]::Create()
+        Add-DATCoreRunspaceBootstrap -PowerShell $repairPS -CaptureIntuneAuthContext:($Platform -in @('Intune', 'Both')) -OptionalIntuneAuthContext
         $repairPS.AddScript({
-            param ($CoreModulePath, $Platform, $SiteServer, $SiteCode, $State, $Token, $TokenExpiry)
-            Import-Module $CoreModulePath -Force
-            if (-not [string]::IsNullOrEmpty($Token)) {
-                Set-DATIntuneAuthToken -Token $Token -ExpiresOn $TokenExpiry
-            }
+            param ($Platform, $SiteServer, $SiteCode, $State)
             try {
                 $params = @{
                     Platform      = $Platform
@@ -3439,24 +3559,10 @@ function Show-DATBiosNameRepairModal {
             }
         })
 
-        # Gather auth state
-        $authToken = $null
-        $authExpiry = $null
-        if ($Platform -in @('Intune', 'Both')) {
-            try {
-                $authStatus = Get-DATIntuneAuthStatus
-                $authToken = $authStatus.Token
-                $authExpiry = $authStatus.ExpiresOn
-            } catch { }
-        }
-
-        [void]$repairPS.AddArgument($CoreModulePath)
         [void]$repairPS.AddArgument($Platform)
         [void]$repairPS.AddArgument($global:SiteServer)
         [void]$repairPS.AddArgument($global:SiteCode)
         [void]$repairPS.AddArgument($repairState)
-        [void]$repairPS.AddArgument($authToken)
-        [void]$repairPS.AddArgument($authExpiry)
         $repairState.PS = $repairPS
         $repairState.AsyncResult = $repairPS.BeginInvoke()
 
@@ -3869,11 +3975,12 @@ function Show-DATCustomDriverDialog {
 function Show-DATEntraGroupSearchDialog {
     <#
     .SYNOPSIS
-        Modal dialog that searches Entra ID groups and returns the selected group.
+        Modal dialog that picks the assignment type (Available/Required), an Entra ID group /
+        All Users / All Devices target, and an optional assignment filter -- all in one step.
     #>
     param (
         [Parameter(Mandatory)][string]$AppName,
-        [Parameter(Mandatory)][ValidateSet('Available', 'Required')][string]$Intent
+        [ValidateSet('Available', 'Required')][string]$DefaultIntent = 'Available'
     )
 
     $script:entraGroupResult = $null
@@ -3897,7 +4004,8 @@ function Show-DATEntraGroupSearchDialog {
     $dlg.WindowStartupLocation = 'CenterOwner'
     $dlg.Owner = $Window
     $dlg.Width = 750
-    $dlg.Height = 660
+    $dlg.SizeToContent = 'Height'
+    $dlg.MaxHeight = 820
     $dlg.Topmost = $true
     $dlg.ResizeMode = 'NoResize'
     $dlg.ShowInTaskbar = $false
@@ -3912,38 +4020,113 @@ function Show-DATEntraGroupSearchDialog {
     }
     $dlg.Content = $outerBorder
 
+    # Merge theme brushes + the app's pill ComboBox styles so the filter dropdown matches the theme.
+    $entraDlgResources = Get-DATThemeResourceDictionary -ThemeName $script:CurrentTheme
+    foreach ($resKey in @('PillComboBoxToggleButton', [System.Windows.Controls.ComboBox], [System.Windows.Controls.ComboBoxItem])) {
+        $resVal = $Window.TryFindResource($resKey)
+        if ($null -ne $resVal) { $entraDlgResources[$resKey] = $resVal }
+    }
+    $dlg.Resources.MergedDictionaries.Add($entraDlgResources)
+
     $panel = [System.Windows.Controls.StackPanel]::new()
     $outerBorder.Child = $panel
 
-    # Intent icon + title
-    $intentColor = if ($Intent -eq 'Required') {
-        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusWarning'])
-    } else { $accent }
-    $intentIcon = if ($Intent -eq 'Required') { [string][char]0xE7BA } else { [string][char]0xE73E }
+    # Rounded TextBox template (WPF TextBox doesn't honor CornerRadius natively) -- applied to the
+    # search inputs so they match the rounded inputs used throughout the rest of the app.
+    $roundedTextBoxTemplate = [System.Windows.Markup.XamlReader]::Parse(@"
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 TargetType="TextBox">
+    <Border x:Name="bd" Background="{TemplateBinding Background}"
+            BorderBrush="{TemplateBinding BorderBrush}"
+            BorderThickness="{TemplateBinding BorderThickness}"
+            CornerRadius="8" SnapsToDevicePixels="True">
+        <ScrollViewer x:Name="PART_ContentHost"
+                      Margin="{TemplateBinding Padding}"
+                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                      HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                      Background="Transparent" Focusable="False"/>
+    </Border>
+    <ControlTemplate.Triggers>
+        <Trigger Property="IsEnabled" Value="False">
+            <Setter TargetName="bd" Property="Opacity" Value="0.55"/>
+        </Trigger>
+    </ControlTemplate.Triggers>
+</ControlTemplate>
+"@)
 
-    $titleIcon = [System.Windows.Controls.TextBlock]::new()
-    $titleIcon.Text = $intentIcon
-    $titleIcon.FontFamily = [System.Windows.Media.FontFamily]::new("Segoe MDL2 Assets")
-    $titleIcon.FontSize = 28
-    $titleIcon.Foreground = [System.Windows.Media.SolidColorBrush]::new($intentColor)
-    $titleIcon.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
-    $panel.Children.Add($titleIcon) | Out-Null
+    # Header: title + subtitle on the left, a close (X) button on the right.
+    $headerGrid = [System.Windows.Controls.Grid]::new()
+    $hgCol1 = [System.Windows.Controls.ColumnDefinition]::new()
+    $hgCol1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+    $hgCol2 = [System.Windows.Controls.ColumnDefinition]::new()
+    $hgCol2.Width = [System.Windows.GridLength]::Auto
+    $headerGrid.ColumnDefinitions.Add($hgCol1)
+    $headerGrid.ColumnDefinitions.Add($hgCol2)
+    $headerGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 14)
+    $panel.Children.Add($headerGrid) | Out-Null
+
+    $headerText = [System.Windows.Controls.StackPanel]::new()
+    [System.Windows.Controls.Grid]::SetColumn($headerText, 0)
+    $headerGrid.Children.Add($headerText) | Out-Null
 
     $title = [System.Windows.Controls.TextBlock]::new()
-    $title.Text = "Assign Package -- $Intent"
+    $title.Text = "Assign Package"
     $title.FontSize = 16
     $title.FontWeight = [System.Windows.FontWeights]::Bold
     $title.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
     $title.Margin = [System.Windows.Thickness]::new(0, 0, 0, 4)
-    $panel.Children.Add($title) | Out-Null
+    $headerText.Children.Add($title) | Out-Null
 
     $subtitle = [System.Windows.Controls.TextBlock]::new()
     $subtitle.Text = $AppName
     $subtitle.FontSize = 12
     $subtitle.Foreground = [System.Windows.Media.SolidColorBrush]::new($dimColor)
     $subtitle.TextTrimming = 'CharacterEllipsis'
-    $subtitle.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
-    $panel.Children.Add($subtitle) | Out-Null
+    $headerText.Children.Add($subtitle) | Out-Null
+
+    $closeBtn = [System.Windows.Controls.Button]::new()
+    $closeBtn.Content = [string][char]0xE711
+    $closeBtn.FontFamily = [System.Windows.Media.FontFamily]::new("Segoe MDL2 Assets")
+    $closeBtn.FontSize = 12
+    $closeBtn.Foreground = [System.Windows.Media.SolidColorBrush]::new($dimColor)
+    $closeBtn.Background = [System.Windows.Media.Brushes]::Transparent
+    $closeBtn.BorderThickness = [System.Windows.Thickness]::new(0)
+    $closeBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+    $closeBtn.VerticalAlignment = 'Top'
+    $closeBtn.ToolTip = 'Close'
+    $closeBtn.Add_Click({ $script:entraGroupResult = $null; $dlg.Close() })
+    [System.Windows.Controls.Grid]::SetColumn($closeBtn, 1)
+    $headerGrid.Children.Add($closeBtn) | Out-Null
+
+    # Assignment Type (Available / Required) -- replaces the two separate right-click options.
+    $intentLabel = [System.Windows.Controls.TextBlock]::new()
+    $intentLabel.Text = "Assignment Type"
+    $intentLabel.FontSize = 12
+    $intentLabel.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $intentLabel.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
+    $intentLabel.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+    $panel.Children.Add($intentLabel) | Out-Null
+
+    $intentCombo = [System.Windows.Controls.ComboBox]::new()
+    $intentCombo.Height = 34
+    $intentCombo.FontSize = 12
+    $intentCombo.Margin = [System.Windows.Thickness]::new(0, 0, 0, 14)
+    foreach ($intentOption in @('Available', 'Required')) {
+        $ci = [System.Windows.Controls.ComboBoxItem]::new()
+        $ci.Content = $intentOption
+        $ci.Tag = $intentOption
+        $intentCombo.Items.Add($ci) | Out-Null
+    }
+    $intentCombo.SelectedIndex = if ($DefaultIntent -eq 'Required') { 1 } else { 0 }
+    $panel.Children.Add($intentCombo) | Out-Null
+
+    # Reads the chosen assignment type from the dropdown.
+    $getSelectedIntent = {
+        $sel = $intentCombo.SelectedItem
+        if ($null -ne $sel -and -not [string]::IsNullOrEmpty([string]$sel.Tag)) { return [string]$sel.Tag }
+        return 'Available'
+    }
 
     # Quick-assign buttons: All Users / All Devices
     $quickLabel = [System.Windows.Controls.TextBlock]::new()
@@ -3964,7 +4147,7 @@ function Show-DATEntraGroupSearchDialog {
     $quickBtnTemplate = [System.Windows.Markup.XamlReader]::Parse(@"
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
     <Border x:Name="bd" Background="$($theme['ButtonSecondary'])" CornerRadius="8"
-            Padding="14,8" BorderBrush="$borderClr" BorderThickness="1"
+            Padding="14,8" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
             TextElement.Foreground="$($theme['ButtonSecondaryForeground'])">
         <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
     </Border>
@@ -3975,6 +4158,19 @@ function Show-DATEntraGroupSearchDialog {
     </ControlTemplate.Triggers>
 </ControlTemplate>
 "@)
+
+    # Quick-assign buttons act as a target *selection* (like picking a row in the group list),
+    # NOT an immediate commit -- the user chooses All Users / All Devices, then optionally picks
+    # an assignment filter, then clicks Assign. Track the buttons so their highlight can be reset.
+    $quickButtons = [System.Collections.Generic.List[object]]::new()
+    $quickDefaultBorder  = [System.Windows.Media.SolidColorBrush]::new($borderClr)
+    $quickSelectedBorder = [System.Windows.Media.SolidColorBrush]::new($accent)
+    $resetQuickHighlight = {
+        foreach ($qb in $quickButtons) {
+            $qb.BorderBrush     = $quickDefaultBorder
+            $qb.BorderThickness = [System.Windows.Thickness]::new(1)
+        }
+    }
 
     foreach ($quickEntry in @(
         @{ Label = 'All Users';   Icon = [string][char]0xE716; Id = 'acacacac-9df4-4c7d-9d50-4ef0226f57a9'; Desc = 'Target all licensed users' },
@@ -4006,6 +4202,8 @@ function Show-DATEntraGroupSearchDialog {
         $qBtn.Margin = [System.Windows.Thickness]::new(0, 0, 10, 0)
         $qBtn.Cursor = [System.Windows.Input.Cursors]::Hand
         $qBtn.Template = $quickBtnTemplate
+        $qBtn.BorderBrush = $quickDefaultBorder
+        $qBtn.BorderThickness = [System.Windows.Thickness]::new(1)
         $qBtn.Tag = [PSCustomObject]@{
             DisplayName = $quickEntry.Label
             Description = $quickEntry.Desc
@@ -4014,14 +4212,19 @@ function Show-DATEntraGroupSearchDialog {
         }
         $qBtn.Add_Click({
             param($s, $e)
-            $script:entraGroupResult = @{
-                GroupId   = $s.Tag.ObjectId
-                GroupName = $s.Tag.DisplayName
-                GroupType = $s.Tag.GroupType
-                Intent    = $Intent
-            }
-            $dlg.Close()
+            # Select this quick-assign target instead of committing. Clear any group-list
+            # selection, highlight this button, and enable Assign so the user can still choose
+            # an assignment filter before applying.
+            $listGroups.SelectedIndex = -1
+            & $resetQuickHighlight
+            $s.BorderBrush     = $quickSelectedBorder
+            $s.BorderThickness = [System.Windows.Thickness]::new(2)
+            $script:selectedGroup = $s.Tag
+            $txtSelected.Text = "Selected: $($s.Tag.DisplayName) ($($s.Tag.GroupType)) -- $($s.Tag.ObjectId)"
+            $txtSelected.Foreground = [System.Windows.Media.SolidColorBrush]::new($accent)
+            $btnAssign.IsEnabled = $true
         })
+        $quickButtons.Add($qBtn) | Out-Null
         $quickRow.Children.Add($qBtn) | Out-Null
     }
 
@@ -4054,6 +4257,7 @@ function Show-DATEntraGroupSearchDialog {
     $txtSearch.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
     $txtSearch.BorderBrush = [System.Windows.Media.SolidColorBrush]::new($borderClr)
     $txtSearch.BorderThickness = [System.Windows.Thickness]::new(1)
+    $txtSearch.Template = $roundedTextBoxTemplate
     [System.Windows.Controls.Grid]::SetColumn($txtSearch, 0)
     $searchRow.Children.Add($txtSearch) | Out-Null
 
@@ -4294,6 +4498,64 @@ function Show-DATEntraGroupSearchDialog {
     $txtSelected.Text = "No group selected"
     $panel.Children.Add($txtSelected) | Out-Null
 
+    # Assignment Filter (optional) -- applied to whichever target is chosen above (search result
+    # OR the All Users / All Devices quick-assign buttons), so the group + filter are set in a
+    # single step. Leave as "No filter" to assign without one.
+    $fltLabel = [System.Windows.Controls.TextBlock]::new()
+    $fltLabel.Text = "Assignment Filter (optional)"
+    $fltLabel.FontSize = 12
+    $fltLabel.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $fltLabel.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
+    $fltLabel.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+    $panel.Children.Add($fltLabel) | Out-Null
+
+    # Free-text search to narrow the filter dropdown (placeholder hint overlaid via a Grid)
+    $fltSearchGrid = [System.Windows.Controls.Grid]::new()
+    $fltSearchGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+
+    $fltSearch = [System.Windows.Controls.TextBox]::new()
+    $fltSearch.Height = 32
+    $fltSearch.FontSize = 12
+    $fltSearch.VerticalContentAlignment = 'Center'
+    $fltSearch.Padding = [System.Windows.Thickness]::new(8, 0, 8, 0)
+    $fltSearch.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
+    $fltSearch.CaretBrush = [System.Windows.Media.SolidColorBrush]::new($fgColor)
+    $fltSearch.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputBackground']))
+    $fltSearch.BorderBrush = [System.Windows.Media.SolidColorBrush]::new($borderClr)
+    $fltSearch.BorderThickness = [System.Windows.Thickness]::new(1)
+    $fltSearch.Template = $roundedTextBoxTemplate
+    $fltSearchGrid.Children.Add($fltSearch) | Out-Null
+
+    $fltHint = [System.Windows.Controls.TextBlock]::new()
+    $fltHint.Text = 'Search filters...'
+    $fltHint.FontSize = 12
+    $fltHint.Foreground = [System.Windows.Media.SolidColorBrush]::new($dimColor)
+    $fltHint.IsHitTestVisible = $false
+    $fltHint.VerticalAlignment = 'Center'
+    $fltHint.Margin = [System.Windows.Thickness]::new(9, 0, 0, 0)
+    $fltSearchGrid.Children.Add($fltHint) | Out-Null
+
+    $panel.Children.Add($fltSearchGrid) | Out-Null
+
+    $fltCombo = [System.Windows.Controls.ComboBox]::new()
+    $fltCombo.Height = 34
+    $fltCombo.FontSize = 12
+    $fltCombo.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
+    $fltLoadingItem = [System.Windows.Controls.ComboBoxItem]::new()
+    $fltLoadingItem.Content = 'Loading filters...'
+    $fltLoadingItem.IsEnabled = $false
+    $fltCombo.Items.Add($fltLoadingItem) | Out-Null
+    $fltCombo.SelectedIndex = 0
+    $panel.Children.Add($fltCombo) | Out-Null
+
+    # Reads the currently chosen assignment filter, or $null when "No filter" is selected.
+    $getSelectedFilter = {
+        $sel = $fltCombo.SelectedItem
+        if ($null -eq $sel -or [string]::IsNullOrEmpty([string]$sel.Tag)) { return $null }
+        return @{ FilterId = [string]$sel.Tag; FilterName = [string]$sel.Content }
+    }
+
     # Button row
     $btnRow = [System.Windows.Controls.StackPanel]::new()
     $btnRow.Orientation = 'Horizontal'
@@ -4307,8 +4569,8 @@ function Show-DATEntraGroupSearchDialog {
     $btnAssign.Height = 36
     $btnAssign.Margin = [System.Windows.Thickness]::new(0, 0, 8, 0)
     $btnAssign.Cursor = [System.Windows.Input.Cursors]::Hand
-    $assignBtnBg = if ($Intent -eq 'Required') { $theme['StatusWarning'] } else { $theme['ButtonPrimary'] }
-    $assignBtnHover = if ($Intent -eq 'Required') { $theme['ButtonDangerHover'] } else { $theme['ButtonPrimaryHover'] }
+    $assignBtnBg = $theme['ButtonPrimary']
+    $assignBtnHover = $theme['ButtonPrimaryHover']
     $assignTemplate = [System.Windows.Markup.XamlReader]::Parse(@"
 <ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
     <Border x:Name="bd" Background="$assignBtnBg" CornerRadius="8" Padding="16,8" TextElement.Foreground="$($theme['ButtonPrimaryForeground'])">
@@ -4357,6 +4619,8 @@ function Show-DATEntraGroupSearchDialog {
     $listGroups.Add_SelectionChanged({
         $item = $listGroups.SelectedItem
         if ($null -ne $item) {
+            # A group-list selection supersedes any quick-assign target -- clear their highlight.
+            & $resetQuickHighlight
             $script:selectedGroup = $item
             $typeLabel = $item.GroupType
             $txtSelected.Text = "Selected: $($item.DisplayName) ($typeLabel) -- $($item.ObjectId)"
@@ -4465,11 +4729,15 @@ function Show-DATEntraGroupSearchDialog {
 
     $btnAssign.Add_Click({
         if ($null -ne $script:selectedGroup) {
+            $selFilter = & $getSelectedFilter
             $script:entraGroupResult = @{
                 GroupId     = $script:selectedGroup.ObjectId
                 GroupName   = $script:selectedGroup.DisplayName
                 GroupType   = $script:selectedGroup.GroupType
-                Intent      = $Intent
+                Intent      = & $getSelectedIntent
+                FilterId    = if ($selFilter) { $selFilter.FilterId } else { $null }
+                FilterName  = if ($selFilter) { $selFilter.FilterName } else { $null }
+                FilterType  = 'include'
             }
             $dlg.Close()
         }
@@ -4478,6 +4746,66 @@ function Show-DATEntraGroupSearchDialog {
     $btnDlgCancel.Add_Click({
         $script:entraGroupResult = $null
         $dlg.Close()
+    })
+
+    # Assignment filter dropdown: load, search, and repopulate. Mirrors the standalone
+    # "Update / Remove Assignment Filter" dialog so the same filter can be chosen here in one step.
+    $script:EntraDlgFilterList = @()
+    $populateEntraFilterCombo = {
+        $all = @($script:EntraDlgFilterList)
+        $searchText = $fltSearch.Text
+        $fltCombo.Items.Clear()
+
+        # Always offer a "No filter" default at the top.
+        $noneItem = [System.Windows.Controls.ComboBoxItem]::new()
+        $noneItem.Content = 'No filter'
+        $noneItem.Tag = ''
+        $fltCombo.Items.Add($noneItem) | Out-Null
+
+        $matchingFilters = if ([string]::IsNullOrWhiteSpace($searchText)) {
+            $all
+        } else {
+            $needle = $searchText.Trim()
+            @($all | Where-Object {
+                $_.displayName -and $_.displayName.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            })
+        }
+        foreach ($f in $matchingFilters) {
+            $item = [System.Windows.Controls.ComboBoxItem]::new()
+            $item.Content = $f.displayName
+            $item.Tag = $f.id
+            $fltCombo.Items.Add($item) | Out-Null
+        }
+        $fltCombo.SelectedIndex = 0
+    }
+
+    # Re-filter the dropdown as the user types, and toggle the placeholder hint.
+    $fltSearch.Add_TextChanged({
+        $fltHint.Visibility = if ([string]::IsNullOrEmpty($fltSearch.Text)) { 'Visible' } else { 'Collapsed' }
+        if (@($script:EntraDlgFilterList).Count -gt 0) { & $populateEntraFilterCombo }
+    })
+
+    # Hide the placeholder while the box has keyboard focus so it never sits under the caret.
+    $fltSearch.Add_GotKeyboardFocus({ $fltHint.Visibility = 'Collapsed' })
+    $fltSearch.Add_LostKeyboardFocus({
+        if ([string]::IsNullOrEmpty($fltSearch.Text)) { $fltHint.Visibility = 'Visible' }
+    })
+
+    # Load assignment filters once the dialog has rendered.
+    $dlg.Add_ContentRendered({
+        try {
+            $loadedFilters = Get-DATIntuneAssignmentFilters
+            $script:EntraDlgFilterList = @($loadedFilters | Sort-Object -Property displayName)
+            & $populateEntraFilterCombo
+        } catch {
+            $script:EntraDlgFilterList = @()
+            $fltCombo.Items.Clear()
+            $errItem = [System.Windows.Controls.ComboBoxItem]::new()
+            $errItem.Content = 'No filter (filter list unavailable)'
+            $errItem.Tag = ''
+            $fltCombo.Items.Add($errItem) | Out-Null
+            $fltCombo.SelectedIndex = 0
+        }
     })
 
     $dlg.ShowDialog() | Out-Null
@@ -4495,7 +4823,8 @@ function Show-DATPackageRetentionModal {
         [int]$RetainCount = 0,
         [string]$SiteServer,
         [string]$SiteCode,
-        [switch]$Intune
+        [switch]$Intune,
+        [switch]$DeleteSourceFolder
     )
 
     $theme = Get-DATTheme -ThemeName $script:CurrentTheme
@@ -4550,9 +4879,19 @@ function Show-DATPackageRetentionModal {
     $titleText.Margin     = [System.Windows.Thickness]::new(0, 0, 0, 8)
     $panel.Children.Add($titleText) | Out-Null
 
-    # Sub-title
+    # Sub-title -- describe the actual action. With retention 0 every superseded version is
+    # deleted; with retention >= 1 the newest is kept and the superseded ones are unassigned
+    # (Intune) or the excess beyond the retained count is removed (ConfigMgr).
+    $retIsIntuneOnly = $Intune.IsPresent -and -not ($SiteServer -and $SiteCode)
+    $retSubtitle = if ($RetainCount -le 0) {
+        'Removing older versions. This may take a moment...'
+    } elseif ($retIsIntuneOnly) {
+        "Keeping the $($RetainCount + 1) newest version(s); removing assignments from superseded versions. This may take a moment..."
+    } else {
+        "Keeping the $($RetainCount + 1) newest version(s); cleaning up superseded versions. This may take a moment..."
+    }
     $subText = [System.Windows.Controls.TextBlock]::new()
-    $subText.Text         = 'Removing older versions. This may take a moment...'
+    $subText.Text         = $retSubtitle
     $subText.FontSize     = 12
     $subText.Foreground   = [System.Windows.Media.SolidColorBrush]::new(
         [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
@@ -4560,6 +4899,21 @@ function Show-DATPackageRetentionModal {
     $subText.TextWrapping = [System.Windows.TextWrapping]::Wrap
     $subText.Margin       = [System.Windows.Thickness]::new(0, 0, 0, 16)
     $panel.Children.Add($subText) | Out-Null
+
+    # Live detail line (current package name + id) shown just above the progress bar. Uses the
+    # same font and colour as the subtitle above it for a consistent look.
+    $detailText = [System.Windows.Controls.TextBlock]::new()
+    $detailText.Text         = ''
+    $detailText.FontSize     = 12
+    $detailText.Foreground   = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
+    $detailText.HorizontalAlignment = 'Center'
+    $detailText.TextAlignment = 'Center'
+    $detailText.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $detailText.TextTrimming = 'CharacterEllipsis'
+    $detailText.MaxHeight    = 34
+    $detailText.Margin       = [System.Windows.Thickness]::new(0, 0, 0, 18)
+    $panel.Children.Add($detailText) | Out-Null
 
     # Progress ring (infinite spinner)
     $spinner = [System.Windows.Controls.ProgressBar]::new()
@@ -4576,12 +4930,13 @@ function Show-DATPackageRetentionModal {
     $resultsPanel.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
     $panel.Children.Add($resultsPanel) | Out-Null
 
-    # Close button (hidden until complete)
+    # Cancel/Close button -- shown from the start as "Cancel" so a long-running or stalled
+    # cleanup can always be dismissed; relabelled "Close" once the run finishes.
     $btnClose = [System.Windows.Controls.Button]::new()
     $btnClose.Height     = 34
     $btnClose.Width      = 100
     $btnClose.HorizontalAlignment = 'Center'
-    $btnClose.Visibility = 'Collapsed'
+    $btnClose.Visibility = 'Visible'
     $btnClose.Cursor     = [System.Windows.Input.Cursors]::Hand
     $btnClose.BorderThickness = [System.Windows.Thickness]::new(0)
     $btnCloseXaml = @"
@@ -4600,13 +4955,29 @@ function Show-DATPackageRetentionModal {
 "@
     $btnClose.Template = [System.Windows.Markup.XamlReader]::Parse($btnCloseXaml)
     $btnCloseTb = [System.Windows.Controls.TextBlock]::new()
-    $btnCloseTb.Text = 'Close'
+    $btnCloseTb.Text = 'Cancel'
     $btnCloseTb.FontSize = 13
     $btnCloseTb.FontWeight = [System.Windows.FontWeights]::SemiBold
     $btnCloseTb.Foreground = [System.Windows.Media.SolidColorBrush]::new(
         [System.Windows.Media.ColorConverter]::ConvertFromString($theme['ButtonPrimaryForeground']))
     $btnClose.Content = $btnCloseTb
-    $btnClose.Add_Click({ $dlg.Close() })
+    # Stop any in-flight background work, then close. Safe whether the run is active or finished.
+    $btnClose.Add_Click({
+        # If the run is still active, this is a Cancel; if it already finished, it's just Close.
+        $wasRunning = ($script:RetentionAsync -and -not $script:RetentionAsync.IsCompleted)
+        try { if ($script:RetentionPollTimer) { $script:RetentionPollTimer.Stop() } } catch { }
+        try {
+            if ($script:RetentionPS -and $script:RetentionAsync -and -not $script:RetentionAsync.IsCompleted) {
+                $script:RetentionPS.Stop()
+            }
+        } catch { }
+        try { if ($script:RetentionPS) { $script:RetentionPS.Dispose() } } catch { }
+        try { if ($script:RetentionRS) { $script:RetentionRS.Dispose() } } catch { }
+        $script:RetentionPS = $null; $script:RetentionRS = $null; $script:RetentionAsync = $null; $script:RetentionPollTimer = $null
+        $script:RetentionProgress = $null; $script:RetentionStartTime = $null
+        if ($wasRunning) { try { Write-DATLogEntry -Value "[Retention] Cleanup cancelled by user before completion." -Severity 2 } catch { } }
+        $dlg.Close()
+    })
     $panel.Children.Add($btnClose) | Out-Null
 
     $border.Child  = $panel
@@ -4614,6 +4985,19 @@ function Show-DATPackageRetentionModal {
 
     # Run retention in a background runspace so the UI stays responsive
     $dlg.Add_ContentRendered({
+        # Capture the Intune auth context on the UI thread -- the background runspace imports a
+        # fresh copy of the core module with no auth state, so without this the Graph calls in
+        # Invoke-DATPackageRetention (Get-DATIntuneWin32Apps / Remove-DATIntuneApp) would fail
+        # authentication and silently delete nothing.
+        $intuneAuthCtx = $null
+        if ($Intune.IsPresent) {
+            try { $intuneAuthCtx = Get-DATIntuneAuthContext } catch { $intuneAuthCtx = $null }
+        }
+
+        # Shared, thread-safe progress state -- the background runspace writes the current
+        # package name/id here and the poll timer surfaces it in the modal subtitle.
+        $retProgress = [hashtable]::Synchronized(@{ Current = '' })
+
         $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
         $rs.ApartmentState = 'STA'
         $rs.ThreadOptions  = 'ReuseThread'
@@ -4623,6 +5007,9 @@ function Show-DATPackageRetentionModal {
         $rs.SessionStateProxy.SetVariable('SiteServer',  $SiteServer)
         $rs.SessionStateProxy.SetVariable('SiteCode',    $SiteCode)
         $rs.SessionStateProxy.SetVariable('RunIntune',   $Intune.IsPresent)
+        $rs.SessionStateProxy.SetVariable('IntuneAuthContext', $intuneAuthCtx)
+        $rs.SessionStateProxy.SetVariable('DeleteSourceFolder', $DeleteSourceFolder.IsPresent)
+        $rs.SessionStateProxy.SetVariable('ProgressState', $retProgress)
         # Pass the module path so the runspace can import the core module
         $rs.SessionStateProxy.SetVariable('CoreModulePath',
             (Get-Module -Name DriverAutomationToolCore).Path)
@@ -4631,7 +5018,21 @@ function Show-DATPackageRetentionModal {
         $ps.Runspace = $rs
         [void]$ps.AddScript({
             Import-Module $CoreModulePath -Force -ErrorAction Stop
+            # Restore the Intune auth context so Graph-backed retention can authenticate.
+            if ($RunIntune -and $null -ne $IntuneAuthContext) {
+                try { Set-DATIntuneAuthContext -AuthContext $IntuneAuthContext | Out-Null } catch { }
+            }
             $allResults = [System.Collections.Generic.List[pscustomobject]]::new()
+
+            # Fetch the expensive, shared lookups ONCE and reuse them across every model. Without
+            # this the Intune Win32 app list (a full paginated Graph query) and a new CIM session
+            # were rebuilt for every model key, making large selections very slow. Each model
+            # matches a disjoint set of apps by name, so a single snapshot is safe.
+            $sharedApps = $null
+            $sharedCim  = $null
+            if ($RunIntune) { try { $sharedApps = @(Get-DATIntuneWin32Apps) } catch { $sharedApps = $null } }
+            if ($SiteServer -and $SiteCode) { try { $sharedCim = New-DATCimSession -ComputerName $SiteServer } catch { $sharedCim = $null } }
+
             foreach ($key in $ModelKeys) {
                 $parts = $key -split '\|'
                 $invokeParams = @{
@@ -4645,29 +5046,118 @@ function Show-DATPackageRetentionModal {
                 if ($SiteServer -and $SiteCode) {
                     $invokeParams['SiteServer'] = $SiteServer
                     $invokeParams['SiteCode']   = $SiteCode
+                    if ($sharedCim) { $invokeParams['CimSession'] = $sharedCim }
                 }
-                if ($RunIntune) { $invokeParams['Intune'] = $true }
+                if ($RunIntune) {
+                    $invokeParams['Intune'] = $true
+                    if ($null -ne $sharedApps) { $invokeParams['IntuneApps'] = $sharedApps }
+                }
+                if ($DeleteSourceFolder) { $invokeParams['DeleteSourceFolder'] = $true }
+                # Direct reference to the shared progress hashtable (matches the known-model
+                # lookup pattern). Do NOT use GetNewClosure here -- it rebinds the scriptblock to
+                # a new module scope and the shared write is lost, so the UI never updates.
+                $invokeParams['OnProgress'] = { param($m) $ProgressState.Current = $m }
                 $r = Invoke-DATPackageRetention @invokeParams
                 foreach ($item in $r) { $allResults.Add($item) }
             }
+            if ($sharedCim) { try { Remove-CimSession -CimSession $sharedCim -ErrorAction SilentlyContinue } catch { } }
             return $allResults.ToArray()
         })
 
         $asyncResult = $ps.BeginInvoke()
 
+        # Publish the background handles so the Cancel button can stop them from the UI thread.
+        $script:RetentionPS = $ps
+        $script:RetentionRS = $rs
+        $script:RetentionAsync = $asyncResult
+        $retStart = Get-Date
+        # Mirror the completion-critical state to $script: scope. A DispatcherTimer tick handler can
+        # lose access to nested-scope locals under PowerShell 5.1, and if the handler throws (e.g.
+        # an unguarded DateTime subtraction against a lost local) the completion check below never
+        # runs and the modal wedges open forever. Everything the tick needs to decide *when to
+        # close* therefore lives in $script: scope, and the whole body is wrapped in try/catch.
+        $script:RetentionStartTime = $retStart
+        $script:RetentionProgress  = $retProgress
+        try { Write-DATLogEntry -Value "[Retention] Cleanup started -- scanning for superseded packages..." -Severity 1 } catch { }
+
         # Poll every 500 ms on the Dispatcher
         $pollTimer = [System.Windows.Threading.DispatcherTimer]::new()
         $pollTimer.Interval = [TimeSpan]::FromMilliseconds(500)
+        $script:RetentionPollTimer = $pollTimer
         $pollTimer.Add_Tick({
-            if ($asyncResult.IsCompleted) {
-                $pollTimer.Stop()
-                $retentionResults = @()
-                try { $retentionResults = $ps.EndInvoke($asyncResult) } catch { }
-                try { $ps.Dispose(); $rs.Dispose() } catch { }
+          # Guard the entire tick: a transient error must NEVER skip the completion check and leave
+          # the modal spinning. The completion decision is made FIRST and in full isolation so that
+          # nothing (e.g. a failed detail-line update) can ever prevent the modal from closing.
+          $isDone = $false; $runState = ''; $timedOut = $false
+          try {
+            $retAsync = $script:RetentionAsync
+            $retPs    = $script:RetentionPS
+            if ($null -ne $retPs)    { try { $runState = [string]$retPs.InvocationStateInfo.State } catch { $runState = '' } }
+            if ($null -ne $retAsync) { try { $isDone   = [bool]$retAsync.IsCompleted } catch { $isDone = $false } }
+            $startedAt = $script:RetentionStartTime
+            if ($startedAt -is [datetime]) { $timedOut = ((Get-Date) - $startedAt).TotalMinutes -ge 15 }
+          } catch { }
+          $reallyDone = $isDone -or ($runState -in @('Completed','Failed','Stopped'))
+          $shouldClose = $reallyDone -or $timedOut
 
-                $spinner.Visibility = 'Collapsed'
+          # Best-effort live detail line update -- isolated so a failure here can't block closing.
+          if (-not $shouldClose) {
+            try {
+                $progState = $script:RetentionProgress
+                if ($progState -and -not [string]::IsNullOrEmpty([string]$progState.Current)) {
+                    $detailText.Text = [string]$progState.Current
+                }
+            } catch { }
+            return
+          }
 
-                if ($retentionResults.Count -eq 0) {
+          # We have decided to close. Stop the timer FIRST via script scope (guarded) so this
+          # branch can never be re-entered even if a later UI update throws -- this is what
+          # previously wedged the modal: a throw on the first line left the timer running and the
+          # completion path retried forever without ever relabelling the button to "Close".
+          try { if ($script:RetentionPollTimer) { $script:RetentionPollTimer.Stop() } } catch { }
+          try { if ($pollTimer) { $pollTimer.Stop() } } catch { }
+
+          $retentionResults = @()
+          if ($reallyDone) {
+              try { $retentionResults = $retPs.EndInvoke($retAsync) } catch { }
+              try { $retPs.Dispose(); if ($script:RetentionRS) { $script:RetentionRS.Dispose() } } catch { }
+          } else {
+              # Safety timeout tripped while the runspace is STILL running (a stalled Graph call).
+              # Do NOT call EndInvoke -- it blocks until completion and would freeze the UI. Stop it
+              # asynchronously and abandon it so the modal can close cleanly.
+              try { if ($retPs) { $retPs.BeginStop($null, $null) | Out-Null } } catch { }
+              try { Write-DATActivityLog "Package retention timed out after 15 minutes -- the background cleanup was still running and has been stopped. Re-run to continue." -Level Warn } catch { }
+              try { Write-DATLogEntry -Value "[Retention] Cleanup timed out after 15 minutes and was stopped -- re-run to continue." -Severity 2 } catch { }
+          }
+
+          # Drop the shared handles so a later Close click doesn't touch a disposed runspace.
+          $script:RetentionPS = $null; $script:RetentionRS = $null
+          $script:RetentionAsync = $null; $script:RetentionPollTimer = $null
+          $script:RetentionProgress = $null; $script:RetentionStartTime = $null
+
+          # Essential UI state -- each guarded so one failure can't block the others. This is what
+          # makes the modal user-closeable, so it must always run regardless of render errors.
+          try { $btnCloseTb.Text = 'Close' } catch { }
+          try { $spinner.Visibility = 'Collapsed' } catch { }
+          try { $detailText.Visibility = 'Collapsed' } catch { }
+          try { $btnClose.Visibility = 'Visible' } catch { }
+
+          # Results rendering is cosmetic -- fully guarded so a render error can never block closing.
+          try {
+                if (-not $reallyDone) {
+                    $timeoutMsg = [System.Windows.Controls.TextBlock]::new()
+                    $timeoutMsg.Text      = 'Cleanup timed out and was stopped. Some packages may not have been processed -- re-run to continue.'
+                    $timeoutMsg.FontSize  = 12
+                    $timeoutMsg.TextWrapping = 'Wrap'
+                    $timeoutMsg.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusWarning']))
+                    $timeoutMsg.HorizontalAlignment = 'Center'
+                    $timeoutMsg.TextAlignment = 'Center'
+                    $timeoutMsg.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+                    $resultsPanel.Children.Add($timeoutMsg) | Out-Null
+                }
+                elseif ($retentionResults.Count -eq 0) {
                     $noAction = [System.Windows.Controls.TextBlock]::new()
                     $noAction.Text      = 'No superseded packages found to remove.'
                     $noAction.FontSize  = 12
@@ -4695,6 +5185,10 @@ function Show-DATPackageRetentionModal {
                             $statusIcon.Text = [string][char]0xE73E
                             $statusIcon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                                 [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusSuccess']))
+                        } elseif ($r.Action -eq 'Unassigned') {
+                            $statusIcon.Text = [string][char]0xE73E
+                            $statusIcon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                                [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusWarning']))
                         } else {
                             $statusIcon.Text = [string][char]0xEA39
                             $statusIcon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
@@ -4714,7 +5208,7 @@ function Show-DATPackageRetentionModal {
                         $row.Children.Add($nameBlock) | Out-Null
 
                         $platBlock = [System.Windows.Controls.TextBlock]::new()
-                        $platBlock.Text     = $r.Platform
+                        $platBlock.Text     = "$($r.Action) - $($r.Platform)"
                         $platBlock.FontSize = 11
                         $platBlock.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                             [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
@@ -4728,9 +5222,21 @@ function Show-DATPackageRetentionModal {
                 }
 
                 $resultsPanel.Visibility = 'Visible'
-                $btnClose.Visibility     = 'Visible'
                 $dlg.SizeToContent       = [System.Windows.SizeToContent]::Height
-            }
+          } catch {
+                try { Write-DATLogEntry -Value "[Retention] Completion render error: $($_.Exception.Message)" -Severity 2 } catch { }
+          }
+
+          # Log the outcome to the CMTrace log so the cleanup result is clear (matches the
+          # per-package [Retention] entries emitted by the background runspace).
+          if ($reallyDone) {
+              $processedCount = @($retentionResults).Count
+              if ($processedCount -gt 0) {
+                  try { Write-DATLogEntry -Value "[Retention] Cleanup complete -- $processedCount superseded package action(s) performed (removed/unassigned)." -Severity 1 } catch { }
+              } else {
+                  try { Write-DATLogEntry -Value "[Retention] Cleanup complete -- no superseded packages found to remove." -Severity 1 } catch { }
+              }
+          }
         })
         $pollTimer.Start()
     })
@@ -4939,6 +5445,163 @@ function Show-DATCustomBuildCompleteDialog {
 $script:BuildModal = $null
 $script:BuildModalRows = @{}
 $script:BuildModalPackageType = 'Drivers'
+# Refs to the temp free-space summary tile so the build progress timer can refresh it live.
+$script:BuildModalTempPath = ''
+$script:BuildModalFreeSpaceValue = $null
+$script:BuildModalFreeSpaceBar = $null
+# Refs to the live stat tiles (downloads remaining, packages created, failed, avg throughput).
+$script:BuildModalDownloadsValue = $null
+$script:BuildInitialDownloads = 0
+$script:BuildModalSuccessValue = $null
+$script:BuildModalFailedValue = $null
+$script:BuildModalThroughputValue = $null
+$script:BuildModalDefaultFgHex = '#FFFFFF'
+$script:BuildThroughputSum = 0.0
+$script:BuildThroughputCount = 0
+
+function New-DATBuildSummaryTile {
+    <#
+    .SYNOPSIS
+        Builds one summary tile (a card with a bold value, a label, and an optional thin bar) for
+        the build progress modal. Returns the Border plus its value/bar elements for live updates.
+    #>
+    param (
+        [string]$ValueText,
+        [string]$LabelText,
+        [string]$ValueColorHex,
+        [int]$Column,
+        [bool]$WithBar = $false
+    )
+    $theme = Get-DATTheme -ThemeName $script:CurrentTheme
+    $card = [System.Windows.Controls.Border]::new()
+    $card.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputBackground']))
+    $card.BorderBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBorder']))
+    $card.BorderThickness = [System.Windows.Thickness]::new(1)
+    $card.CornerRadius = [System.Windows.CornerRadius]::new(10)
+    $card.Padding = [System.Windows.Thickness]::new(14, 10, 14, 10)
+    $leftMargin  = if ($Column -eq 0) { 0 } else { 4 }
+    $rightMargin = if ($Column -eq 2) { 0 } else { 4 }
+    $card.Margin = [System.Windows.Thickness]::new($leftMargin, 0, $rightMargin, 0)
+    [System.Windows.Controls.Grid]::SetColumn($card, $Column)
+
+    $sp = [System.Windows.Controls.StackPanel]::new()
+
+    $val = [System.Windows.Controls.TextBlock]::new()
+    $val.Text = $ValueText
+    $val.FontSize = 20
+    $val.FontWeight = [System.Windows.FontWeights]::Bold
+    $val.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($ValueColorHex))
+    $sp.Children.Add($val) | Out-Null
+
+    $lbl = [System.Windows.Controls.TextBlock]::new()
+    $lbl.Text = $LabelText
+    $lbl.FontSize = 11
+    $lbl.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
+    $lbl.Margin = [System.Windows.Thickness]::new(0, 2, 0, 0)
+    $sp.Children.Add($lbl) | Out-Null
+
+    $bar = $null
+    if ($WithBar) {
+        $bar = [System.Windows.Controls.ProgressBar]::new()
+        $bar.Height = 4
+        $bar.Minimum = 0
+        $bar.Maximum = 100
+        $bar.Margin = [System.Windows.Thickness]::new(0, 8, 0, 0)
+        $bar.Background = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($theme['ProgressBackground']))
+        $bar.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($ValueColorHex))
+        $bar.BorderThickness = [System.Windows.Thickness]::new(0)
+        $sp.Children.Add($bar) | Out-Null
+    }
+
+    $card.Child = $sp
+    return [PSCustomObject]@{ Card = $card; Value = $val; Bar = $bar }
+}
+
+function Update-DATBuildModalFreeSpace {
+    <#
+    .SYNOPSIS
+        Refreshes the temp free-space tile from the current drive state. Called live from the build
+        progress timer so the value drops as downloads consume space. Green by default, amber at
+        >=75% used, red at >=90% used -- matching the Common Settings storage bar thresholds.
+    #>
+    if ($null -eq $script:BuildModalFreeSpaceValue) { return }
+    $path = $script:BuildModalTempPath
+    try {
+        if ([string]::IsNullOrWhiteSpace($path)) { return }
+        $root = [System.IO.Path]::GetPathRoot($path)
+        if (-not $root -or $root.StartsWith('\\')) { return }
+        $drive = [System.IO.DriveInfo]::new($root)
+        if (-not $drive.IsReady) { return }
+        $freeGB = [math]::Round($drive.AvailableFreeSpace / 1GB, 1)
+        $usedPct = [math]::Round((($drive.TotalSize - $drive.AvailableFreeSpace) / $drive.TotalSize) * 100, 0)
+        $colorHex = if ($usedPct -ge 90) { '#EF4444' } elseif ($usedPct -ge 75) { '#F59E0B' } else { '#22C55E' }
+        $brush = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($colorHex))
+        $script:BuildModalFreeSpaceValue.Text = "$freeGB GB"
+        $script:BuildModalFreeSpaceValue.Foreground = $brush
+        if ($null -ne $script:BuildModalFreeSpaceBar) {
+            $script:BuildModalFreeSpaceBar.Value = $usedPct
+            $script:BuildModalFreeSpaceBar.Foreground = $brush
+        }
+    } catch { }
+}
+
+function Update-DATBuildModalStats {
+    <#
+    .SYNOPSIS
+        Refreshes the live stat tiles from the registry: downloads remaining (counts down as
+        packages succeed), packages created, failed (red when > 0), and a running average of the
+        download throughput. Called each build progress tick.
+    #>
+    if ($null -eq $script:BuildModalSuccessValue) { return }
+    try {
+        $rv = Get-ItemProperty -Path $global:RegPath -ErrorAction SilentlyContinue
+        if ($null -eq $rv) { return }
+        # Packages actually created (real download + packaging work) -- excludes skipped/current ones
+        $created = 0
+        try { $created = [int]$rv.PackagesCreated } catch { $created = 0 }
+        $failed = 0
+        try { $failed = [int]$rv.FailedPackages } catch { $failed = 0 }
+
+        # Downloads remaining -- initial required count minus packages already created
+        if ($null -ne $script:BuildModalDownloadsValue) {
+            $remaining = $script:BuildInitialDownloads - $created
+            if ($remaining -lt 0) { $remaining = 0 }
+            $script:BuildModalDownloadsValue.Text = "$remaining"
+        }
+
+        $script:BuildModalSuccessValue.Text = "$created"
+
+        if ($null -ne $script:BuildModalFailedValue) {
+            $script:BuildModalFailedValue.Text = "$failed"
+            $failHex = if ($failed -gt 0) { '#EF4444' } else { $script:BuildModalDefaultFgHex }
+            $script:BuildModalFailedValue.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                [System.Windows.Media.ColorConverter]::ConvertFromString($failHex))
+        }
+
+        # Average download throughput -- sample the current speed and keep a running mean
+        if ($null -ne $script:BuildModalThroughputValue) {
+            $spd = [string]$rv.DownloadSpeed
+            if ($spd -match '([\d\.]+)\s*MB/s') {
+                $v = [double]$Matches[1]
+                if ($v -gt 0) {
+                    $script:BuildThroughputSum += $v
+                    $script:BuildThroughputCount++
+                }
+            }
+            if ($script:BuildThroughputCount -gt 0) {
+                $avg = [math]::Round($script:BuildThroughputSum / $script:BuildThroughputCount, 1)
+                $script:BuildModalThroughputValue.Text = "$avg MB/s"
+            }
+        }
+    } catch { }
+}
 
 function Show-DATBuildProgressModal {
     <#
@@ -4950,7 +5613,11 @@ function Show-DATBuildProgressModal {
     param (
         [Parameter(Mandatory)][array]$Models,
         [string]$Platform = 'Download Only',
-        [string]$PackageType = 'Drivers'
+        [string]$PackageType = 'Drivers',
+        [bool]$UpdatesOnly = $false,
+        [int]$ModelsSelected = 0,
+        [int]$DownloadsRequired = 0,
+        [string]$TempPath = ''
     )
 
     # Close any existing modal
@@ -4980,7 +5647,7 @@ function Show-DATBuildProgressModal {
     $dlg.WindowStartupLocation = 'CenterOwner'
     $dlg.Owner = $Window
     $dlg.Width = 620
-    $dlg.MaxHeight = 600
+    $dlg.MaxHeight = 760
     $dlg.SizeToContent = 'Height'
     $dlg.Topmost = $false
     $dlg.ResizeMode = 'NoResize'
@@ -5036,6 +5703,14 @@ function Show-DATBuildProgressModal {
             try { $script:BuildModal.Close() } catch { }
             $script:BuildModal = $null
             $script:BuildModalRows = @{}
+            $script:BuildModalFreeSpaceValue = $null
+            $script:BuildModalFreeSpaceBar = $null
+            $script:BuildModalDownloadsValue = $null
+            $script:BuildModalSuccessValue = $null
+            $script:BuildModalFailedValue = $null
+            $script:BuildModalThroughputValue = $null
+            # Restore the main-UI Abort button so the user can still abort with the modal closed
+            $btn_Abort.Visibility = 'Visible'
             if ($owner) { $owner.Activate() }
         }
     })
@@ -5044,7 +5719,68 @@ function Show-DATBuildProgressModal {
     $titleGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
     $outerPanel.Children.Add($titleGrid) | Out-Null
 
-    # Stage header row (show stage labels)
+    # When every model being processed already has an existing package (no brand-new models are
+    # being added), surface a subtitle so the user knows this run only refreshes existing packages.
+    if ($UpdatesOnly) {
+        $subtitleText = [System.Windows.Controls.TextBlock]::new()
+        $subtitleText.Text = "Processing Updates Only"
+        $subtitleText.FontSize = 12
+        $subtitleText.FontWeight = [System.Windows.FontWeights]::SemiBold
+        $subtitleText.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.ColorConverter]::ConvertFromString($theme['AccentColor']))
+        $subtitleText.Margin = [System.Windows.Thickness]::new(0, -8, 0, 14)
+        $outerPanel.Children.Add($subtitleText) | Out-Null
+    }
+
+    # Summary tiles -- row 1: Models Selected | Downloads Required | Temp Free Space
+    $tilesGrid = [System.Windows.Controls.Grid]::new()
+    for ($tcol = 0; $tcol -lt 3; $tcol++) {
+        $tcd = [System.Windows.Controls.ColumnDefinition]::new()
+        $tcd.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $tilesGrid.ColumnDefinitions.Add($tcd)
+    }
+    $tilesGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+
+    $tileModels    = New-DATBuildSummaryTile -ValueText "$ModelsSelected" -LabelText 'Models Selected' -ValueColorHex $theme['WindowForeground'] -Column 0
+    $tileDownloads = New-DATBuildSummaryTile -ValueText "$DownloadsRequired" -LabelText 'Downloads Required' -ValueColorHex $theme['AccentColor'] -Column 1
+    $tileFree      = New-DATBuildSummaryTile -ValueText '--' -LabelText 'Temp Free Space' -ValueColorHex '#22C55E' -Column 2 -WithBar $true
+    $tilesGrid.Children.Add($tileModels.Card) | Out-Null
+    $tilesGrid.Children.Add($tileDownloads.Card) | Out-Null
+    $tilesGrid.Children.Add($tileFree.Card) | Out-Null
+    $outerPanel.Children.Add($tilesGrid) | Out-Null
+
+    # Summary tiles -- row 2: Packages Created | Failed | Avg Throughput
+    $tilesGrid2 = [System.Windows.Controls.Grid]::new()
+    for ($tcol2 = 0; $tcol2 -lt 3; $tcol2++) {
+        $tcd2 = [System.Windows.Controls.ColumnDefinition]::new()
+        $tcd2.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $tilesGrid2.ColumnDefinitions.Add($tcd2)
+    }
+    $tilesGrid2.Margin = [System.Windows.Thickness]::new(0, 0, 0, 16)
+
+    $tileSuccess    = New-DATBuildSummaryTile -ValueText '0' -LabelText 'Packages Created' -ValueColorHex '#22C55E' -Column 0
+    $tileFailed     = New-DATBuildSummaryTile -ValueText '0' -LabelText 'Failed' -ValueColorHex $theme['WindowForeground'] -Column 1
+    $tileThroughput = New-DATBuildSummaryTile -ValueText '-- MB/s' -LabelText 'Avg Throughput' -ValueColorHex $theme['AccentColor'] -Column 2
+    $tilesGrid2.Children.Add($tileSuccess.Card) | Out-Null
+    $tilesGrid2.Children.Add($tileFailed.Card) | Out-Null
+    $tilesGrid2.Children.Add($tileThroughput.Card) | Out-Null
+    $outerPanel.Children.Add($tilesGrid2) | Out-Null
+
+    # Wire tiles for live refresh from the build progress timer, then populate them now
+    $script:BuildModalTempPath = $TempPath
+    $script:BuildModalFreeSpaceValue = $tileFree.Value
+    $script:BuildModalFreeSpaceBar = $tileFree.Bar
+    $script:BuildModalDownloadsValue = $tileDownloads.Value
+    $script:BuildInitialDownloads = $DownloadsRequired
+    $script:BuildModalSuccessValue = $tileSuccess.Value
+    $script:BuildModalFailedValue = $tileFailed.Value
+    $script:BuildModalThroughputValue = $tileThroughput.Value
+    $script:BuildModalDefaultFgHex = "$($theme['WindowForeground'])"
+    $script:BuildThroughputSum = 0.0
+    $script:BuildThroughputCount = 0
+    Update-DATBuildModalFreeSpace
+    Update-DATBuildModalStats
+
     $headerGrid = [System.Windows.Controls.Grid]::new()
     $hcModel = [System.Windows.Controls.ColumnDefinition]::new()
     $hcModel.Width = [System.Windows.GridLength]::new(180)
@@ -5081,7 +5817,7 @@ function Show-DATBuildProgressModal {
     $headerGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 10)
     $outerPanel.Children.Add($headerGrid) | Out-Null
 
-    # Scrollable model list (show 5 rows before scrolling: 5 × 46px = 230)
+    # Scrollable model list (shows 5 rows before scrolling: 5 × 46px = 230)
     $scrollViewer = [System.Windows.Controls.ScrollViewer]::new()
     $scrollViewer.VerticalScrollBarVisibility = 'Auto'
     $scrollViewer.MaxHeight = 230
@@ -5154,15 +5890,18 @@ function Show-DATBuildProgressModal {
     # For 'All' package type, expand each model into two rows: Drivers then BIOS
     # Microsoft models skip the BIOS row (firmware is delivered via driver injection)
     # BIOSOnly models skip the Drivers row (no driver package for the selected OS/build)
+    # A model narrowed to a single type (only a driver OR only a BIOS update is needed) shows
+    # just that one row, so the modal reflects exactly what will be processed.
     $displayModels = if ($PackageType -eq 'All') {
         $expanded = [System.Collections.ArrayList]::new()
         $srcIdx = 0
         foreach ($m in $Models) {
             $srcIdx++
-            if (-not $m.BIOSOnly) {
+            $mType = if (-not [string]::IsNullOrEmpty($m.PackageType)) { [string]$m.PackageType } else { 'All' }
+            if ($mType -in @('Drivers', 'All') -and -not $m.BIOSOnly) {
                 [void]$expanded.Add([PSCustomObject]@{ OEM = $m.OEM; Model = $m.Model; OS = $m.OS; Phase = 'Drivers'; SourceIndex = $srcIdx })
             }
-            if ($m.OEM -ne 'Microsoft') {
+            if ($mType -in @('BIOS', 'All') -and $m.OEM -ne 'Microsoft') {
                 [void]$expanded.Add([PSCustomObject]@{ OEM = $m.OEM; Model = $m.Model; OS = $m.OS; Phase = 'BIOS'; SourceIndex = $srcIdx })
             }
         }
@@ -5361,6 +6100,7 @@ function Show-DATBuildProgressModal {
             Subtitle   = $subtitleLabel
             Stages  = $stages
             Status  = @{}
+            RowGrid = $rowGrid
         }
         foreach ($s in $stages) {
             $script:BuildModalRows[$modelKey].Status[$s] = 'Pending'
@@ -5381,6 +6121,39 @@ function Show-DATBuildProgressModal {
     $script:BuildModalPackagingNote.HorizontalAlignment = 'Center'
     $script:BuildModalPackagingNote.Visibility = 'Collapsed'
     $outerPanel.Children.Add($script:BuildModalPackagingNote) | Out-Null
+
+    # Abort button -- kept at the bottom of the modal so it stays in the field of view while the
+    # modal covers the main window. Built with the theme's danger colours baked in because the
+    # modal is a separate window where the app's DynamicResource button styles do not resolve.
+    $abortDangerBg    = $theme['ButtonDanger']
+    $abortDangerHover = $theme['ButtonDangerHover']
+    $abortDangerFg    = $theme['ButtonPrimaryForeground']
+    $abortXaml = @"
+<Button xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Height="36" MinWidth="140" HorizontalAlignment="Center" Margin="0,18,0,0"
+        Cursor="Hand" Foreground="$abortDangerFg" FontSize="13" FontWeight="SemiBold" FontFamily="Segoe UI">
+    <Button.Template>
+        <ControlTemplate TargetType="Button">
+            <Border x:Name="border" Background="$abortDangerBg" CornerRadius="8" Padding="16,8" BorderThickness="0" Cursor="Hand">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                    <Setter TargetName="border" Property="Background" Value="$abortDangerHover"/>
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+    </Button.Template>
+    <TextBlock><Run Text="&#xE711;" FontFamily="Segoe MDL2 Assets"/><Run Text="  Abort Build"/></TextBlock>
+</Button>
+"@
+    $abortBtn = [System.Windows.Markup.XamlReader]::Parse($abortXaml)
+    $abortBtn.Add_Click({
+        # Reuse the main-UI Abort handler (kills child processes, signals abort, closes the modal)
+        try { $btn_Abort.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)) } catch { }
+    })
+    $outerPanel.Children.Add($abortBtn) | Out-Null
 
     $border.Child = $outerPanel
     $dlg.Content = $border
@@ -5417,6 +6190,10 @@ function Show-DATBuildProgressModal {
         $Window.Add_SizeChanged($centerAction)
         $script:BuildModalCenteringRegistered = $true
     }
+
+    # Hide the main-UI Abort button while the modal is open -- the modal has its own Abort button
+    # so the control stays in the user's field of view. It is restored when the modal closes.
+    $btn_Abort.Visibility = 'Collapsed'
 
     # Show non-blocking
     $dlg.Show()
@@ -5591,6 +6368,11 @@ function Update-DATBuildModalStage {
             $icon.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
             $icon.FontSize = 12
             $icon.Foreground = [System.Windows.Media.Brushes]::White
+            # Auto-scroll the active model row into view so progress stays visible
+            # on long builds without the user having to scroll manually.
+            if ($row.RowGrid) {
+                try { $row.RowGrid.BringIntoView() } catch { }
+            }
         }
         'Success' {
             $circle.Background = [System.Windows.Media.SolidColorBrush]::new(
@@ -5778,6 +6560,61 @@ function Update-DATBuildModalFromRegistry {
     }
     $script:BuildProgressLastJob = $currentJob
     $script:BuildProgressLastCompletedJobs = $currentCompletedJobs
+
+    # Authoritative per-model failure marking. The heuristic above can miss a failure when the
+    # failed model is immediately followed by a skipped/successful model within a single poll
+    # interval (that model's CompletedJobs increment masks the stall). Drive the row failure
+    # state from the structured BuildFailures list the runspace records instead, so the red row
+    # state and the "Failed" tile always agree.
+    $failuresJson = [string]$regValues.BuildFailures
+    if (-not [string]::IsNullOrEmpty($failuresJson)) {
+        $failList = $null
+        try { $failList = @($failuresJson | ConvertFrom-Json) } catch { $failList = $null }
+        if ($failList) {
+            foreach ($bf in $failList) {
+                if (-not $bf.Model) { continue }
+                # Resolve the failed model's job index (1-based). Match on OEM + Model, and when
+                # the same model appears for several OS/builds, disambiguate on OS.
+                $candidates = @()
+                for ($fi = 0; $fi -lt $global:SelectedModels.Count; $fi++) {
+                    $sm = $global:SelectedModels[$fi]
+                    if ($sm.OEM -eq $bf.OEM -and $sm.Model -eq $bf.Model) { $candidates += $fi }
+                }
+                if ($candidates.Count -eq 0) { continue }
+                $failIdx = $candidates[0]
+                if ($candidates.Count -gt 1 -and $bf.OS) {
+                    foreach ($c in $candidates) {
+                        $smOS = [string]$global:SelectedModels[$c].OS
+                        if ($smOS -and ($bf.OS -like "*$smOS*" -or $smOS -like "*$($bf.OS)*")) { $failIdx = $c; break }
+                    }
+                }
+                $failJob = $failIdx + 1
+                $failDisplay = if ($script:BuildModalPackageType -eq 'All') {
+                    if ($bf.PackageType -eq 'BIOS') { "$($bf.Model) (BIOS)" } else { "$($bf.Model) (Drivers)" }
+                } else {
+                    $bf.Model
+                }
+                $failKey = "$($bf.OEM)|$failJob|$failDisplay"
+                if (-not $script:BuildModalRows.ContainsKey($failKey)) { continue }
+                $failRow = $script:BuildModalRows[$failKey]
+                # Already flagged (or intentionally skipped)? leave it alone
+                $skipMark = $false
+                foreach ($s in $failRow.Stages) {
+                    if ($failRow.Status[$s] -in @('Error', 'Skipped')) { $skipMark = $true; break }
+                }
+                if ($skipMark) { continue }
+                # Mark the furthest-progressed stage as Error so the failure point is visible
+                $stageToError = $null
+                foreach ($s in $failRow.Stages) { if ($failRow.Status[$s] -eq 'Active') { $stageToError = $s; break } }
+                if (-not $stageToError) {
+                    foreach ($s in $failRow.Stages) { if ($failRow.Status[$s] -ne 'Success') { $stageToError = $s; break } }
+                }
+                if ($stageToError) {
+                    Update-DATBuildModalStage -ModelKey $failKey -Stage $stageToError -State Error
+                }
+            }
+        }
+    }
 
     # Mark all completed models as fully succeeded (skip models marked as Error or Skipped)
     for ($i = 0; $i -lt $modelIdx; $i++) {
@@ -5989,6 +6826,14 @@ function Close-DATBuildProgressModal {
             try { $script:BuildModal.Close() } catch { }
             $script:BuildModal = $null
             $script:BuildModalRows = @{}
+            $script:BuildModalFreeSpaceValue = $null
+            $script:BuildModalFreeSpaceBar = $null
+            $script:BuildModalDownloadsValue = $null
+            $script:BuildModalSuccessValue = $null
+            $script:BuildModalFailedValue = $null
+            $script:BuildModalThroughputValue = $null
+            # Restore the main-UI Abort button once the modal auto-closes
+            $btn_Abort.Visibility = 'Visible'
             if ($owner) { $owner.Activate() }
         }
     })
@@ -6518,6 +7363,18 @@ $grid_Models.Add_Sorting({
     $e.Column.SortDirection = $newDir
 })
 
+# Brings selected models to the top of the grid (checked first, then OEM/Model). Called after a
+# bulk selection change (profile load, known-model selection) so the user immediately sees what is
+# selected without manually clicking the checkbox column header.
+function Sort-DATModelsSelectedFirst {
+    $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:ModelData)
+    if ($null -eq $view) { return }
+    $view.SortDescriptions.Clear()
+    $view.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Selected', [System.ComponentModel.ListSortDirection]::Descending))
+    $view.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('OEM', [System.ComponentModel.ListSortDirection]::Ascending))
+    $view.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Model', [System.ComponentModel.ListSortDirection]::Ascending))
+}
+
 # Model detail panel: show package details when a row is selected
 $grid_Models.Add_SelectionChanged({
     param($s, $e)
@@ -6591,6 +7448,11 @@ $grid_Models.Add_SelectionChanged({
 $ctx_AddCustomDrivers = $grid_Models.ContextMenu.Items | Where-Object { $_.Name -eq 'ctx_AddCustomDrivers' }
 $ctx_ClearCustomDrivers = $grid_Models.ContextMenu.Items | Where-Object { $_.Name -eq 'ctx_ClearCustomDrivers' }
 $ctx_ForcePackageUpdate = $grid_Models.ContextMenu.Items | Where-Object { $_.Name -eq 'ctx_ForcePackageUpdate' }
+$ctx_SelectModelsWithUpdates = $grid_Models.ContextMenu.Items | Where-Object { $_.Name -eq 'ctx_SelectModelsWithUpdates' }
+
+if ($null -ne $ctx_SelectModelsWithUpdates) {
+    $ctx_SelectModelsWithUpdates.Add_Click({ Select-DATModelsWithUpdates })
+}
 
 $ctx_AddCustomDrivers.Add_Click({
     $selectedItem = $grid_Models.SelectedItem
@@ -7066,8 +7928,16 @@ $btn_RefreshModels.Add_Click({
                                 continue
                             }
                             if ($model.OEM -eq 'Acer') {
-                                # Acer SupportedDevices == model name; look up by uppercased model name
-                                $biosEntry = $biosDeviceMap["Acer|$($model.Model.ToUpper())"]
+                                # Acer BIOS SupportedDevices is the platform product code (e.g.
+                                # Trumpet_RBU), identical to the driver catalog -- so match on that
+                                # via Baseboards, exactly like the other OEMs. Fall back to the model
+                                # DisplayName only for any legacy entries keyed by name.
+                                $biosEntry = $null
+                                $boards = $model.Baseboards -split '[,;\s]+' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
+                                foreach ($board in $boards) {
+                                    $biosEntry = $biosDeviceMap["Acer|$board"]
+                                    if ($null -ne $biosEntry) { break }
+                                }
                                 if ($null -eq $biosEntry) {
                                     # Fallback: DisplayName-keyed map (legacy entries without SupportedDevices)
                                     $biosEntry = $biosNameMap["Acer|$($model.Model)"]
@@ -7870,6 +8740,9 @@ $btn_RefreshModels.Add_Click({
                         Restore-DATModelSelections
                         # Persist the restored selection state immediately
                         Save-DATModelSelections
+                        # Re-apply deployed-version flags to the freshly loaded grid (uses the
+                        # cached deployed-version map from the last known-model scan).
+                        Update-DATModelUpdateStatus
 
                         # Warn if BIOS catalog was unavailable (no models have BIOS versions)
                         $biosPopulated = @($script:ModelData | Where-Object { -not [string]::IsNullOrEmpty($_.BIOSVersion) })
@@ -7913,9 +8786,12 @@ $txt_ModelSearch.Add_TextChanged({
     if ([string]::IsNullOrEmpty($searchText)) {
         $view.Filter = $null
     } else {
+        # Escape wildcard metacharacters (* ? [ ]) so a partially typed pattern such as
+        # "p[" is matched literally instead of throwing "invalid wildcard pattern".
+        $escapedSearch = [System.Management.Automation.WildcardPattern]::Escape($searchText)
         $view.Filter = [System.Predicate[object]]{
             param($item)
-            $item.Model -like "*$searchText*" -or $item.OEM -like "*$searchText*" -or $item.Baseboards -like "*$searchText*"
+            $item.Model -like "*$escapedSearch*" -or $item.OEM -like "*$escapedSearch*" -or $item.Baseboards -like "*$escapedSearch*"
         }
     }
     $grid_Models.ItemsSource = $view
@@ -8047,6 +8923,158 @@ function Test-DATKnownDeviceMatch {
     return $false
 }
 
+# Deployed-version comparison state. Populated when connected to Intune/ConfigMgr so the grid
+# can flag models whose catalog driver/BIOS version is newer than what is already deployed.
+$script:DeployedVersionMap = $null        # hashtable: key -> List[string] of deployed versions
+$script:DeployedVersionsFetched = $false
+$script:LastDriverUpdateCount = 0
+$script:LastBiosUpdateCount = 0
+
+function Add-DATDeployedVersionEntry {
+    # Parses a deployed package name into a lookup key and records its version. Package names:
+    #   "Drivers - <OEM> <Model> - <OS> <Arch>"      -> key "DRIVER|<oem> <model>|<os>"
+    #   "BIOS - <OEM> <Model>" / "BIOS Update - ..."  -> key "BIOS|<oem> <model>"
+    param([hashtable]$Map, [string]$Name, [string]$Version)
+    if ([string]::IsNullOrEmpty($Name)) { return }
+    $parts = [regex]::Split($Name, '\s+-\s+')
+    if ($parts.Count -lt 2) { return }
+    $type = $parts[0].Trim()
+    $makeModel = $parts[1].Trim()
+    $key = $null
+    if ($type -like 'Drivers*') {
+        $os = ''
+        if ($parts.Count -ge 3) {
+            $os = ($parts[2].Trim() -replace '\s+(x64|arm64|x86)$', '').Trim()
+        }
+        $key = "DRIVER|$makeModel|$os".ToLowerInvariant()
+    } elseif ($type -like 'BIOS*') {
+        $key = "BIOS|$makeModel".ToLowerInvariant()
+    }
+    if ($null -eq $key) { return }
+    if (-not $Map.ContainsKey($key)) { $Map[$key] = New-Object System.Collections.Generic.List[string] }
+    if (-not [string]::IsNullOrEmpty($Version) -and -not $Map[$key].Contains($Version)) {
+        [void]$Map[$key].Add($Version)
+    }
+}
+
+function Invoke-DATDeployedVersionScan {
+    <#
+    .SYNOPSIS
+        Fetches the versions of driver/BIOS packages already deployed to Intune and/or
+        ConfigMgr, caches them, and re-annotates the model grid so newer catalog versions are
+        flagged. Called whenever known-model data is (re)loaded. Non-fatal on any failure.
+    #>
+    try {
+        $map = @{}
+        $any = $false
+
+        if (Test-DATIntuneAuth) {
+            try {
+                foreach ($v in @(Get-DATDeployedPackageVersions -Platform Intune)) {
+                    Add-DATDeployedVersionEntry -Map $map -Name $v.Name -Version $v.Version
+                }
+                $any = $true
+            } catch {
+                Write-DATActivityLog "Deployed-version scan (Intune) failed: $($_.Exception.Message)" -Level Warn
+            }
+        }
+
+        if (-not [string]::IsNullOrEmpty($global:SiteServer) -and -not [string]::IsNullOrEmpty($global:SiteCode)) {
+            try {
+                foreach ($v in @(Get-DATDeployedPackageVersions -Platform ConfigMgr -SiteServer $global:SiteServer -SiteCode $global:SiteCode)) {
+                    Add-DATDeployedVersionEntry -Map $map -Name $v.Name -Version $v.Version
+                }
+                $any = $true
+            } catch {
+                Write-DATActivityLog "Deployed-version scan (ConfigMgr) failed: $($_.Exception.Message)" -Level Warn
+            }
+        }
+
+        if (-not $any) { return }
+
+        $script:DeployedVersionMap = $map
+        $script:DeployedVersionsFetched = $true
+        Update-DATModelUpdateStatus
+    } catch {
+        Write-DATActivityLog "Deployed-version scan error: $($_.Exception.Message)" -Level Warn
+    }
+}
+
+function Update-DATModelUpdateStatus {
+    <#
+    .SYNOPSIS
+        Annotates each grid model with driver/BIOS deployment status by comparing its catalog
+        version against the cached deployed-version map. Sets DriverStatus/BIOSStatus to
+        "Current" / "UpdateAvailable" / "NotDeployed" (or "" when nothing was fetched) plus a
+        descriptive tooltip. Cell colouring and the update glyph are driven from these values
+        in the XAML. Safe to call after any grid refresh (re-uses the cached map).
+    #>
+    if (-not $script:DeployedVersionsFetched -or $null -eq $script:DeployedVersionMap) { return }
+    if ($script:ModelData.Count -eq 0) { return }
+
+    $map = $script:DeployedVersionMap
+    $driverUpdates = 0
+    $biosUpdates = 0
+
+    foreach ($item in $script:ModelData) {
+        # ----- Driver -----
+        if (-not $item.BIOSOnly -and -not [string]::IsNullOrEmpty($item.Version)) {
+            $dKey = "DRIVER|$($item.OEM) $($item.Model)|$($item.OS)".ToLowerInvariant()
+            if ($map.ContainsKey($dKey)) {
+                $deployed = @($map[$dKey])
+                $item.DeployedDriverVersion = ($deployed -join ', ')
+                if ($deployed -contains $item.Version) {
+                    $item.DriverStatus  = 'Current'
+                    $item.DriverTooltip = "Driver deployed and current (v$($item.Version))"
+                } else {
+                    $item.DriverStatus  = 'UpdateAvailable'
+                    $item.DriverTooltip = "Newer driver available`nDeployed: v$($item.DeployedDriverVersion)`nAvailable: v$($item.Version)"
+                    $driverUpdates++
+                }
+            } else {
+                $item.DeployedDriverVersion = ''
+                $item.DriverStatus  = 'NotDeployed'
+                $item.DriverTooltip = "Driver not yet deployed (available: v$($item.Version))"
+            }
+        } else {
+            $item.DriverStatus  = ''
+            $item.DriverTooltip = ''
+        }
+
+        # ----- BIOS -----
+        if (-not [string]::IsNullOrEmpty($item.BIOSVersion)) {
+            $bKey = "BIOS|$($item.OEM) $($item.Model)".ToLowerInvariant()
+            if ($map.ContainsKey($bKey)) {
+                $deployed = @($map[$bKey])
+                $item.DeployedBIOSVersion = ($deployed -join ', ')
+                if ($deployed -contains $item.BIOSVersion) {
+                    $item.BIOSStatus  = 'Current'
+                    $item.BIOSTooltip = "BIOS deployed and current (v$($item.BIOSVersion))"
+                } else {
+                    $item.BIOSStatus  = 'UpdateAvailable'
+                    $item.BIOSTooltip = "Newer BIOS available`nDeployed: v$($item.DeployedBIOSVersion)`nAvailable: v$($item.BIOSVersion)"
+                    $biosUpdates++
+                }
+            } else {
+                $item.DeployedBIOSVersion = ''
+                $item.BIOSStatus  = 'NotDeployed'
+                $item.BIOSTooltip = "BIOS not yet deployed (available: v$($item.BIOSVersion))"
+            }
+        } else {
+            $item.BIOSStatus  = ''
+            $item.BIOSTooltip = ''
+        }
+    }
+
+    $script:LastDriverUpdateCount = $driverUpdates
+    $script:LastBiosUpdateCount   = $biosUpdates
+    if (($driverUpdates + $biosUpdates) -gt 0) {
+        Write-DATActivityLog "Update check: $driverUpdates driver and $biosUpdates BIOS update(s) available vs deployed packages" -Level Info
+    } else {
+        Write-DATActivityLog "Update check: all deployed driver/BIOS packages are current" -Level Info
+    }
+}
+
 function Update-DATSelectKnownModelsVisibility {
     <#
     .SYNOPSIS
@@ -8132,6 +9160,51 @@ $btn_DeselectAll.Add_Click({
     Save-DATModelSelections
 })
 
+function Select-DATModelsWithUpdates {
+    <#
+    .SYNOPSIS
+        Selects every grid model that has a newer catalog driver or BIOS version than what is
+        currently deployed (DriverStatus/BIOSStatus = 'UpdateAvailable'). Requires a prior
+        deployed-version scan (connect to Intune/ConfigMgr and load known models first).
+    #>
+    if (-not $script:DeployedVersionsFetched) {
+        Show-DATInfoDialog -Title 'No Deployment Data' -Type Info `
+            -Message 'Connect to Intune and/or Configuration Manager and load known models first so the tool can compare deployed versions.'
+        return
+    }
+
+    foreach ($item in $script:ModelData) { $item.Selected = $false }
+    $count = 0
+    foreach ($item in $script:ModelData) {
+        if ($item.DriverStatus -eq 'UpdateAvailable' -or $item.BIOSStatus -eq 'UpdateAvailable') {
+            $item.Selected = $true
+            $count++
+        }
+    }
+
+    Write-DATActivityLog "Selected $count model(s) with a newer driver or BIOS available than deployed" -Level Success
+    if ($count -eq 0) {
+        $txt_Status.Text = 'No models have a newer driver/BIOS than what is already deployed.'
+    }
+
+    # Float selected rows to the top
+    $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($script:ModelData)
+    $view.SortDescriptions.Clear()
+    $view.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Selected', [System.ComponentModel.ListSortDirection]::Descending))
+    $view.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('OEM', [System.ComponentModel.ListSortDirection]::Ascending))
+    $view.SortDescriptions.Add([System.ComponentModel.SortDescription]::new('Model', [System.ComponentModel.ListSortDirection]::Ascending))
+    foreach ($col in $grid_Models.Columns) {
+        if ($col.SortMemberPath -eq 'Selected') {
+            $col.SortDirection = [System.ComponentModel.ListSortDirection]::Descending
+        } else {
+            $col.SortDirection = $null
+        }
+    }
+
+    Update-DATBuildButtonState
+    Save-DATModelSelections
+}
+
 function Update-DATBuildButtonState {
     $selectedCount = ($script:ModelData | Where-Object { $_.Selected }).Count
     $btn_Build.IsEnabled = ($selectedCount -gt 0)
@@ -8139,6 +9212,99 @@ function Update-DATBuildButtonState {
     if ($script:ModelData.Count -gt 0) {
         $txt_ModelCount.Text = "$selectedCount of $($script:ModelData.Count) selected"
     }
+}
+
+function Write-DATJsonFileAtomic {
+    <#
+    .SYNOPSIS
+        Writes text to a file atomically with retry. Avoids "used by another process" /
+        "Stream was not readable" errors when the target is briefly locked (antivirus,
+        the search indexer, or a concurrent reader). Content is written to a per-call
+        temp file first, then swapped into place so readers never see a partial file.
+    .OUTPUTS
+        [bool] $true on success, $false if all attempts fail (never throws).
+    #>
+    param (
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content,
+        [int]$MaxAttempts = 5
+    )
+    $parent = Split-Path -Path $Path -Parent
+    if ([string]::IsNullOrWhiteSpace($parent)) {
+        # No directory component -- resolve against the current location so the swap APIs get a
+        # fully-qualified path (a bare filename can trip "the path is not of a legal form").
+        try { $parent = (Get-Location -PSProvider FileSystem).ProviderPath } catch { $parent = $PWD.Path }
+        $Path = Join-Path $parent (Split-Path -Path $Path -Leaf)
+    }
+    if (-not (Test-Path -LiteralPath $parent)) {
+        try { New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null } catch { }
+    }
+    $tempPath = Join-Path $parent ("~dat_" + [System.IO.Path]::GetRandomFileName())
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            [System.IO.File]::WriteAllText($tempPath, $Content, $utf8NoBom)
+            try {
+                if (Test-Path -LiteralPath $Path) {
+                    # Atomic in-place swap (same volume). A real backup path is required -- passing
+                    # $null for the backup throws ("the path is not of a legal form" on .NET
+                    # Framework / "the path is empty" on .NET Core). The backup is deleted after.
+                    $backupPath = Join-Path $parent ("~datbak_" + [System.IO.Path]::GetRandomFileName())
+                    [System.IO.File]::Replace($tempPath, $Path, $backupPath)
+                    try { if (Test-Path -LiteralPath $backupPath) { [System.IO.File]::Delete($backupPath) } } catch { }
+                } else {
+                    [System.IO.File]::Move($tempPath, $Path)
+                }
+            } catch {
+                # File.Replace/Move can still fail on some paths/filesystems (cross-device,
+                # network/ReFS quirks). The temp write above already proved the folder is writable,
+                # so fall back to overwriting the destination directly, then remove the temp file.
+                [System.IO.File]::WriteAllText($Path, $Content, $utf8NoBom)
+                try { if (Test-Path -LiteralPath $tempPath) { [System.IO.File]::Delete($tempPath) } } catch { }
+            }
+            return $true
+        } catch {
+            if ($attempt -ge $MaxAttempts) {
+                $leaf = try { [System.IO.Path]::GetFileName($Path) } catch { $Path }
+                Write-DATActivityLog "Could not write '$leaf' after $MaxAttempts attempts: $($_.Exception.Message)" -Level Warn
+                try { if (Test-Path -LiteralPath $tempPath) { [System.IO.File]::Delete($tempPath) } } catch { }
+                return $false
+            }
+            Start-Sleep -Milliseconds (50 * $attempt)
+        }
+    }
+    return $false
+}
+
+function Read-DATTextFileWithRetry {
+    <#
+    .SYNOPSIS
+        Reads a text file with retry so a brief lock from a concurrent writer or antivirus
+        scan does not surface as a "used by another process" / "Stream was not readable"
+        error. Returns $null when the file is missing or unreadable (never throws).
+    #>
+    param (
+        [Parameter(Mandatory)][string]$Path,
+        [int]$MaxAttempts = 5
+    )
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            # FileShare.ReadWrite tolerates a concurrent reader/writer holding the handle.
+            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            try {
+                $reader = [System.IO.StreamReader]::new($fs)
+                try { return $reader.ReadToEnd() } finally { $reader.Dispose() }
+            } finally { $fs.Dispose() }
+        } catch {
+            if ($attempt -ge $MaxAttempts) {
+                Write-DATActivityLog "Could not read '$([System.IO.Path]::GetFileName($Path))' after $MaxAttempts attempts: $($_.Exception.Message)" -Level Warn
+                return $null
+            }
+            Start-Sleep -Milliseconds (50 * $attempt)
+        }
+    }
+    return $null
 }
 
 function Save-DATModelSelections {
@@ -8157,7 +9323,7 @@ function Save-DATModelSelections {
         @{ OEM = $_.OEM; Model = $_.Model; Baseboards = $_.Baseboards; OS = $_.OS; Build = $_.Build; Architecture = $_.Architecture }
     })
     $json = if ($selections.Count -eq 0) { '[]' } else { $selections | ConvertTo-Json -Depth 2 -Compress }
-    Set-Content -Path $jsonPath -Value $json -Encoding UTF8 -Force
+    [void](Write-DATJsonFileAtomic -Path $jsonPath -Content $json)
 }
 
 function Restore-DATModelSelections {
@@ -8168,11 +9334,28 @@ function Restore-DATModelSelections {
         so selections survive OS changes where model names may differ but hardware IDs stay the same.
     #>
     $jsonPath = Join-Path $global:ScriptDirectory 'Settings\SelectedModels.json'
-    if (-not (Test-Path $jsonPath)) { return }
+
+    # A profile apply hands its exact model list to us in-memory via
+    # $script:PendingProfileModels. Prefer that over the on-disk SelectedModels.json so a
+    # background refresh that is still finishing for a previously-selected OEM cannot
+    # overwrite the seeded file with an empty selection before this restore runs. The pending
+    # list is only cleared once it matches at least one grid row, so the profile's own refresh
+    # (which loads the correct OEM) always gets a chance to apply it.
+    $fromPending = $false
+    $saved = $null
+    if ($null -ne $script:PendingProfileModels -and @($script:PendingProfileModels).Count -gt 0) {
+        $saved = @($script:PendingProfileModels | ForEach-Object { [PSCustomObject]$_ })
+        $fromPending = $true
+    }
+    if (-not $fromPending -and -not (Test-Path $jsonPath)) { return }
 
     try {
-        $saved = Get-Content -Path $jsonPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        if (-not $saved -or $saved.Count -eq 0) { return }
+        if (-not $fromPending) {
+            $raw = Read-DATTextFileWithRetry -Path $jsonPath
+            if ([string]::IsNullOrWhiteSpace($raw)) { return }
+            $saved = $raw | ConvertFrom-Json -ErrorAction Stop
+        }
+        if (-not $saved -or @($saved).Count -eq 0) { return }
 
         # Build lookup sets. New-format entries include OS + Build so a model selected for a
         # specific Windows build (e.g. HP "Windows 11 25H2") only re-selects that build row
@@ -8246,6 +9429,13 @@ function Restore-DATModelSelections {
         if ($matchCount -gt 0) {
             Write-DATActivityLog "Restored $matchCount previously selected models" -Level Success
             Update-DATBuildButtonState
+            # Bring the just-selected models to the top so the user immediately sees them
+            # (matches the behaviour of the known-model selection paths).
+            Sort-DATModelsSelectedFirst
+            # Consume the pending profile list only once it has actually matched grid rows,
+            # so a racing wrong-OEM refresh (which matches nothing) leaves it intact for the
+            # profile's own refresh.
+            if ($fromPending) { $script:PendingProfileModels = $null }
         }
     } catch {
         Write-DATActivityLog "Could not restore model selections: $($_.Exception.Message)" -Level Warn
@@ -8259,6 +9449,9 @@ function Restore-DATModelSelections {
 # Saved selection profiles let the user capture the OEM/OS/Architecture/Platform/PackageType
 # filters plus the selected models under a named profile, then reload them later.
 $script:SuppressProfileSelect = $false
+# Holds a profile's model list between applying the profile and the async model refresh that
+# repopulates the grid. Consumed by Restore-DATModelSelections (see notes there).
+$script:PendingProfileModels = $null
 
 $cmb_Profiles      = $Window.FindName('cmb_Profiles')
 $btn_SaveProfile   = $Window.FindName('btn_SaveProfile')
@@ -8541,10 +9734,16 @@ function Invoke-DATApplyProfile {
         $models = @($Profile.Models | ForEach-Object {
             @{ OEM = $_.OEM; Model = $_.Model; Baseboards = $_.Baseboards; OS = $_.OS; Build = $_.Build }
         })
+        # Also hand the list to the restore in-memory. The on-disk SelectedModels.json can be
+        # overwritten with an empty selection by a background refresh that is still finishing
+        # for a previously-selected OEM (its completion calls Save-DATModelSelections), which
+        # would wipe the seed before this profile's refresh restores it. The in-memory list
+        # survives that race and is only cleared once it actually matches grid rows.
+        $script:PendingProfileModels = $models
         $settingsDir = Join-Path $global:ScriptDirectory 'Settings'
         if (-not (Test-Path $settingsDir)) { New-Item -Path $settingsDir -ItemType Directory -Force | Out-Null }
         $modelsJson = if ($models.Count -eq 0) { '[]' } else { ConvertTo-Json @($models) -Depth 3 -Compress }
-        Set-Content -Path (Join-Path $settingsDir 'SelectedModels.json') -Value $modelsJson -Encoding UTF8 -Force
+        [void](Write-DATJsonFileAtomic -Path (Join-Path $settingsDir 'SelectedModels.json') -Content $modelsJson)
     } finally {
         $script:SuppressModelRefresh = $false
     }
@@ -8559,6 +9758,8 @@ function Reset-DATSelectionsForNewProfile {
     # Clears OEM/OS selections and the model grid so the user starts a fresh, unsaved profile.
     # Architecture/Platform/Package Type are left as-is (sensible carry-over defaults).
     $script:SuppressModelRefresh = $true
+    # Drop any pending profile model list so it cannot re-apply to a fresh, blank selection.
+    $script:PendingProfileModels = $null
     try {
         foreach ($entry in $script:OEMCheckboxes.GetEnumerator()) {
             if ($entry.Value.IsEnabled) { $entry.Value.IsChecked = $false }
@@ -8870,6 +10071,7 @@ $btn_Build.Add_Click({
     Set-DATRegistryValue -Name "Architecture" -Value "$selectedArch" -Type String
 
     $global:SelectedModels = [System.Collections.ArrayList]::new()
+    $downloadsRequired = 0   # count of new/updated packages that will actually download
     foreach ($model in $selectedModels) {
         # Determine the OS label for package naming
         $osForPackage = if ($model.Build -eq 'All') {
@@ -8889,6 +10091,31 @@ $btn_Build.Add_Click({
             ($osArr[0] -split '\s+')[0..1] -join ' '  # "Windows 11"
         }
         
+        # Per-model package-type narrowing: when building 'All' and the deployed-version scan has
+        # run, a model that only needs a BIOS update (driver already current) is scoped to 'BIOS'
+        # only, and vice versa. Leaves 'All' when both need work, when either is unknown, or when
+        # the scan hasn't run -- the build's skip-if-current logic remains the safety net.
+        $mBiosOnly      = $(try { [bool]$model.BIOSOnly } catch { $false })
+        $dvApplicable   = (-not $mBiosOnly) -and -not [string]::IsNullOrEmpty($model.Version)
+        $biosApplicable = (-not [string]::IsNullOrEmpty($model.BIOSVersion)) -and ($model.OEM -ne 'Microsoft')
+        $driverCurrent  = ($model.DriverStatus -eq 'Current')
+        $biosCurrent    = ($model.BIOSStatus -eq 'Current')
+
+        $perModelPkgType = $buildPackageType
+        if ($buildPackageType -eq 'All' -and $script:DeployedVersionsFetched) {
+            if ($dvApplicable -and $driverCurrent -and $biosApplicable -and (-not $biosCurrent)) {
+                $perModelPkgType = 'BIOS'
+            } elseif ($biosApplicable -and $biosCurrent -and $dvApplicable -and (-not $driverCurrent)) {
+                $perModelPkgType = 'Drivers'
+            }
+        }
+
+        # Count downloads required -- packages that are new or updated (skip known-current ones)
+        if (($perModelPkgType -in @('Drivers', 'All')) -and $dvApplicable -and
+            (-not ($script:DeployedVersionsFetched -and $driverCurrent))) { $downloadsRequired++ }
+        if (($perModelPkgType -in @('BIOS', 'All')) -and $biosApplicable -and
+            (-not ($script:DeployedVersionsFetched -and $biosCurrent))) { $downloadsRequired++ }
+
         $modelObj = [PSCustomObject]@{
             OEM              = $model.OEM
             Model            = $model.Model
@@ -8901,6 +10128,7 @@ $btn_Build.Add_Click({
             ForceUpdate      = [bool]$model.ForceUpdate
             BIOSOnly         = $(try { [bool]$model.BIOSOnly } catch { $false })
             DownloadURL      = $(try { $model.DownloadURL } catch { '' })
+            PackageType      = $perModelPkgType
         }
         $global:SelectedModels.Add($modelObj) | Out-Null
     }
@@ -8911,6 +10139,14 @@ $btn_Build.Add_Click({
     Set-DATRegistryValue -Name "TotalJobs" -Value "$($global:SelectedModelCount)" -Type String
     Set-DATRegistryValue -Name "CurrentJob" -Value "1" -Type String
     Set-DATRegistryValue -Name "CompletedJobs" -Value "0" -Type String
+    # Clear the package-success counters from any previous build so the completion summary
+    # cannot inherit stale counts when the current build's models are all skipped (#862-follow-up).
+    Set-DATRegistryValue -Name "CompletedDriverPackages" -Value "0" -Type String
+    Set-DATRegistryValue -Name "CompletedBiosPackages" -Value "0" -Type String
+    Set-DATRegistryValue -Name "FailedPackages" -Value "0" -Type String
+    Set-DATRegistryValue -Name "PackagesCreated" -Value "0" -Type String
+    # Clear the structured failure list so the progress modal cannot mark rows from a prior build.
+    Remove-ItemProperty -Path $global:RegPath -Name 'BuildFailures' -ErrorAction SilentlyContinue
     Set-DATRegistryValue -Name "RunningState"  -Value "Starting" -Type String
     Set-DATRegistryValue -Name "RunningMode"   -Value "Download" -Type String
     Set-DATRegistryValue -Name "PackagePhase"  -Value "" -Type String
@@ -8956,81 +10192,51 @@ $btn_Build.Add_Click({
     $txt_BuildDownloadSpeed.Text = ""
     $txt_BuildProgressLabel.Text = "Download:"
 
-    # Show build progress modal with per-model pipeline stages
-    Show-DATBuildProgressModal -Models $global:SelectedModels -Platform $selectedPlatform -PackageType $buildPackageType
+    # Determine whether this run only refreshes existing packages (no brand-new models added).
+    # Requires the deployed-version scan to have run so statuses are known; otherwise leave the
+    # default title. Statuses are scoped to the package type being built and to models that
+    # actually carry the relevant package.
+    $buildUpdatesOnly = $false
+    if ($script:DeployedVersionsFetched) {
+        $checkDrivers = $buildPackageType -in @('Drivers', 'All')
+        $checkBios    = $buildPackageType -in @('BIOS', 'All')
+        $anyNew = $false; $anyUpdate = $false; $anyUnknown = $false
+        foreach ($m in $selectedModels) {
+            if ($checkDrivers -and -not $m.BIOSOnly -and -not [string]::IsNullOrEmpty($m.Version)) {
+                switch ([string]$m.DriverStatus) {
+                    'NotDeployed'     { $anyNew = $true }
+                    'UpdateAvailable' { $anyUpdate = $true }
+                    'Current'         { }
+                    default           { $anyUnknown = $true }
+                }
+            }
+            if ($checkBios -and -not [string]::IsNullOrEmpty($m.BIOSVersion)) {
+                switch ([string]$m.BIOSStatus) {
+                    'NotDeployed'     { $anyNew = $true }
+                    'UpdateAvailable' { $anyUpdate = $true }
+                    'Current'         { }
+                    default           { $anyUnknown = $true }
+                }
+            }
+        }
+        $buildUpdatesOnly = (-not $anyNew) -and (-not $anyUnknown) -and $anyUpdate
+    }
 
-    # Launch processing in a background job
-    $script:BuildRunspace = [runspacefactory]::CreateRunspace()
-    $script:BuildRunspace.ApartmentState = 'STA'
-    $script:BuildRunspace.Open()
-    $script:BuildPS = [powershell]::Create()
-    $script:BuildPS.Runspace = $script:BuildRunspace
-    [void]$script:BuildPS.AddScript({
-        param($ModulePath, $ScriptDir, $RegPath, $RunningMode, $SelectedModels, $StoragePath, $PackagePath, $IntuneToken, $IntuneRefreshTok, $IntuneAuthClientIdParam, $IntuneTokenExpSec, $DisableToast, $DisableRestart, $SiteServer, $SiteCode, $PackageType, $DPGroups, $DPs, $DistPriority, $EnableBDR, $DebugBuildPath, $CustomBrandingPath, $HPPasswordBinPath, $ToastTimeoutAction, $MaxDeferrals, $BIOSRestartDelayMinutes, $TeamsWebhookUrl, $TeamsNotificationsEnabled, $CustomToastTextsJson, $ConsoleFolderID, $MaintenanceWindowsJson, $AlarmMode, $CreateIntuneWinOnly)
-        try {
-        Import-Module $ModulePath -Force
-        $procParams = @{
-            ScriptDirectory = $ScriptDir
-            RegPath         = $RegPath
-            RunningMode     = $RunningMode
-            SelectedModels  = $SelectedModels
-            StoragePath     = $StoragePath
-            PackagePath     = $PackagePath
-            IntuneAuthToken = $IntuneToken
-        }
-        if (-not [string]::IsNullOrEmpty($IntuneRefreshTok)) { $procParams['IntuneRefreshToken'] = $IntuneRefreshTok }
-        if (-not [string]::IsNullOrEmpty($IntuneAuthClientIdParam)) { $procParams['IntuneAuthClientId'] = $IntuneAuthClientIdParam }
-        if ($IntuneTokenExpSec -gt 0) { $procParams['IntuneTokenExpiresInSec'] = $IntuneTokenExpSec }
-        if ($DisableToast) { $procParams['DisableToast'] = $true }
-        if ($DisableRestart) { $procParams['DisableRestart'] = $true }
-        if ($AlarmMode) { $procParams['AlarmMode'] = $true }
-        if ($CreateIntuneWinOnly) { $procParams['CreateIntuneWinOnly'] = $true }
-        if ($ToastTimeoutAction -ne 'RemindMeLater') { $procParams['ToastTimeoutAction'] = $ToastTimeoutAction }
-        if ($MaxDeferrals -gt 0) { $procParams['MaxDeferrals'] = $MaxDeferrals }
-        if ($BIOSRestartDelayMinutes -gt 0 -and $BIOSRestartDelayMinutes -ne 10) { $procParams['RestartDelaySeconds'] = $BIOSRestartDelayMinutes * 60 }
-        if (-not [string]::IsNullOrEmpty($DebugBuildPath)) { $procParams['DebugBuildPath'] = $DebugBuildPath }
-        if (-not [string]::IsNullOrEmpty($CustomBrandingPath)) { $procParams['CustomBrandingPath'] = $CustomBrandingPath }
-        if (-not [string]::IsNullOrEmpty($HPPasswordBinPath)) { $procParams['HPPasswordBinPath'] = $HPPasswordBinPath }
-        if (-not [string]::IsNullOrEmpty($CustomToastTextsJson)) { $procParams['CustomToastTextsJson'] = $CustomToastTextsJson }
-        if (-not [string]::IsNullOrEmpty($MaintenanceWindowsJson)) { $procParams['MaintenanceWindowsJson'] = $MaintenanceWindowsJson }
-        if (-not [string]::IsNullOrEmpty($SiteServer)) { $procParams['SiteServer'] = $SiteServer }
-        if (-not [string]::IsNullOrEmpty($SiteCode)) { $procParams['SiteCode'] = $SiteCode }
-        if (-not [string]::IsNullOrEmpty($PackageType)) { $procParams['PackageType'] = $PackageType }
-        if ($DPGroups -and $DPGroups.Count -gt 0) { $procParams['DistributionPointGroups'] = $DPGroups }
-        if ($DPs -and $DPs.Count -gt 0) { $procParams['DistributionPoints'] = $DPs }
-        if (-not [string]::IsNullOrEmpty($DistPriority)) { $procParams['DistributionPriority'] = $DistPriority }
-        if ($EnableBDR) { $procParams['EnableBinaryDeltaReplication'] = $true }
-        if ($null -ne $ConsoleFolderID -and $ConsoleFolderID -ge 0) { $procParams['ConsoleFolderID'] = $ConsoleFolderID }
-        if ($TeamsNotificationsEnabled -and -not [string]::IsNullOrEmpty($TeamsWebhookUrl)) {
-            $procParams['TeamsNotificationsEnabled'] = $true
-            $procParams['TeamsWebhookUrl'] = $TeamsWebhookUrl
-        }
-        Start-DATModelProcessing @procParams
-        } catch [System.Management.Automation.PipelineStoppedException] {
-            # Abort signal received -- set registry state and exit cleanly
-            try { Set-ItemProperty -Path $RegPath -Name 'RunningState' -Value 'Aborted' -Force -ErrorAction SilentlyContinue } catch {}
-        }
-    })
+    # Show build progress modal with per-model pipeline stages
+    Show-DATBuildProgressModal -Models $global:SelectedModels -Platform $selectedPlatform -PackageType $buildPackageType -UpdatesOnly $buildUpdatesOnly -ModelsSelected $global:SelectedModelCount -DownloadsRequired $downloadsRequired -TempPath $pfTempDir
+
     $modulePath = Join-Path $PSScriptRoot "..\Modules\DriverAutomationToolCore\DriverAutomationToolCore.psd1"
+    $resolvedModulePath = (Resolve-Path $modulePath).Path
 
     # Read user-configured storage paths from registry (already validated above)
     $tempStoragePath = if ($regConfig -and -not [string]::IsNullOrEmpty($regConfig.TempStoragePath)) { $regConfig.TempStoragePath } else { Join-Path $global:ScriptDirectory 'Temp' }
 
-    # Pass Intune auth token, refresh token, and real expiry for Intune mode
-    $intuneToken = $null
-    $intuneRefreshToken = $null
-    $intuneAuthClientId = $null
-    $intuneTokenExpSec = 0
+    # Capture the complete Intune auth context before opening the background runspace.
+    $intuneAuthContext = $null
     if ($selectedPlatform -eq 'Intune') {
         $authStatus = Get-DATIntuneAuthStatus
         if ($authStatus.IsAuthenticated) {
-            $coreModule = Get-Module -Name DriverAutomationToolCore
-            if ($coreModule) {
-                $intuneToken = & $coreModule { $script:IntuneAuthToken }
-                $intuneRefreshToken = & $coreModule { $script:IntuneRefreshToken }
-                $intuneAuthClientId = & $coreModule { $script:IntuneAuthClientId }
-                $intuneTokenExpSec = [math]::Max(0, [int]($authStatus.MinutesRemaining * 60))
-            }
+            $intuneAuthContext = Get-DATIntuneAuthContext
         } else {
             Write-DATActivityLog "Intune platform selected but not authenticated. Build aborted." -Level Warn
             $txt_Status.Text = "Please authenticate to Intune before building packages."
@@ -9047,6 +10253,55 @@ $btn_Build.Add_Click({
             return
         }
     }
+
+    # Launch processing in a background job
+    $script:BuildRunspace = [runspacefactory]::CreateRunspace()
+    $script:BuildRunspace.ApartmentState = 'STA'
+    $script:BuildRunspace.Open()
+    $script:BuildPS = [powershell]::Create()
+    $script:BuildPS.Runspace = $script:BuildRunspace
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:BuildPS -IntuneAuthContext $intuneAuthContext -ModulePath $resolvedModulePath
+    [void]$script:BuildPS.AddScript({
+        param($ScriptDir, $RegPath, $RunningMode, $SelectedModels, $StoragePath, $PackagePath, $DisableToast, $DisableRestart, $SiteServer, $SiteCode, $PackageType, $DPGroups, $DPs, $DistPriority, $EnableBDR, $DebugBuildPath, $CustomBrandingPath, $HPPasswordBinPath, $ToastTimeoutAction, $MaxDeferrals, $BIOSRestartDelayMinutes, $TeamsWebhookUrl, $TeamsNotificationsEnabled, $CustomToastTextsJson, $ConsoleFolderID, $MaintenanceWindowsJson, $AlarmMode, $CreateIntuneWinOnly)
+        try {
+            $procParams = @{
+                ScriptDirectory = $ScriptDir
+                RegPath         = $RegPath
+                RunningMode     = $RunningMode
+                SelectedModels  = $SelectedModels
+                StoragePath     = $StoragePath
+                PackagePath     = $PackagePath
+            }
+            if ($DisableToast) { $procParams['DisableToast'] = $true }
+            if ($DisableRestart) { $procParams['DisableRestart'] = $true }
+            if ($AlarmMode) { $procParams['AlarmMode'] = $true }
+            if ($CreateIntuneWinOnly) { $procParams['CreateIntuneWinOnly'] = $true }
+            if ($ToastTimeoutAction -ne 'RemindMeLater') { $procParams['ToastTimeoutAction'] = $ToastTimeoutAction }
+            if ($MaxDeferrals -gt 0) { $procParams['MaxDeferrals'] = $MaxDeferrals }
+            if ($BIOSRestartDelayMinutes -gt 0 -and $BIOSRestartDelayMinutes -ne 10) { $procParams['RestartDelaySeconds'] = $BIOSRestartDelayMinutes * 60 }
+            if (-not [string]::IsNullOrEmpty($DebugBuildPath)) { $procParams['DebugBuildPath'] = $DebugBuildPath }
+            if (-not [string]::IsNullOrEmpty($CustomBrandingPath)) { $procParams['CustomBrandingPath'] = $CustomBrandingPath }
+            if (-not [string]::IsNullOrEmpty($HPPasswordBinPath)) { $procParams['HPPasswordBinPath'] = $HPPasswordBinPath }
+            if (-not [string]::IsNullOrEmpty($CustomToastTextsJson)) { $procParams['CustomToastTextsJson'] = $CustomToastTextsJson }
+            if (-not [string]::IsNullOrEmpty($MaintenanceWindowsJson)) { $procParams['MaintenanceWindowsJson'] = $MaintenanceWindowsJson }
+            if (-not [string]::IsNullOrEmpty($SiteServer)) { $procParams['SiteServer'] = $SiteServer }
+            if (-not [string]::IsNullOrEmpty($SiteCode)) { $procParams['SiteCode'] = $SiteCode }
+            if (-not [string]::IsNullOrEmpty($PackageType)) { $procParams['PackageType'] = $PackageType }
+            if ($DPGroups -and $DPGroups.Count -gt 0) { $procParams['DistributionPointGroups'] = $DPGroups }
+            if ($DPs -and $DPs.Count -gt 0) { $procParams['DistributionPoints'] = $DPs }
+            if (-not [string]::IsNullOrEmpty($DistPriority)) { $procParams['DistributionPriority'] = $DistPriority }
+            if ($EnableBDR) { $procParams['EnableBinaryDeltaReplication'] = $true }
+            if ($null -ne $ConsoleFolderID -and $ConsoleFolderID -ge 0) { $procParams['ConsoleFolderID'] = $ConsoleFolderID }
+            if ($TeamsNotificationsEnabled -and -not [string]::IsNullOrEmpty($TeamsWebhookUrl)) {
+                $procParams['TeamsNotificationsEnabled'] = $true
+                $procParams['TeamsWebhookUrl'] = $TeamsWebhookUrl
+            }
+            Start-DATModelProcessing @procParams
+        } catch [System.Management.Automation.PipelineStoppedException] {
+            # Abort signal received -- set registry state and exit cleanly
+            try { Set-ItemProperty -Path $RegPath -Name 'RunningState' -Value 'Aborted' -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    })
 
     # Read the Disable Toast checkbox state (Intune only)
     $disableToast = ($selectedPlatform -eq 'Intune') -and ($chk_DisableToastPrompt.IsChecked -eq $true)
@@ -9075,17 +10330,12 @@ $btn_Build.Add_Click({
     $cmDPs = if ($regConfig -and -not [string]::IsNullOrEmpty($regConfig.SelectedDPs)) { @($regConfig.SelectedDPs -split '\|') } else { @() }
     $cmDistPriority = if ($null -ne $cmb_DistPriority -and $null -ne $cmb_DistPriority.SelectedItem) { $cmb_DistPriority.SelectedItem.Content } else { 'Normal' }
 
-    [void]$script:BuildPS.AddArgument((Resolve-Path $modulePath).Path)
     [void]$script:BuildPS.AddArgument($global:ScriptDirectory)
     [void]$script:BuildPS.AddArgument($global:RegPath)
     [void]$script:BuildPS.AddArgument($selectedPlatform)
     [void]$script:BuildPS.AddArgument($global:SelectedModels.ToArray())
     [void]$script:BuildPS.AddArgument($tempStoragePath)
     [void]$script:BuildPS.AddArgument($packageStoragePath)
-    [void]$script:BuildPS.AddArgument($intuneToken)
-    [void]$script:BuildPS.AddArgument($intuneRefreshToken)
-    [void]$script:BuildPS.AddArgument($intuneAuthClientId)
-    [void]$script:BuildPS.AddArgument($intuneTokenExpSec)
     [void]$script:BuildPS.AddArgument($disableToast)
     $disableRestart = ($selectedPlatform -eq 'Intune') -and ($chk_DisableBIOSRestart.IsChecked -eq $true)
     [void]$script:BuildPS.AddArgument($disableRestart)
@@ -9209,6 +10459,12 @@ $btn_Build.Add_Click({
 
         # Update build progress modal from registry
         Update-DATBuildModalFromRegistry
+
+        # Refresh the temp free-space tile so it drops live as downloads consume space
+        Update-DATBuildModalFreeSpace
+
+        # Refresh the live stat tiles (downloads remaining, packages created, failed, throughput)
+        Update-DATBuildModalStats
 
         # Check if a Lenovo flash utility was auto-killed during extraction
         try {
@@ -9371,6 +10627,12 @@ $btn_Build.Add_Click({
                          ($runningState -eq 'CompletedWithErrors') -or
                          ($fCompJobs -lt $fTotalJobs)
             $isNoMatch = ($runningState -eq 'CompletedNoMatch')
+            # "Create .intunewin only" mode -- packages are built but intentionally not uploaded.
+            $createWinOnlyActive = $false
+            try {
+                $completedPlatform = if ($null -ne $cmb_Platform.SelectedItem) { [string]$cmb_Platform.SelectedItem.Content } else { '' }
+                $createWinOnlyActive = ($completedPlatform -eq 'Intune') -and ($null -ne $chk_CreateIntuneWinOnly) -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
+            } catch { $createWinOnlyActive = $false }
             if ($isNoMatch) {
                 # BIOS-only build with no catalog matches -- show warning amber state
                 $theme = Get-DATTheme -ThemeName $script:CurrentTheme
@@ -9396,25 +10658,28 @@ $btn_Build.Add_Click({
                         (Get-DATTheme -ThemeName $script:CurrentTheme)['StatusError']))
                 $txt_Status.Tag = 'StatusError'
             } else {
+                $successKey = if ($createWinOnlyActive) { 'StatusWarning' } else { 'ButtonSuccess' }
                 $pill_BuildStatus.Background = [System.Windows.Media.SolidColorBrush]::new(
                     [System.Windows.Media.ColorConverter]::ConvertFromString(
-                        (Get-DATTheme -ThemeName $script:CurrentTheme)['ButtonSuccess']))
-                $txt_BuildStatusIcon.Text = [string][char]0xE73E
+                        (Get-DATTheme -ThemeName $script:CurrentTheme)[$successKey]))
+                $txt_BuildStatusIcon.Text = if ($createWinOnlyActive) { [string][char]0xE896 } else { [string][char]0xE73E }
                 $txt_BuildStatusIcon.Foreground = [System.Windows.Media.Brushes]::White
-                $txt_BuildStatusText.Text = "Succeeded"
+                $txt_BuildStatusText.Text = if ($createWinOnlyActive) { "Built (not uploaded)" } else { "Succeeded" }
                 $txt_BuildStatusText.Foreground = [System.Windows.Media.Brushes]::White
+                $statusFgKey = if ($createWinOnlyActive) { 'StatusWarning' } else { 'StatusSuccess' }
                 $txt_Status.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                     [System.Windows.Media.ColorConverter]::ConvertFromString(
-                        (Get-DATTheme -ThemeName $script:CurrentTheme)['StatusSuccess']))
-                $txt_Status.Tag = 'StatusSuccess'
+                        (Get-DATTheme -ThemeName $script:CurrentTheme)[$statusFgKey]))
+                $txt_Status.Tag = $statusFgKey
             }
 
             $panel_BuildProgress.Visibility = 'Collapsed'
             $progress_Job.Visibility = 'Collapsed'
             $btn_Build.IsEnabled = $true
             $btn_Abort.IsEnabled = $false
-            $txt_Status.Text = "$finalMessage ($totalElapsed)"
-            Write-DATActivityLog "$finalMessage (elapsed: $totalElapsed)" -Level $(if ($hadErrors) { 'Error' } elseif ($isNoMatch) { 'Warn' } else { 'Success' })
+            $statusSuffix = if ($createWinOnlyActive -and -not $hadErrors -and -not $isNoMatch) { ' -- .intunewin built locally, upload to Intune skipped' } else { '' }
+            $txt_Status.Text = "$finalMessage ($totalElapsed)$statusSuffix"
+            Write-DATActivityLog "$finalMessage (elapsed: $totalElapsed)$statusSuffix" -Level $(if ($hadErrors) { 'Error' } elseif ($isNoMatch -or ($createWinOnlyActive -and $statusSuffix)) { 'Warn' } else { 'Success' })
 
             # Close build progress modal -- mark remaining as success if build succeeded (skip no-match)
             Close-DATBuildProgressModal -MarkAllSuccess:$(-not $hadErrors -and -not $isNoMatch)
@@ -9428,7 +10693,8 @@ $btn_Build.Add_Click({
                 $sumPkgType = if ($sumReg.PackageType) { [string]$sumReg.PackageType } else { 'Drivers' }
                 Show-DATBuildSummaryDialog -TotalModels $fTotalJobs `
                     -DriverSuccess $sumDriverPkgs -BiosSuccess $sumBiosPkgs `
-                    -PackageType $sumPkgType -Elapsed $totalElapsed -HadErrors $hadErrors
+                    -PackageType $sumPkgType -Elapsed $totalElapsed -HadErrors $hadErrors `
+                    -UploadSkipped ($createWinOnlyActive -and -not $hadErrors -and -not $isNoMatch)
             } catch {
                 Write-DATLogEntry -Value "[UI] Build summary dialog error: $($_.Exception.Message)" -Severity 2
             }
@@ -9461,15 +10727,40 @@ $btn_Build.Add_Click({
                     }
                     $platform = if ($null -ne $cmb_Platform.SelectedItem) { $cmb_Platform.SelectedItem.Content } else { '' }
                     $isIntune  = $platform -match 'Intune'
-                    $isCM      = $platform -match 'ConfigMgr|SCCM|MECM'
-                    $selectedOS   = if ($null -ne $cmb_OperatingSystem.SelectedItem) { $cmb_OperatingSystem.SelectedItem.Content } else { 'Windows 11' }
-                    $selectedArch = if ($null -ne $cmb_Architecture.SelectedItem)     { $cmb_Architecture.SelectedItem.Content }     else { 'x64' }
+                    # The platform combo value is the literal "Configuration Manager" (see MainWindow.xaml),
+                    # so the previous 'ConfigMgr|SCCM|MECM' pattern never matched and ConfigMgr retention
+                    # silently never ran -- only Intune was cleaned up. Match the actual value plus the
+                    # common aliases so post-build cleanup works for ConfigMgr too.
+                    $isCM      = $platform -match 'Configuration Manager|ConfigMgr|SCCM|MECM'
+                    $selectedArch = if ($null -ne $cmb_Architecture.SelectedItem) { $cmb_Architecture.SelectedItem.Content } else { 'x64' }
+                    $selectedOSes = Get-DATSelectedOSes
+                    $selectedOS   = if ($selectedOSes.Count -gt 0) { ($selectedOSes[0] -split '\s+')[0..1] -join ' ' } else { 'Windows 11' }
+
+                    # Retention targets the package TYPE(s) that were just built. The grid models
+                    # carry no per-model package type, so derive it from the build's Package Type:
+                    # 'All' cleans both driver and BIOS packages; Pilot variants map to their base
+                    # type. (Previously this read the never-assigned $script:SelectedModels and a
+                    # missing per-model .PackageType, so retention silently never ran and superseded
+                    # packages were never removed.)
+                    $rawPkgType  = if ($null -ne $cmb_PackageType.SelectedItem) { [string]$cmb_PackageType.SelectedItem.Content } else { 'Drivers' }
+                    $basePkgType = ($rawPkgType -replace '\s*Pilot$', '').Trim()
+                    $retPkgTypes = switch ($basePkgType) {
+                        'All'  { @('Drivers', 'BIOS') }
+                        'BIOS' { @('BIOS') }
+                        default { @('Drivers') }
+                    }
+
                     $modelKeys = @()
-                    if ($null -ne $script:SelectedModels) {
-                        $modelKeys = @($script:SelectedModels | ForEach-Object {
-                            $keyArch = if (-not [string]::IsNullOrEmpty($_.Architecture)) { $_.Architecture } else { $selectedArch }
-                            "$($_.OEM)|$($_.Model)|$selectedOS|$keyArch|$($_.PackageType)"
-                        })
+                    if ($null -ne $global:SelectedModels) {
+                        foreach ($m in $global:SelectedModels) {
+                            $keyArch = if (-not [string]::IsNullOrEmpty($m.Architecture)) { $m.Architecture } else { $selectedArch }
+                            $keyOS   = if (-not [string]::IsNullOrEmpty($m.OS)) { $m.OS } else { $selectedOS }
+                            foreach ($pt in $retPkgTypes) {
+                                # BIOS-only models have no driver package to supersede
+                                if ($pt -eq 'Drivers' -and ($(try { [bool]$m.BIOSOnly } catch { $false }))) { continue }
+                                $modelKeys += "$($m.OEM)|$($m.Model)|$keyOS|$keyArch|$pt"
+                            }
+                        }
                     }
                     if ($modelKeys.Count -gt 0) {
                         $retentionParams = @{
@@ -9477,14 +10768,22 @@ $btn_Build.Add_Click({
                             RetainCount = $retainCount
                         }
                         if ($isCM) {
-                            $cmSiteServer = if ($null -ne $txt_SiteServer) { $txt_SiteServer.Text } else { '' }
-                            $cmSiteCode   = if ($null -ne $txt_SiteCode)   { $txt_SiteCode.Text }   else { '' }
+                            # Use the resolved site connection globals -- NOT $txt_SiteCode, which is a
+                            # status-display textbox holding strings like "Connected - Site Code: P01".
+                            # Passing that as the site code produced an invalid WMI namespace
+                            # (root\SMS\Site_Connected - Site Code: P01), so the retention query threw
+                            # and silently cleaned up nothing. Every other CM call uses these globals.
+                            $cmSiteServer = if (-not [string]::IsNullOrEmpty($global:SiteServer)) { $global:SiteServer } else { '' }
+                            $cmSiteCode   = if (-not [string]::IsNullOrEmpty($global:SiteCode))   { $global:SiteCode }   else { '' }
                             if ($cmSiteServer -and $cmSiteCode) {
                                 $retentionParams['SiteServer'] = $cmSiteServer
                                 $retentionParams['SiteCode']   = $cmSiteCode
                             }
                         }
                         if ($isIntune) { $retentionParams['Intune'] = $true }
+                        if ($null -ne $chk_DeleteSourceFolder -and $chk_DeleteSourceFolder.IsChecked) {
+                            $retentionParams['DeleteSourceFolder'] = $true
+                        }
                         Show-DATPackageRetentionModal @retentionParams
                     }
                 } catch {
@@ -9577,6 +10876,8 @@ $btn_Abort.Add_Click({
         $progress_Job.Visibility = 'Collapsed'
         $btn_Build.IsEnabled = $true
         $btn_Abort.IsEnabled = $false
+        # The modal (with its own Abort) is closing -- bring the main-UI Abort button back
+        $btn_Abort.Visibility = 'Visible'
 
         # Show aborted status with elapsed time
         $totalElapsed = if ($script:BuildStartTime) {
@@ -10264,6 +11565,8 @@ function Invoke-DATConfigMgrKnownModelLookup {
 
             Update-DATConfigMgrKnownModelSelection
             Update-DATSelectKnownModelsVisibility
+            # Compare catalog versions against what is deployed and flag available updates.
+            Invoke-DATDeployedVersionScan
 
             $script:ConfigMgrModelLookupPS.Dispose()
             $script:ConfigMgrModelLookupPS = $null
@@ -10610,8 +11913,9 @@ function Invoke-DATIntuneKnownModelLookup {
     Write-DATActivityLog "Starting Intune known model lookup via Graph API" -Level Info
 
     # Capture auth state before launching background runspace
-    $intuneAuthToken = (Get-DATIntuneAuthStatus).Token
-    $graphBaseUrl = "https://graph.microsoft.com/beta"
+    $intuneAuthStatus = Get-DATIntuneAuthStatus
+    $intuneAuthToken = $intuneAuthStatus.Token
+    $graphBaseUrl = $intuneAuthStatus.GraphBaseUrl
 
     # Shared state for background progress reporting
     $script:IntuneModelLookupState = [hashtable]::Synchronized(@{
@@ -10685,6 +11989,8 @@ function Invoke-DATIntuneKnownModelLookup {
             # Auto-select matching models in the grid if populated
             Update-DATKnownModelSelection
             Update-DATSelectKnownModelsVisibility
+            # Compare catalog versions against what is deployed and flag available updates.
+            Invoke-DATDeployedVersionScan
 
             $script:IntuneModelLookupPS.Dispose()
             $script:IntuneModelLookupPS = $null
@@ -11058,6 +12364,18 @@ if ($null -ne $chk_XmlLogicCreatePackage) {
             $txt_XmlLogicCreatePackageState.Foreground = $Window.FindResource('InputPlaceholder')
         }
     })
+
+    # Restore persisted "Create & distribute as package" toggle at launch (#858)
+    $savedXmlLogicCreate = (Get-ItemProperty -Path $global:RegPath -Name 'XmlLogicCreatePackage' -ErrorAction SilentlyContinue).XmlLogicCreatePackage
+    if ($savedXmlLogicCreate -eq 1) {
+        # Setting IsChecked fires Add_Checked, which updates the state label.
+        $chk_XmlLogicCreatePackage.IsChecked = $true
+    }
+    elseif ($null -ne $txt_XmlLogicCreatePackageState) {
+        # Value absent or 0 -- ensure the "off" label is shown.
+        $txt_XmlLogicCreatePackageState.Text = 'Write XML file only'
+        $txt_XmlLogicCreatePackageState.Foreground = $Window.FindResource('InputPlaceholder')
+    }
 }
 
 if ($null -ne $btn_GenerateXmlLogicPackage) {
@@ -11192,18 +12510,10 @@ $chk_DeleteSourceFolder.Add_Unchecked({
 # --- Custom Console Folder toggle and browse ---
 $chk_CustomConsoleFolder.Add_Checked({
     Set-DATRegistryValue -Name 'CustomConsoleFolderEnabled' -Value 1 -Type DWord
-    if ($null -ne $txt_CustomConsoleFolderState) {
-        $txt_CustomConsoleFolderState.Text = 'Custom Folder'
-        $txt_CustomConsoleFolderState.Foreground = $Window.FindResource('AccentColor')
-    }
     if ($null -ne $panel_ConsoleFolderPicker) { $panel_ConsoleFolderPicker.Visibility = 'Visible' }
 })
 $chk_CustomConsoleFolder.Add_Unchecked({
     Set-DATRegistryValue -Name 'CustomConsoleFolderEnabled' -Value 0 -Type DWord
-    if ($null -ne $txt_CustomConsoleFolderState) {
-        $txt_CustomConsoleFolderState.Text = 'Use Default'
-        $txt_CustomConsoleFolderState.Foreground = $Window.FindResource('InputPlaceholder')
-    }
     if ($null -ne $panel_ConsoleFolderPicker) { $panel_ConsoleFolderPicker.Visibility = 'Collapsed' }
 })
 
@@ -13652,6 +14962,7 @@ $btn_ScheduleSave.Add_Click({
         return
     }
     $schedPlatform = if ($null -ne $cmb_Platform.SelectedItem) { $cmb_Platform.SelectedItem.Content } else { 'Download Only' }
+    $schedTenantEnvironment = Get-DATSelectedIntuneTenantEnvironment
 
     # Intune scheduled builds require App Registration credentials for unattended auth
     if ($schedPlatform -eq 'Intune') {
@@ -13715,6 +15026,7 @@ $btn_ScheduleSave.Add_Click({
 
     # Intune credentials for unattended auth
     $schedIntune = @{
+        TenantEnvironment = if ($schedPlatform -eq 'Intune') { $schedTenantEnvironment } else { 'Commercial' }
         TenantId  = if ($schedPlatform -eq 'Intune') { $schedTenantId } else { '' }
         AppId     = if ($schedPlatform -eq 'Intune') { $schedAppId } else { '' }
         AppSecret = if ($schedPlatform -eq 'Intune') { $schedSecret } else { '' }
@@ -13724,6 +15036,15 @@ $btn_ScheduleSave.Add_Click({
     $schedMWEnabled = ($schedPlatform -eq 'Intune') -and ($chk_MaintenanceWindowEnabled.IsChecked -eq $true)
     $schedMWMode = if ($cmb_MaintenanceWindowMode.SelectedItem) { [string]$cmb_MaintenanceWindowMode.SelectedItem.Content } else { 'Daily' }
     $schedMWindows = if ($schedMWEnabled) { @(Get-DATMaintenanceWindowSchedule) } else { @() }
+
+    # Package retention settings -- carry the live UI toggles into the headless config so
+    # scheduled runs perform the same post-build cleanup the operator configured (#849).
+    $schedRetentionEnabled = ($null -ne $chk_PackageRetentionEnabled) -and ($chk_PackageRetentionEnabled.IsChecked -eq $true)
+    $schedRetentionCount = 0
+    if ($null -ne $cmb_RetentionCount -and $cmb_RetentionCount.SelectedItem) {
+        $schedRetentionCount = [int]$cmb_RetentionCount.SelectedItem.Content
+    }
+    $schedDeleteSourceFolder = ($null -ne $chk_DeleteSourceFolder) -and ($chk_DeleteSourceFolder.IsChecked -eq $true)
 
     try {
         Export-DATBuildConfig -ConfigPath $configPath -Platform $schedPlatform -OS $schedOS -Architecture $schedArch `
@@ -13735,7 +15056,9 @@ $btn_ScheduleSave.Add_Click({
             -Intune $schedIntune `
             -MaintenanceWindowEnabled $schedMWEnabled -MaintenanceWindowMode $schedMWMode -MaintenanceWindows $schedMWindows `
             -CleanTempOnExit $schedCleanTemp `
-            -CreateIntuneWinOnly $schedCreateWinOnly
+            -CreateIntuneWinOnly $schedCreateWinOnly `
+            -PackageRetentionEnabled $schedRetentionEnabled -PackageRetentionCount $schedRetentionCount `
+            -DeleteSourceFolderOnRemoval $schedDeleteSourceFolder
     } catch {
         Show-DATInfoDialog -Title 'Schedule Error' `
             -Message "Failed to export build config:`n`n$($_.Exception.Message)" `
@@ -14057,6 +15380,12 @@ $cmb_WimEngine.Add_SelectionChanged({
             default                   { 'dism' }
         }
         Set-DATRegistryValue -Name 'WimEngine' -Value $val -Type String
+        # 7-Zip does not support WIM compression -- hide the compression level options
+        $panel_WimCompression.Visibility = if ($val -eq '7zip') {
+            [System.Windows.Visibility]::Collapsed
+        } else {
+            [System.Windows.Visibility]::Visible
+        }
         # Update compression description to match selected engine
         $txt_CompressionDescription.Text = switch ($val) {
             '7zip'  { 'Controls compression when creating WIM packages. Fast (-mx=1) is recommended for most scenarios. Maximum (-mx=9) produces smaller files but is significantly slower.' }
@@ -14069,6 +15398,7 @@ $cmb_WimEngine.Add_SelectionChanged({
 # WIM Compression Level
 $txt_CompressionDescription = $Window.FindName('txt_CompressionDescription')
 $cmb_DismCompression = $Window.FindName('cmb_DismCompression')
+$panel_WimCompression = $Window.FindName('panel_WimCompression')
 $cmb_DismCompression.Add_SelectionChanged({
     $selected = $cmb_DismCompression.SelectedItem
     if ($selected) {
@@ -14110,6 +15440,8 @@ $txt_CurlStatus = $Window.FindName('txt_CurlStatus')
 $link_CurlDownload = $Window.FindName('link_CurlDownload')
 $cmb_CurlRunMode = $Window.FindName('cmb_CurlRunMode')
 $cmb_CurlSource = $Window.FindName('cmb_CurlSource')
+$cmb_DownloadEngine = $Window.FindName('cmb_DownloadEngine')
+$panel_CurlSettings = $Window.FindName('panel_CurlSettings')
 $panel_CurlThirdParty = $Window.FindName('panel_CurlThirdParty')
 $txt_CurlSHA256Pin = $Window.FindName('txt_CurlSHA256Pin')
 $btn_CurlComputeHash = $Window.FindName('btn_CurlComputeHash')
@@ -14448,6 +15780,19 @@ $cmb_CurlSource.Add_SelectionChanged({
     }
 })
 
+# Download engine persistence (#876) -- allow skipping curl entirely and using .NET HttpClient.
+# When CURL is selected the curl-specific settings are shown; otherwise they are hidden.
+if ($null -ne $cmb_DownloadEngine) {
+    $cmb_DownloadEngine.Add_SelectionChanged({
+        if ($null -ne $cmb_DownloadEngine.SelectedItem) {
+            Set-DATRegistryValue -Name 'DownloadEngine' -Value $cmb_DownloadEngine.SelectedItem.Content -Type String
+            if ($null -ne $panel_CurlSettings) {
+                $panel_CurlSettings.Visibility = if ($cmb_DownloadEngine.SelectedItem.Content -eq '.NET HttpClient') { 'Collapsed' } else { 'Visible' }
+            }
+        }
+    })
+}
+
 # CURL trusted SHA-256 pin persistence (#809) -- normalise (strip spaces/colons) and store
 if ($null -ne $txt_CurlSHA256Pin) {
     $txt_CurlSHA256Pin.Add_LostFocus({
@@ -14667,13 +16012,6 @@ $btn_CustomBuild.Add_Click({
     $osLabel = if ($null -ne $cmb_CustomOS.SelectedItem) { $cmb_CustomOS.SelectedItem.Content } else { 'Windows 11 - 24H2' }
     $detectedArch = if ([System.Environment]::Is64BitOperatingSystem) { 'x64' } else { 'x86' }
 
-    # Gather Intune token for Intune platform
-    $intuneToken = $null
-    if ($platform -eq 'Intune') {
-        $coreModule = Get-Module -Name DriverAutomationToolCore
-        if ($coreModule) { $intuneToken = & $coreModule { $script:IntuneAuthToken } }
-    }
-
     # Gather ConfigMgr settings
     $siteServer = if ($regConfig) { $regConfig.SiteServer } else { $null }
     $siteCode = $global:SiteCode
@@ -14709,12 +16047,12 @@ $btn_CustomBuild.Add_Click({
     $script:CustomBuildRunspace.Open()
     $script:CustomBuildPS = [powershell]::Create()
     $script:CustomBuildPS.Runspace = $script:CustomBuildRunspace
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:CustomBuildPS -CaptureIntuneAuthContext:($platform -eq 'Intune') -ModulePath (Resolve-Path $modulePath).Path
     [void]$script:CustomBuildPS.AddScript({
-        param($ModulePath, $Make, $Model, $BaseBoard, $Platform, $TempStorage, $PackageStorage, $RegPath,
-              $OSLabel, $Architecture, $Version, $ScriptDir, $IntuneToken, $SiteServer, $SiteCode, $DisableToast, $TotalSteps,
+        param($Make, $Model, $BaseBoard, $Platform, $TempStorage, $PackageStorage, $RegPath,
+              $OSLabel, $Architecture, $Version, $ScriptDir, $SiteServer, $SiteCode, $DisableToast, $TotalSteps,
               $Method, $DriverFolderPath, $DPGroups, $DPs, $DistPriority, $DebugBuildPath, $CustomBrandingPath, $AlarmMode, $CreateIntuneWinOnly)
 
-        Import-Module $ModulePath -Force
         $global:ScriptDirectory = $ScriptDir
         $global:RegPath = $RegPath
 
@@ -15197,7 +16535,6 @@ $btn_CustomBuild.Add_Click({
                     Architecture       = $Architecture
                     WimFilePath        = $WimFile
                     PackageDestination = $PackageStorage
-                    IntuneAuthToken    = $IntuneToken
                     DisableToast       = $DisableToast
                 }
                 if (-not [string]::IsNullOrEmpty($DebugBuildPath)) { $intuneCreateParams['DebugBuildPath'] = $DebugBuildPath }
@@ -15288,7 +16625,6 @@ $btn_CustomBuild.Add_Click({
     })
 
     $customVersion = Get-Date -Format "ddMMyyyy"
-    [void]$script:CustomBuildPS.AddArgument((Resolve-Path $modulePath).Path)
     [void]$script:CustomBuildPS.AddArgument($make)
     [void]$script:CustomBuildPS.AddArgument($model)
     [void]$script:CustomBuildPS.AddArgument($baseBoard)
@@ -15300,7 +16636,6 @@ $btn_CustomBuild.Add_Click({
     [void]$script:CustomBuildPS.AddArgument($detectedArch)
     [void]$script:CustomBuildPS.AddArgument($customVersion)
     [void]$script:CustomBuildPS.AddArgument($global:ScriptDirectory)
-    [void]$script:CustomBuildPS.AddArgument($intuneToken)
     [void]$script:CustomBuildPS.AddArgument($siteServer)
     [void]$script:CustomBuildPS.AddArgument($siteCode)
     [void]$script:CustomBuildPS.AddArgument($disableToast)
@@ -15989,20 +17324,159 @@ $chk_DeployAllDevices.Add_Unchecked({
     Write-DATActivityLog "Package Deployment: Deploy to All Devices disabled" -Level Info
 })
 
+# Custom deployment target (Entra security group)
+$txt_DeployGroupSearch          = $Window.FindName('txt_DeployGroupSearch')
+$btn_SearchDeployGroup          = $Window.FindName('btn_SearchDeployGroup')
+$txt_DeployGroupStatus          = $Window.FindName('txt_DeployGroupStatus')
+$cmb_DeployGroupResults         = $Window.FindName('cmb_DeployGroupResults')
+$panel_DeployGroupSelected      = $Window.FindName('panel_DeployGroupSelected')
+$txt_DeployGroupSelectedName    = $Window.FindName('txt_DeployGroupSelectedName')
+$txt_DeployGroupSelectedId      = $Window.FindName('txt_DeployGroupSelectedId')
+$btn_ClearDeployGroup           = $Window.FindName('btn_ClearDeployGroup')
+
+# Flag used to suppress persistence while the results list is populated programmatically
+$script:DeployGroupSuppressSelection = $false
+
+# Helper to persist and display the selected target group
+function Set-DATDeployTargetGroup {
+    param (
+        [Parameter(Mandatory)][AllowEmptyString()][string]$GroupId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$GroupName
+    )
+    if ([string]::IsNullOrWhiteSpace($GroupId)) {
+        Remove-ItemProperty -Path $global:RegPath -Name "DeployTargetGroupId" -Force -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path $global:RegPath -Name "DeployTargetGroupName" -Force -ErrorAction SilentlyContinue
+        $panel_DeployGroupSelected.Visibility = 'Collapsed'
+        Write-DATActivityLog "Package Deployment: custom target group cleared (reverting to All Devices)" -Level Info
+        return
+    }
+    Set-DATRegistryValue -Name "DeployTargetGroupId" -Value $GroupId -Type String
+    Set-DATRegistryValue -Name "DeployTargetGroupName" -Value $GroupName -Type String
+    $txt_DeployGroupSelectedName.Text = $GroupName
+    $txt_DeployGroupSelectedId.Text = $GroupId
+    $panel_DeployGroupSelected.Visibility = 'Visible'
+    Write-DATActivityLog "Package Deployment: custom target group set to '$GroupName' ($GroupId)" -Level Info
+}
+
+$btn_SearchDeployGroup.Add_Click({
+    $searchText = $txt_DeployGroupSearch.Text
+    if ([string]::IsNullOrWhiteSpace($searchText)) {
+        $txt_DeployGroupStatus.Text = 'Enter a group name or Object ID to search.'
+        $txt_DeployGroupStatus.Visibility = 'Visible'
+        $cmb_DeployGroupResults.Visibility = 'Collapsed'
+        return
+    }
+    if (-not (Test-DATIntuneAuth)) {
+        Show-DATInfoDialog -Title "Authentication Required" -Message "Please authenticate to Intune before searching Entra groups. Group lookup requires the Group.Read.All Graph permission." -Type Warning -ButtonLabel "OK"
+        Write-DATActivityLog "Cannot search Entra groups: authenticate to Intune first" -Level Error
+        return
+    }
+
+    # If the input is a GUID, validate and select it directly
+    $parsedGuid = [ref][guid]::Empty
+    if ([guid]::TryParse($searchText.Trim(), $parsedGuid)) {
+        try {
+            $txt_DeployGroupStatus.Text = 'Validating group Object ID...'
+            $txt_DeployGroupStatus.Visibility = 'Visible'
+            $group = Invoke-DATGraphRequest -Uri "/groups/$($searchText.Trim())?`$select=id,displayName" -NoPagination
+            if ($null -ne $group -and -not [string]::IsNullOrEmpty($group.id)) {
+                Set-DATDeployTargetGroup -GroupId $group.id -GroupName $group.displayName
+                $txt_DeployGroupStatus.Visibility = 'Collapsed'
+                $cmb_DeployGroupResults.Visibility = 'Collapsed'
+            } else {
+                $txt_DeployGroupStatus.Text = 'No group found with that Object ID.'
+            }
+        } catch {
+            $txt_DeployGroupStatus.Text = "Group lookup failed: $($_.Exception.Message)"
+            $txt_DeployGroupStatus.Visibility = 'Visible'
+            Write-DATActivityLog "Entra group ID lookup failed: $($_.Exception.Message)" -Level Error
+        }
+        return
+    }
+
+    # Otherwise search by display name
+    try {
+        $txt_DeployGroupStatus.Text = 'Searching...'
+        $txt_DeployGroupStatus.Visibility = 'Visible'
+        $cmb_DeployGroupResults.Visibility = 'Collapsed'
+        $results = @(Search-DATEntraGroups -SearchText $searchText.Trim())
+        $script:DeployGroupSuppressSelection = $true
+        $cmb_DeployGroupResults.Items.Clear()
+        if ($results.Count -eq 0) {
+            $txt_DeployGroupStatus.Text = "No groups found matching '$($searchText.Trim())'."
+            $cmb_DeployGroupResults.Visibility = 'Collapsed'
+        } else {
+            foreach ($g in $results) {
+                $item = [System.Windows.Controls.ComboBoxItem]::new()
+                $item.Content = $g.displayName
+                $item.Tag = [pscustomobject]@{ Id = $g.id; Name = $g.displayName }
+                $item.ToolTip = "$($g.displayName)`n$($g.id)"
+                $cmb_DeployGroupResults.Items.Add($item) | Out-Null
+            }
+            $txt_DeployGroupStatus.Text = "$($results.Count) group(s) found. Select one to set as the deployment target."
+            $cmb_DeployGroupResults.Visibility = 'Visible'
+        }
+        $script:DeployGroupSuppressSelection = $false
+        Write-DATActivityLog "Entra group search for '$($searchText.Trim())' returned $($results.Count) result(s)" -Level Info
+    } catch {
+        $script:DeployGroupSuppressSelection = $false
+        $txt_DeployGroupStatus.Text = "Search failed: $($_.Exception.Message)"
+        $txt_DeployGroupStatus.Visibility = 'Visible'
+        Write-DATActivityLog "Entra group search failed: $($_.Exception.Message)" -Level Error
+    }
+})
+
+$cmb_DeployGroupResults.Add_SelectionChanged({
+    if ($script:DeployGroupSuppressSelection) { return }
+    $selected = $cmb_DeployGroupResults.SelectedItem
+    if ($null -ne $selected -and $null -ne $selected.Tag) {
+        Set-DATDeployTargetGroup -GroupId $selected.Tag.Id -GroupName $selected.Tag.Name
+    }
+})
+
+$btn_ClearDeployGroup.Add_Click({
+    Set-DATDeployTargetGroup -GroupId '' -GroupName ''
+    $txt_DeployGroupSearch.Text = ''
+    $txt_DeployGroupStatus.Visibility = 'Collapsed'
+    $cmb_DeployGroupResults.Visibility = 'Collapsed'
+    $script:DeployGroupSuppressSelection = $true
+    $cmb_DeployGroupResults.Items.Clear()
+    $script:DeployGroupSuppressSelection = $false
+})
+
+
 $chk_CreateIntuneWinOnly = $Window.FindName('chk_CreateIntuneWinOnly')
 $txt_CreateIntuneWinOnlyState = $Window.FindName('txt_CreateIntuneWinOnlyState')
+$banner_CreateWinOnly = $Window.FindName('banner_CreateWinOnly')
+
+function Update-DATCreateWinOnlyBanner {
+    # Shows the Model Selection banner only when 'Create .intunewin only' is on AND the
+    # Intune platform is selected (the only mode where the upload is actually skipped).
+    if ($null -eq $banner_CreateWinOnly) { return }
+    $platform = if ($null -ne $cmb_Platform -and $null -ne $cmb_Platform.SelectedItem) { [string]$cmb_Platform.SelectedItem.Content } else { '' }
+    $active = ($platform -eq 'Intune') -and ($null -ne $chk_CreateIntuneWinOnly) -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
+    $banner_CreateWinOnly.Visibility = if ($active) { 'Visible' } else { 'Collapsed' }
+}
+
 $chk_CreateIntuneWinOnly.Add_Checked({
     Set-DATRegistryValue -Name "IntuneCreateWinOnly" -Value 1 -Type DWord
     $txt_CreateIntuneWinOnlyState.Text = 'On'
     $txt_CreateIntuneWinOnlyState.Foreground = $Window.FindResource('AccentColor')
     Write-DATActivityLog "Package Output: Create IntuneWin file only (skip upload) enabled" -Level Info
+    Update-DATCreateWinOnlyBanner
 })
 $chk_CreateIntuneWinOnly.Add_Unchecked({
     Set-DATRegistryValue -Name "IntuneCreateWinOnly" -Value 0 -Type DWord
     $txt_CreateIntuneWinOnlyState.Text = 'Off'
     $txt_CreateIntuneWinOnlyState.Foreground = $Window.FindResource('InputPlaceholder')
     Write-DATActivityLog "Package Output: Create IntuneWin file only (skip upload) disabled" -Level Info
+    Update-DATCreateWinOnlyBanner
 })
+
+# Keep the Model Selection banner in sync when the deployment platform changes.
+if ($null -ne $cmb_Platform) {
+    $cmb_Platform.Add_SelectionChanged({ Update-DATCreateWinOnlyBanner })
+}
 
 # Assignment Filter settings
 $chk_AutoAssignmentFilter = $Window.FindName('chk_AutoAssignmentFilter')
@@ -17507,6 +18981,17 @@ $btn_ResetToastDefaults.Add_Click({
 $script:IntuneAppsData = [System.Collections.ObjectModel.ObservableCollection[PSObject]]::new()
 $grid_IntuneApps.ItemsSource = $script:IntuneAppsData
 
+function Get-DATCheckedIntuneApps {
+    # Returns apps that are both checked (Selected) AND visible in the current filtered view.
+    # This ensures actions only apply to the on-screen selection, not stale selections that were
+    # left checked under a previous filter (e.g. Drivers selected, then switched to BIOS).
+    $view = [System.Windows.Data.CollectionViewSource]::GetDefaultView($grid_IntuneApps.ItemsSource)
+    if ($null -eq $view) {
+        return @($script:IntuneAppsData | Where-Object { $_.Selected -eq $true })
+    }
+    return @($view | Where-Object { $_.Selected -eq $true })
+}
+
 # Intune context menu: theme sync + state management
 $grid_IntuneApps.ContextMenu.Add_Opened({
     # Sync theme resources into the ContextMenu (separate visual tree)
@@ -17522,11 +19007,14 @@ $grid_IntuneApps.ContextMenu.Add_Opened({
     }
 
     # Enable assignment options when authenticated and at least one row is checked or highlighted
-    $checkedApps = @($script:IntuneAppsData | Where-Object { $_.Selected -eq $true })
+    $checkedApps = Get-DATCheckedIntuneApps
     $hasSelection = ($checkedApps.Count -gt 0) -or ($null -ne $grid_IntuneApps.SelectedItem)
     $canAssign = $hasSelection -and (Test-DATIntuneAuth)
-    $ctx_AssignAvailable.IsEnabled = $canAssign
-    $ctx_AssignRequired.IsEnabled = $canAssign
+    $ctx_AssignPackage.IsEnabled = $canAssign
+    $ctx_UpdateDetectionScript.IsEnabled = $canAssign
+    $ctx_UpdateRequirementScript.IsEnabled = $canAssign
+    $ctx_RepublishMetadata.IsEnabled = $canAssign
+    $ctx_RemoveAssignments.IsEnabled = $canAssign
     $ctx_UpdateRemoveFilter.IsEnabled = $canAssign
 })
 
@@ -17548,6 +19036,29 @@ function Invoke-DATIntuneAssignmentWithProgress {
         [System.Windows.Media.ColorConverter]::ConvertFromString($theme['WindowForeground']))
     $mutedBrush = [System.Windows.Media.SolidColorBrush]::new(
         [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
+
+    # Convert a raw assignment error into a short, friendly message for display. The full technical
+    # detail (raw Graph response body and diagnostic IDs) is already written to the CMTrace log by
+    # the core module, so the UI only needs a plain-English summary.
+    $friendlyError = {
+        param($raw)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return 'Assignment failed for an unknown reason. See the log for details.' }
+        $msg = [string]$raw
+        $msg = $msg -replace '^Graph API \d+:\s*', ''   # strip the module's "Graph API 400: " prefix
+        if ($msg -match "PublishingState is not 'Published'") {
+            return 'The package is still being processed by Intune. Wait for the upload to finish (state = Published), then try assigning again.'
+        }
+        if ($msg -match 'already exist' -or $msg -match 'duplicate') {
+            return 'This package already has an assignment for the selected group. Remove the existing assignment or choose a different group.'
+        }
+        if ($msg -match 'Authentication expired|Unauthorized|token') {
+            return 'Your Intune session has expired. Re-authenticate and try again.'
+        }
+        # Fallback: keep it to the first sentence / before any diagnostic trailer so it stays short.
+        $msg = ($msg -split ' - Operation ID')[0]
+        $msg = ($msg -split ' - Activity ID')[0]
+        return $msg.Trim()
+    }
 
     # Build modal window
     $script:AssignDlg = [System.Windows.Window]::new()
@@ -17617,7 +19128,11 @@ function Invoke-DATIntuneAssignmentWithProgress {
 
     # Subtitle -- target group
     $script:AssignDlgSubtitle = [System.Windows.Controls.TextBlock]::new()
-    $script:AssignDlgSubtitle.Text = "Target group: $($GroupResult.GroupName)"
+    $script:AssignDlgSubtitle.Text = if (-not [string]::IsNullOrEmpty($GroupResult.FilterName)) {
+        "Target group: $($GroupResult.GroupName)  --  filter: $($GroupResult.FilterName)"
+    } else {
+        "Target group: $($GroupResult.GroupName)"
+    }
     $script:AssignDlgSubtitle.FontSize = 12
     $script:AssignDlgSubtitle.Foreground = $mutedBrush
     $script:AssignDlgSubtitle.TextTrimming = 'CharacterEllipsis'
@@ -17693,9 +19208,6 @@ function Invoke-DATIntuneAssignmentWithProgress {
     $script:AssignDlg.Content = $asBorder
 
     # Prepare data for the background runspace
-    $authStatus = Get-DATIntuneAuthStatus
-    $token = $authStatus.Token
-    $tokenExpiry = $authStatus.ExpiresOn
     $appList = @($Apps | ForEach-Object { @{ AppId = $_.AppId; DisplayName = $_.DisplayName } })
 
     $script:AssignState = [hashtable]::Synchronized(@{
@@ -17705,14 +19217,18 @@ function Invoke-DATIntuneAssignmentWithProgress {
     })
 
     $script:AssignPS = [powershell]::Create()
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:AssignPS -CaptureIntuneAuthContext
     $script:AssignPS.AddScript({
-        param ($ModulePath, $State, $Token, $TokenExpiry, $AppList, $GroupId, $Intent)
-        Import-Module $ModulePath -Force
-        Set-DATIntuneAuthToken -Token $Token -ExpiresOn $TokenExpiry
+        param ($State, $AppList, $GroupId, $Intent, $FilterId, $FilterType)
         foreach ($app in $AppList) {
             $entry = @{ AppId = $app.AppId; DisplayName = $app.DisplayName; Success = $false; Error = '' }
             try {
-                Set-DATIntuneAppAssignment -AppId $app.AppId -GroupId $GroupId -Intent $Intent
+                if (-not [string]::IsNullOrEmpty($FilterId)) {
+                    $effectiveFilterType = if ([string]::IsNullOrEmpty($FilterType)) { 'include' } else { $FilterType }
+                    Set-DATIntuneAppAssignmentWithFilter -AppId $app.AppId -GroupId $GroupId -Intent $Intent -FilterId $FilterId -FilterType $effectiveFilterType
+                } else {
+                    Set-DATIntuneAppAssignment -AppId $app.AppId -GroupId $GroupId -Intent $Intent
+                }
                 $entry.Success = $true
             } catch {
                 $entry.Error = $_.Exception.Message
@@ -17721,13 +19237,12 @@ function Invoke-DATIntuneAssignmentWithProgress {
         }
         $State.Status = 'Complete'
     })
-    [void]$script:AssignPS.AddArgument($CoreModulePath)
     [void]$script:AssignPS.AddArgument($script:AssignState)
-    [void]$script:AssignPS.AddArgument($token)
-    [void]$script:AssignPS.AddArgument($tokenExpiry)
     [void]$script:AssignPS.AddArgument($appList)
     [void]$script:AssignPS.AddArgument($GroupResult.GroupId)
     [void]$script:AssignPS.AddArgument($Intent)
+    [void]$script:AssignPS.AddArgument($GroupResult.FilterId)
+    [void]$script:AssignPS.AddArgument($GroupResult.FilterType)
     $script:AssignAsync = $script:AssignPS.BeginInvoke()
 
     # Poll timer to update icons as each assignment completes
@@ -17748,13 +19263,20 @@ function Invoke-DATIntuneAssignmentWithProgress {
                     $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                         [System.Windows.Media.ColorConverter]::ConvertFromString('#22C55E'))
                     if ($label) { $label.Text = 'Assigned'; $label.Foreground = $icon.Foreground }
-                    Write-DATActivityLog "Assigned '$($entry.DisplayName)' as $Intent to group" -Level Info
+                    $filterSuffix = if (-not [string]::IsNullOrEmpty($GroupResult.FilterName)) { " with filter '$($GroupResult.FilterName)'" } else { '' }
+                    Write-DATActivityLog "Assigned '$($entry.DisplayName)' as $Intent to $($GroupResult.GroupName)$filterSuffix" -Level Info
                 } else {
                     $icon.Text = [string][char]0xE711  # X
                     $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                         [System.Windows.Media.ColorConverter]::ConvertFromString('#EF4444'))
-                    if ($label) { $label.Text = 'Failed'; $label.Foreground = $icon.Foreground }
-                    Write-DATActivityLog "Assignment failed for '$($entry.DisplayName)': $($entry.Error)" -Level Error
+                    $rawErr = if ([string]::IsNullOrWhiteSpace($entry.Error)) { 'Unknown error (no detail returned)' } else { $entry.Error }
+                    $errText = & $friendlyError $rawErr
+                    if ($label) {
+                        $label.Text = 'Failed'; $label.Foreground = $icon.Foreground
+                        $label.ToolTip = $errText
+                    }
+                    $icon.ToolTip = $errText
+                    Write-DATActivityLog "Assignment failed for '$($entry.DisplayName)': $rawErr" -Level Error
                 }
             }
             $script:AssignLastSeen++
@@ -17782,6 +19304,19 @@ function Invoke-DATIntuneAssignmentWithProgress {
                 $script:AssignDlgSummary.Inlines.Add([System.Windows.Documents.Run]::new("$successes assigned, $failures failed."))
                 $script:AssignDlgSummary.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                     [System.Windows.Media.ColorConverter]::ConvertFromString('#EF4444'))
+                # Surface the actual failure reason(s) so the user isn't left with a blank "Failed".
+                $failedEntries = @($completed | Where-Object { -not $_.Success })
+                $distinctErrors = @($failedEntries | ForEach-Object {
+                    & $friendlyError $_.Error
+                } | Select-Object -Unique)
+                foreach ($de in $distinctErrors) {
+                    $script:AssignDlgSummary.Inlines.Add([System.Windows.Documents.LineBreak]::new())
+                    $errRun = [System.Windows.Documents.Run]::new($de)
+                    $errRun.FontWeight = [System.Windows.FontWeights]::Normal
+                    $errRun.FontSize = 11
+                    $script:AssignDlgSummary.Inlines.Add($errRun)
+                }
+                $script:AssignDlgSummary.TextWrapping = 'Wrap'
             }
             $script:AssignDlgSummary.Visibility = 'Visible'
             try { $script:AssignPS.Dispose() } catch { }
@@ -17798,9 +19333,291 @@ function Invoke-DATIntuneAssignmentWithProgress {
     if ($script:AssignPS) { try { $script:AssignPS.Dispose() } catch { }; $script:AssignPS = $null }
 }
 
-# Assign Package -- Available
-$ctx_AssignAvailable.Add_Click({
-    $checkedApps = @($script:IntuneAppsData | Where-Object { $_.Selected -eq $true })
+# --- Generic bulk operation progress modal ---
+function Invoke-DATIntuneBulkAppProgress {
+    <#
+    .SYNOPSIS
+        Shows a themed modal with per-app progress while running a bulk Intune operation
+        (remove assignments / update detection script / update requirement script) against the
+        selected packages in a background runspace, so the UI stays responsive.
+    #>
+    param (
+        [array]$Apps,
+        [ValidateSet('RemoveAssignments','UpdateDetection','UpdateRequirement','UpdateMetadata')][string]$Operation
+    )
+
+    switch ($Operation) {
+        'RemoveAssignments' { $titleIcon = [char]0xE8FB; $titleText = 'Removing Assignments';                        $doneLabel = 'Removed'; $doneSummary = 'assignments removed from' }
+        'UpdateDetection'   { $titleIcon = [char]0xE9F5; $titleText = 'Updating Detection & Remediation Scripts';    $doneLabel = 'Updated';  $doneSummary = 'script updated on' }
+        'UpdateRequirement' { $titleIcon = [char]0xE90F; $titleText = 'Updating Requirement Script';                 $doneLabel = 'Updated';  $doneSummary = 'script updated on' }
+        'UpdateMetadata'    { $titleIcon = [char]0xE898; $titleText = 'Republishing Metadata';                       $doneLabel = 'Updated';  $doneSummary = 'metadata republished on' }
+    }
+
+    $theme = Get-DATTheme -ThemeName $script:CurrentTheme
+    $bgColor = [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBackground'])
+    $fgBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['WindowForeground']))
+    $mutedBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
+
+    $script:BulkDlg = [System.Windows.Window]::new()
+    $script:BulkDlg.WindowStyle = 'None'
+    $script:BulkDlg.AllowsTransparency = $true
+    $script:BulkDlg.Background = [System.Windows.Media.Brushes]::Transparent
+    $script:BulkDlg.WindowStartupLocation = 'CenterOwner'
+    $script:BulkDlg.Owner = $Window
+    $script:BulkDlg.Width = 540
+    $script:BulkDlg.SizeToContent = 'Height'
+    $script:BulkDlg.MaxHeight = 520
+    $script:BulkDlg.Topmost = $false
+    $script:BulkDlg.ResizeMode = 'NoResize'
+    $script:BulkDlg.ShowInTaskbar = $false
+
+    $bkBorder = [System.Windows.Controls.Border]::new()
+    $bkBorder.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.Color]::FromArgb(250, $bgColor.R, $bgColor.G, $bgColor.B))
+    $bkBorder.CornerRadius = [System.Windows.CornerRadius]::new(16)
+    $bkBorder.Padding = [System.Windows.Thickness]::new(28, 24, 28, 24)
+    $bkBorder.BorderBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBorder']))
+    $bkBorder.BorderThickness = [System.Windows.Thickness]::new(1)
+    $bkShadow = [System.Windows.Media.Effects.DropShadowEffect]::new()
+    $bkShadow.BlurRadius = 30; $bkShadow.ShadowDepth = 0; $bkShadow.Opacity = 0.5
+    $bkShadow.Color = [System.Windows.Media.Colors]::Black
+    $bkBorder.Effect = $bkShadow
+
+    $bkPanel = [System.Windows.Controls.StackPanel]::new()
+
+    # Title row with close button
+    $bkTitleGrid = [System.Windows.Controls.Grid]::new()
+    $btc1 = [System.Windows.Controls.ColumnDefinition]::new(); $btc1.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+    $btc2 = [System.Windows.Controls.ColumnDefinition]::new(); $btc2.Width = [System.Windows.GridLength]::Auto
+    $bkTitleGrid.ColumnDefinitions.Add($btc1)
+    $bkTitleGrid.ColumnDefinitions.Add($btc2)
+
+    $bkTitle = [System.Windows.Controls.TextBlock]::new()
+    $bkTitle.FontSize = 15
+    $bkTitle.FontWeight = [System.Windows.FontWeights]::Bold
+    $bkTitle.Foreground = $fgBrush
+    $bkTitle.VerticalAlignment = 'Center'
+    $btr1 = [System.Windows.Documents.Run]::new([string]$titleIcon)
+    $btr1.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+    $btr1.FontSize = 14
+    $btr2 = [System.Windows.Documents.Run]::new("  $titleText")
+    $bkTitle.Inlines.Add($btr1)
+    $bkTitle.Inlines.Add($btr2)
+    [System.Windows.Controls.Grid]::SetColumn($bkTitle, 0)
+    $bkTitleGrid.Children.Add($bkTitle) | Out-Null
+
+    $bkCloseBtn = [System.Windows.Controls.Button]::new()
+    $bkCloseBtn.Content = [string][char]0xE711
+    $bkCloseBtn.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+    $bkCloseBtn.FontSize = 12
+    $bkCloseBtn.Foreground = $mutedBrush
+    $bkCloseBtn.Background = [System.Windows.Media.Brushes]::Transparent
+    $bkCloseBtn.BorderThickness = [System.Windows.Thickness]::new(0)
+    $bkCloseBtn.Cursor = [System.Windows.Input.Cursors]::Hand
+    $bkCloseBtn.ToolTip = 'Close'
+    [System.Windows.Controls.Grid]::SetColumn($bkCloseBtn, 1)
+    $bkCloseBtn.Add_Click({ $script:BulkDlg.Close() })
+    $bkTitleGrid.Children.Add($bkCloseBtn) | Out-Null
+
+    $bkTitleGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 14)
+    $bkPanel.Children.Add($bkTitleGrid) | Out-Null
+
+    # Subtitle -- progress counter
+    $script:BulkDlgSubtitle = [System.Windows.Controls.TextBlock]::new()
+    $script:BulkDlgSubtitle.Text = "0 / $($Apps.Count)"
+    $script:BulkDlgSubtitle.FontSize = 12
+    $script:BulkDlgSubtitle.Foreground = $mutedBrush
+    $script:BulkDlgSubtitle.Margin = [System.Windows.Thickness]::new(0, 0, 0, 14)
+    $bkPanel.Children.Add($script:BulkDlgSubtitle) | Out-Null
+
+    # Scrollable area for app rows
+    $bkScroll = [System.Windows.Controls.ScrollViewer]::new()
+    $bkScroll.VerticalScrollBarVisibility = 'Auto'
+    $bkScroll.MaxHeight = 320
+    $bkItemsPanel = [System.Windows.Controls.StackPanel]::new()
+
+    $script:BulkDlgIcons = @{}
+    $script:BulkDlgStatusLabels = @{}
+    foreach ($app in $Apps) {
+        $brRow = [System.Windows.Controls.Grid]::new()
+        $brc1 = [System.Windows.Controls.ColumnDefinition]::new(); $brc1.Width = [System.Windows.GridLength]::new(26, [System.Windows.GridUnitType]::Pixel)
+        $brc2 = [System.Windows.Controls.ColumnDefinition]::new(); $brc2.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+        $brc3 = [System.Windows.Controls.ColumnDefinition]::new(); $brc3.Width = [System.Windows.GridLength]::Auto
+        $brRow.ColumnDefinitions.Add($brc1)
+        $brRow.ColumnDefinitions.Add($brc2)
+        $brRow.ColumnDefinitions.Add($brc3)
+        $brRow.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+
+        $brIcon = [System.Windows.Controls.TextBlock]::new()
+        $brIcon.Text = [string][char]0xE916  # Pending
+        $brIcon.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+        $brIcon.FontSize = 14
+        $brIcon.VerticalAlignment = 'Center'
+        $brIcon.Foreground = $mutedBrush
+        [System.Windows.Controls.Grid]::SetColumn($brIcon, 0)
+        $brRow.Children.Add($brIcon) | Out-Null
+        $script:BulkDlgIcons[$app.AppId] = $brIcon
+
+        $brName = [System.Windows.Controls.TextBlock]::new()
+        $brName.Text = $app.DisplayName
+        $brName.FontSize = 13
+        $brName.Foreground = $fgBrush
+        $brName.VerticalAlignment = 'Center'
+        $brName.TextTrimming = 'CharacterEllipsis'
+        [System.Windows.Controls.Grid]::SetColumn($brName, 1)
+        $brRow.Children.Add($brName) | Out-Null
+
+        $brStatus = [System.Windows.Controls.TextBlock]::new()
+        $brStatus.Text = 'Pending'
+        $brStatus.FontSize = 11
+        $brStatus.Foreground = $mutedBrush
+        $brStatus.VerticalAlignment = 'Center'
+        $brStatus.Margin = [System.Windows.Thickness]::new(12, 0, 0, 0)
+        [System.Windows.Controls.Grid]::SetColumn($brStatus, 2)
+        $brRow.Children.Add($brStatus) | Out-Null
+        $script:BulkDlgStatusLabels[$app.AppId] = $brStatus
+
+        $bkItemsPanel.Children.Add($brRow) | Out-Null
+    }
+
+    $bkScroll.Content = $bkItemsPanel
+    $bkPanel.Children.Add($bkScroll) | Out-Null
+
+    # Summary line (hidden until complete)
+    $script:BulkDlgSummary = [System.Windows.Controls.TextBlock]::new()
+    $script:BulkDlgSummary.FontSize = 12
+    $script:BulkDlgSummary.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $script:BulkDlgSummary.Margin = [System.Windows.Thickness]::new(0, 14, 0, 0)
+    $script:BulkDlgSummary.Visibility = 'Collapsed'
+    $bkPanel.Children.Add($script:BulkDlgSummary) | Out-Null
+
+    $bkBorder.Child = $bkPanel
+    $script:BulkDlg.Content = $bkBorder
+
+    # Prepare data for the background runspace
+    $appList = @($Apps | ForEach-Object { @{ AppId = $_.AppId; DisplayName = $_.DisplayName } })
+
+    $script:BulkState = [hashtable]::Synchronized(@{
+        Status    = 'Running'
+        Completed = [System.Collections.ArrayList]::new()  # list of @{ AppId; DisplayName; Success; Error; Count }
+        Total     = $appList.Count
+    })
+
+    $script:BulkPS = [powershell]::Create()
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:BulkPS -CaptureIntuneAuthContext
+    $script:BulkPS.AddScript({
+        param ($State, $AppList, $Operation)
+        foreach ($app in $AppList) {
+            $entry = @{ AppId = $app.AppId; DisplayName = $app.DisplayName; Success = $false; Error = ''; Count = 0 }
+            try {
+                switch ($Operation) {
+                    'RemoveAssignments' { $entry.Count = [int](Remove-DATIntuneAppAssignments -AppId $app.AppId) }
+                    'UpdateDetection'   { Update-DATIntuneAppRuleScript -AppId $app.AppId -ScriptType 'Detection'   | Out-Null }
+                    'UpdateRequirement' { Update-DATIntuneAppRuleScript -AppId $app.AppId -ScriptType 'Requirement' | Out-Null }
+                    'UpdateMetadata'    { Update-DATIntuneAppMetadata -AppId $app.AppId | Out-Null }
+                }
+                $entry.Success = $true
+            } catch {
+                $entry.Error = $_.Exception.Message
+            }
+            [void]$State.Completed.Add($entry)
+        }
+        $State.Status = 'Complete'
+    })
+    [void]$script:BulkPS.AddArgument($script:BulkState)
+    [void]$script:BulkPS.AddArgument($appList)
+    [void]$script:BulkPS.AddArgument($Operation)
+    $script:BulkAsync = $script:BulkPS.BeginInvoke()
+
+    $script:BulkLastSeen = 0
+    $script:BulkAnyChanges = $false
+    $script:BulkTimer = [System.Windows.Threading.DispatcherTimer]::new()
+    $script:BulkTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+    $script:BulkTimer.Add_Tick({
+        $completed = $script:BulkState.Completed
+        $count = $completed.Count
+        while ($script:BulkLastSeen -lt $count) {
+            $entry = $completed[$script:BulkLastSeen]
+            $icon = $script:BulkDlgIcons[$entry.AppId]
+            $label = $script:BulkDlgStatusLabels[$entry.AppId]
+            if ($icon) {
+                if ($entry.Success) {
+                    $icon.Text = [string][char]0xE73E  # Checkmark
+                    $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                        [System.Windows.Media.ColorConverter]::ConvertFromString('#22C55E'))
+                    if ($label) { $label.Text = $doneLabel; $label.Foreground = $icon.Foreground }
+                    if ($Operation -eq 'RemoveAssignments') {
+                        if ([int]$entry.Count -gt 0) {
+                            $script:BulkAnyChanges = $true
+                            Write-DATActivityLog "Removed $($entry.Count) assignment(s) from '$($entry.DisplayName)'" -Level Success
+                        } else {
+                            if ($label) { $label.Text = 'None' }
+                            Write-DATActivityLog "No assignments to remove for '$($entry.DisplayName)'" -Level Info
+                        }
+                    } else {
+                        $script:BulkAnyChanges = $true
+                        Write-DATActivityLog "$doneLabel '$($entry.DisplayName)'" -Level Success
+                    }
+                } else {
+                    $icon.Text = [string][char]0xE711  # X
+                    $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                        [System.Windows.Media.ColorConverter]::ConvertFromString('#EF4444'))
+                    if ($label) { $label.Text = 'Failed'; $label.Foreground = $icon.Foreground }
+                    Write-DATActivityLog "Operation failed for '$($entry.DisplayName)': $($entry.Error)" -Level Error
+                }
+            }
+            $script:BulkLastSeen++
+        }
+
+        $script:BulkDlgSubtitle.Text = "$count / $($script:BulkState.Total)"
+
+        if ($script:BulkState.Status -eq 'Complete') {
+            $script:BulkTimer.Stop()
+            $successes = @($completed | Where-Object { $_.Success }).Count
+            $failures = $script:BulkState.Total - $successes
+            $script:BulkDlgSummary.Inlines.Clear()
+            if ($failures -eq 0) {
+                $iconRun = [System.Windows.Documents.Run]::new([string][char]0xE73E + "  ")
+                $iconRun.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+                $script:BulkDlgSummary.Inlines.Add($iconRun)
+                $script:BulkDlgSummary.Inlines.Add([System.Windows.Documents.Run]::new("$doneSummary $successes package(s)."))
+                $script:BulkDlgSummary.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString('#22C55E'))
+            } else {
+                $iconRun = [System.Windows.Documents.Run]::new([string][char]0xE7BA + "  ")
+                $iconRun.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+                $script:BulkDlgSummary.Inlines.Add($iconRun)
+                $script:BulkDlgSummary.Inlines.Add([System.Windows.Documents.Run]::new("$successes succeeded, $failures failed."))
+                $script:BulkDlgSummary.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString('#EF4444'))
+            }
+            $script:BulkDlgSummary.Visibility = 'Visible'
+            try { $script:BulkPS.Dispose() } catch { }
+            $script:BulkPS = $null
+
+            # Refresh the grid so the Assigned column reflects any assignment removal
+            if ($Operation -eq 'RemoveAssignments' -and $script:BulkAnyChanges) {
+                try { Invoke-DATIntuneAppRefresh } catch { }
+            }
+        }
+    })
+    $script:BulkTimer.Start()
+
+    # Show modal -- blocks until closed; DispatcherTimer fires during modal pump
+    $script:BulkDlg.ShowDialog() | Out-Null
+
+    # Cleanup if dialog closed before work finished
+    if ($script:BulkTimer) { try { $script:BulkTimer.Stop() } catch { } }
+    if ($script:BulkPS) { try { $script:BulkPS.Dispose() } catch { }; $script:BulkPS = $null }
+}
+
+# Assign Package -- a single dialog where the user chooses the assignment type (Available or
+# Required), the target group / All Users / All Devices, and an optional assignment filter.
+$ctx_AssignPackage.Add_Click({
+    $checkedApps = Get-DATCheckedIntuneApps
     if ($checkedApps.Count -eq 0) {
         $highlighted = $grid_IntuneApps.SelectedItem
         if ($null -eq $highlighted) { return }
@@ -17808,31 +19625,82 @@ $ctx_AssignAvailable.Add_Click({
     }
 
     $appLabel = if ($checkedApps.Count -eq 1) { $checkedApps[0].DisplayName } else { "$($checkedApps.Count) selected packages" }
-    $result = Show-DATEntraGroupSearchDialog -AppName $appLabel -Intent 'Available'
+    $result = Show-DATEntraGroupSearchDialog -AppName $appLabel
     if ($null -ne $result) {
-        Invoke-DATIntuneAssignmentWithProgress -Apps $checkedApps -GroupResult $result -Intent 'Available'
+        Invoke-DATIntuneAssignmentWithProgress -Apps $checkedApps -GroupResult $result -Intent $result.Intent
     }
 })
 
-# Assign Package -- Required
-$ctx_AssignRequired.Add_Click({
-    $checkedApps = @($script:IntuneAppsData | Where-Object { $_.Selected -eq $true })
+# Update Detection & Remediation / Requirement rule scripts on existing apps. This pushes template
+# fixes (e.g. detection PendingReboot guard, requirement maintenance-window logic) into a published
+# package by regenerating the rule script and PATCHing it into the existing Intune app -- the app and
+# its uploaded .intunewin content are left untouched, so there is no need to recreate the whole app.
+function Invoke-DATIntuneScriptUpdate {
+    param ([Parameter(Mandatory)][ValidateSet('Detection','Requirement')][string]$ScriptType)
+
+    $checkedApps = Get-DATCheckedIntuneApps
     if ($checkedApps.Count -eq 0) {
         $highlighted = $grid_IntuneApps.SelectedItem
         if ($null -eq $highlighted) { return }
         $checkedApps = @($highlighted)
     }
 
-    $appLabel = if ($checkedApps.Count -eq 1) { $checkedApps[0].DisplayName } else { "$($checkedApps.Count) selected packages" }
-    $result = Show-DATEntraGroupSearchDialog -AppName $appLabel -Intent 'Required'
-    if ($null -ne $result) {
-        Invoke-DATIntuneAssignmentWithProgress -Apps $checkedApps -GroupResult $result -Intent 'Required'
+    $label = if ($ScriptType -eq 'Detection') { 'detection & remediation' } else { 'requirement' }
+    $appLabel = if ($checkedApps.Count -eq 1) { "'$($checkedApps[0].DisplayName)'" } else { "$($checkedApps.Count) selected packages" }
+    $confirm = Show-DATConfirmDialog -Title "Update $ScriptType Script" `
+        -Message "Regenerate the $label script from the current templates and update it on $appLabel in Intune?`n`nThe existing app is kept -- only the rule script is replaced. The installer content (.intunewin) is not changed." `
+        -ConfirmLabel "Yes, Update"
+    if (-not $confirm) { return }
+
+    $operation = if ($ScriptType -eq 'Detection') { 'UpdateDetection' } else { 'UpdateRequirement' }
+    Invoke-DATIntuneBulkAppProgress -Apps $checkedApps -Operation $operation
+}
+
+$ctx_UpdateDetectionScript.Add_Click({ Invoke-DATIntuneScriptUpdate -ScriptType 'Detection' })
+$ctx_UpdateRequirementScript.Add_Click({ Invoke-DATIntuneScriptUpdate -ScriptType 'Requirement' })
+
+# Republish Metadata -- refreshes the description, information URL, notes and logo on the existing
+# app(s) from the current templates/branding via a Graph PATCH. The .intunewin content and the
+# detection/requirement rules are left untouched.
+$ctx_RepublishMetadata.Add_Click({
+    $checkedApps = Get-DATCheckedIntuneApps
+    if ($checkedApps.Count -eq 0) {
+        $highlighted = $grid_IntuneApps.SelectedItem
+        if ($null -eq $highlighted) { return }
+        $checkedApps = @($highlighted)
     }
+
+    $appLabel = if ($checkedApps.Count -eq 1) { "'$($checkedApps[0].DisplayName)'" } else { "$($checkedApps.Count) selected packages" }
+    $confirm = Show-DATConfirmDialog -Title "Republish Metadata" `
+        -Message "Refresh the description, information URL, notes and logo on $appLabel from the current templates and branding?`n`nThe installer content (.intunewin) and the detection/requirement rules are not changed." `
+        -ConfirmLabel "Yes, Republish"
+    if (-not $confirm) { return }
+
+    Invoke-DATIntuneBulkAppProgress -Apps $checkedApps -Operation 'UpdateMetadata'
+})
+
+# Remove Assignments -- clears ALL group assignments from the selected package(s) without deleting the app
+$ctx_RemoveAssignments.Add_Click({
+    $checkedApps = Get-DATCheckedIntuneApps
+    if ($checkedApps.Count -eq 0) {
+        $highlighted = $grid_IntuneApps.SelectedItem
+        if ($null -eq $highlighted) { return }
+        $checkedApps = @($highlighted)
+    }
+
+    $appLabel = if ($checkedApps.Count -eq 1) { "'$($checkedApps[0].DisplayName)'" } else { "$($checkedApps.Count) selected packages" }
+    $confirm = Show-DATConfirmDialog -Title "Remove Assignments" `
+        -Message "Remove ALL group assignments from $appLabel`?`n`nThe package(s) will remain in Intune but will no longer be assigned to any group." `
+        -ConfirmLabel "Yes, Remove"
+    if (-not $confirm) { return }
+
+    Invoke-DATIntuneBulkAppProgress -Apps $checkedApps -Operation 'RemoveAssignments'
 })
 
 # Update / Remove Assignment Filter
 $ctx_UpdateRemoveFilter.Add_Click({
-    $checkedApps = @($script:IntuneAppsData | Where-Object { $_.Selected -eq $true })
+  try {
+    $checkedApps = Get-DATCheckedIntuneApps
     if ($checkedApps.Count -eq 0) {
         $highlighted = $grid_IntuneApps.SelectedItem
         if ($null -eq $highlighted) { return }
@@ -17923,6 +19791,54 @@ $ctx_UpdateRemoveFilter.Add_Click({
     $fFilterLabel.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
     $fPanel.Children.Add($fFilterLabel) | Out-Null
 
+    # Free-text search to narrow the filter list (placeholder hint overlaid via a Grid)
+    $fSearchGrid = [System.Windows.Controls.Grid]::new()
+    $fSearchGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+
+    # Rounded TextBox template so the search input matches the rounded inputs used app-wide.
+    $fRoundedTextBoxTemplate = [System.Windows.Markup.XamlReader]::Parse(@"
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                 xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                 TargetType="TextBox">
+    <Border x:Name="bd" Background="{TemplateBinding Background}"
+            BorderBrush="{TemplateBinding BorderBrush}"
+            BorderThickness="{TemplateBinding BorderThickness}"
+            CornerRadius="8" SnapsToDevicePixels="True">
+        <ScrollViewer x:Name="PART_ContentHost"
+                      Margin="{TemplateBinding Padding}"
+                      VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                      HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                      Background="Transparent" Focusable="False"/>
+    </Border>
+</ControlTemplate>
+"@)
+
+    $fSearchBox = [System.Windows.Controls.TextBox]::new()
+    $fSearchBox.Height = 32
+    $fSearchBox.FontSize = 12
+    $fSearchBox.VerticalContentAlignment = 'Center'
+    $fSearchBox.Padding = [System.Windows.Thickness]::new(8, 0, 8, 0)
+    $fSearchBox.Foreground = $fgBrush
+    $fSearchBox.CaretBrush = $fgBrush
+    $fSearchBox.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputBackground']))
+    $fSearchBox.BorderBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBorder']))
+    $fSearchBox.BorderThickness = [System.Windows.Thickness]::new(1)
+    $fSearchBox.Template = $fRoundedTextBoxTemplate
+    $fSearchGrid.Children.Add($fSearchBox) | Out-Null
+
+    $fSearchHint = [System.Windows.Controls.TextBlock]::new()
+    $fSearchHint.Text = 'Search filters...'
+    $fSearchHint.FontSize = 12
+    $fSearchHint.Foreground = $mutedBrush
+    $fSearchHint.IsHitTestVisible = $false
+    $fSearchHint.VerticalAlignment = 'Center'
+    $fSearchHint.Margin = [System.Windows.Thickness]::new(9, 0, 0, 0)
+    $fSearchGrid.Children.Add($fSearchHint) | Out-Null
+
+    $fPanel.Children.Add($fSearchGrid) | Out-Null
+
     # Filter dropdown
     $fCombo = [System.Windows.Controls.ComboBox]::new()
     $fCombo.Height = 36
@@ -17951,11 +19867,16 @@ $ctx_UpdateRemoveFilter.Add_Click({
     $fClearBtn.Style = $Window.FindResource('DangerButton')
     $fClearContent = [System.Windows.Controls.TextBlock]::new()
     $fClearContent.Foreground = [System.Windows.Media.Brushes]::White
-    $fClearContent.Inlines.Add([System.Windows.Documents.Run]::new([string][char]0xE74D))
-    $fClearContent.Inlines[0].FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
-    $fClearContent.Inlines[0].FontSize = 11
-    $fClearContent.Inlines.Add([System.Windows.Documents.Run]::new('  Clear Filter'))
-    $fClearContent.Inlines[1].FontSize = 12
+    # Build each Run explicitly and set its properties before adding. In Windows PowerShell 5.1
+    # $TextBlock.Inlines[0] returns the InlineCollection itself (not the Run), so setting a Run
+    # property via the indexer throws "property 'FontFamily' cannot be found on this object".
+    $fClearIcon = [System.Windows.Documents.Run]::new([string][char]0xE74D)
+    $fClearIcon.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+    $fClearIcon.FontSize = 11
+    $fClearContent.Inlines.Add($fClearIcon)
+    $fClearLabel = [System.Windows.Documents.Run]::new('  Clear Filter')
+    $fClearLabel.FontSize = 12
+    $fClearContent.Inlines.Add($fClearLabel)
     $fClearBtn.Content = $fClearContent
     $fBtnPanel.Children.Add($fClearBtn) | Out-Null
 
@@ -17968,11 +19889,13 @@ $ctx_UpdateRemoveFilter.Add_Click({
     $fApplyBtn.Style = $Window.FindResource('RoundedButton')
     $fApplyContent = [System.Windows.Controls.TextBlock]::new()
     $fApplyContent.Foreground = [System.Windows.Media.Brushes]::White
-    $fApplyContent.Inlines.Add([System.Windows.Documents.Run]::new([string][char]0xE73E))
-    $fApplyContent.Inlines[0].FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
-    $fApplyContent.Inlines[0].FontSize = 11
-    $fApplyContent.Inlines.Add([System.Windows.Documents.Run]::new('  Apply Filter'))
-    $fApplyContent.Inlines[1].FontSize = 12
+    $fApplyIcon = [System.Windows.Documents.Run]::new([string][char]0xE73E)
+    $fApplyIcon.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+    $fApplyIcon.FontSize = 11
+    $fApplyContent.Inlines.Add($fApplyIcon)
+    $fApplyLabel = [System.Windows.Documents.Run]::new('  Apply Filter')
+    $fApplyLabel.FontSize = 12
+    $fApplyContent.Inlines.Add($fApplyLabel)
     $fApplyBtn.Content = $fApplyContent
     $fBtnPanel.Children.Add($fApplyBtn) | Out-Null
 
@@ -17987,33 +19910,88 @@ $ctx_UpdateRemoveFilter.Add_Click({
     $fPanel.Children.Add($fStatusText) | Out-Null
 
     $fBorder.Child = $fPanel
-    # Merge main window resources so ComboBox pill style is inherited
-    $filterDlg.Resources.MergedDictionaries.Add($Window.Resources)
+    # Give the dialog its own isolated resource dictionary: theme brushes plus copies of the app's
+    # implicit pill ComboBox / ComboBoxItem styles. Merging the live $Window.Resources (the main
+    # window's in-use dictionary) into a second window can raise a resource-collection re-entrancy
+    # error during rendering, so copy only what the dialog needs instead.
+    $fDlgResources = Get-DATThemeResourceDictionary -ThemeName $script:CurrentTheme
+    foreach ($resKey in @('PillComboBoxToggleButton', [System.Windows.Controls.ComboBox], [System.Windows.Controls.ComboBoxItem])) {
+        $resVal = $Window.TryFindResource($resKey)
+        if ($null -ne $resVal) { $fDlgResources[$resKey] = $resVal }
+    }
+    $filterDlg.Resources.MergedDictionaries.Add($fDlgResources)
     $filterDlg.Content = $fBorder
+
+    # Rebuilds the dropdown from the cached filter list, applying the current search text.
+    $script:AssignFilterDlgFilters = @()
+    $populateFilterCombo = {
+        $all = @($script:AssignFilterDlgFilters)
+        $searchText = $fSearchBox.Text
+        $fCombo.Items.Clear()
+
+        if ($all.Count -eq 0) {
+            $emptyItem = [System.Windows.Controls.ComboBoxItem]::new()
+            $emptyItem.Content = 'No filters available'
+            $emptyItem.IsEnabled = $false
+            $fCombo.Items.Add($emptyItem) | Out-Null
+            $fCombo.SelectedIndex = 0
+            $fApplyBtn.IsEnabled = $false
+            $fApplyBtn.Opacity = 0.5
+            return
+        }
+
+        $matchingFilters = if ([string]::IsNullOrWhiteSpace($searchText)) {
+            $all
+        } else {
+            $needle = $searchText.Trim()
+            @($all | Where-Object {
+                $_.displayName -and $_.displayName.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+            })
+        }
+
+        if (@($matchingFilters).Count -eq 0) {
+            $noMatchItem = [System.Windows.Controls.ComboBoxItem]::new()
+            $noMatchItem.Content = 'No matching filters'
+            $noMatchItem.IsEnabled = $false
+            $fCombo.Items.Add($noMatchItem) | Out-Null
+            $fCombo.SelectedIndex = 0
+            $fApplyBtn.IsEnabled = $false
+            $fApplyBtn.Opacity = 0.5
+            return
+        }
+
+        foreach ($f in $matchingFilters) {
+            $fItem = [System.Windows.Controls.ComboBoxItem]::new()
+            $fItem.Content = $f.displayName
+            $fItem.Tag = $f.id
+            $fCombo.Items.Add($fItem) | Out-Null
+        }
+        $fCombo.SelectedIndex = 0
+        $fApplyBtn.IsEnabled = $true
+        $fApplyBtn.Opacity = 1.0
+    }
+
+    # Re-filter the dropdown as the user types, and toggle the placeholder hint.
+    $fSearchBox.Add_TextChanged({
+        $fSearchHint.Visibility = if ([string]::IsNullOrEmpty($fSearchBox.Text)) { 'Visible' } else { 'Collapsed' }
+        if (@($script:AssignFilterDlgFilters).Count -gt 0) { & $populateFilterCombo }
+    })
+
+    # Hide the placeholder while the box has keyboard focus so it never sits under the caret.
+    $fSearchBox.Add_GotKeyboardFocus({ $fSearchHint.Visibility = 'Collapsed' })
+    $fSearchBox.Add_LostKeyboardFocus({
+        if ([string]::IsNullOrEmpty($fSearchBox.Text)) { $fSearchHint.Visibility = 'Visible' }
+    })
 
     # Load filters after dialog renders
     $filterDlg.Add_ContentRendered({
         try {
             $filters = Get-DATIntuneAssignmentFilters
-            $fCombo.Items.Clear()
-            if (@($filters).Count -eq 0) {
-                $emptyItem = [System.Windows.Controls.ComboBoxItem]::new()
-                $emptyItem.Content = 'No filters available'
-                $emptyItem.IsEnabled = $false
-                $fCombo.Items.Add($emptyItem) | Out-Null
-                $fCombo.SelectedIndex = 0
-            } else {
-                foreach ($f in ($filters | Sort-Object -Property displayName)) {
-                    $fItem = [System.Windows.Controls.ComboBoxItem]::new()
-                    $fItem.Content = $f.displayName
-                    $fItem.Tag = $f.id
-                    $fCombo.Items.Add($fItem) | Out-Null
-                }
-                $fCombo.SelectedIndex = 0
-                $fApplyBtn.IsEnabled = $true
-                $fApplyBtn.Opacity = 1.0
-            }
+            $script:AssignFilterDlgFilters = @($filters | Sort-Object -Property displayName)
+            & $populateFilterCombo
+            $fSearchBox.Focus() | Out-Null
         } catch {
+            $script:AssignFilterDlgFilters = @()
             $fCombo.Items.Clear()
             $errItem = [System.Windows.Controls.ComboBoxItem]::new()
             $errItem.Content = "Error loading filters"
@@ -18155,6 +20133,10 @@ $ctx_UpdateRemoveFilter.Add_Click({
     $fBorder.Add_MouseLeftButtonDown({ $filterDlg.DragMove() })
 
     $filterDlg.ShowDialog() | Out-Null
+  } catch {
+    Write-DATActivityLog "Update / Remove Assignment Filter dialog error: $($_.Exception.Message)" -Level Error
+    try { Show-DATInfoDialog -Title 'Assignment Filter' -Type Error -Message "Could not open the assignment filter dialog.`n`n$($_.Exception.Message)" } catch { }
+  }
 })
 
 # Row-click checkbox toggle for IntuneApps grid
@@ -18170,6 +20152,24 @@ $grid_IntuneApps.Add_PreviewMouseLeftButtonDown({
         if ($null -ne $item -and $item.PSObject.Properties['Selected']) {
             $item.Selected = -not $item.Selected
         }
+    }
+})
+
+# Right-click selects the row under the cursor. WPF does not change selection on right-click, so
+# without this a context-menu action taken with NO checkboxes ticked would fall back to the
+# previously-highlighted row rather than the row actually right-clicked. This makes the fallback
+# ($grid_IntuneApps.SelectedItem) target the row you clicked. Checkbox multi-selection is
+# unaffected -- when one or more rows are checked, actions still use the full checked set.
+$grid_IntuneApps.Add_PreviewMouseRightButtonDown({
+    param($s, $e)
+    $dep = $e.OriginalSource
+    while ($null -ne $dep -and $dep -isnot [System.Windows.Controls.DataGridRow]) {
+        if ($dep -is [System.Windows.Controls.Primitives.DataGridColumnHeader]) { return }
+        $dep = [System.Windows.Media.VisualTreeHelper]::GetParent($dep)
+    }
+    if ($null -ne $dep -and $dep -is [System.Windows.Controls.DataGridRow]) {
+        $dep.IsSelected = $true
+        $grid_IntuneApps.SelectedItem = $dep.DataContext
     }
 })
 
@@ -18189,10 +20189,71 @@ $grid_IntuneApps.Add_PreviewKeyDown({
 
 # Auth mode toggle - show/hide app credential fields and interactive app selection panel
 $cmb_IntuneAuthMode = $Window.FindName('cmb_IntuneAuthMode')
+$cmb_IntuneTenantEnvironment = $Window.FindName('cmb_IntuneTenantEnvironment')
 $cmb_InteractiveAppSource = $Window.FindName('cmb_InteractiveAppSource')
 $panel_CustomInteractiveAppId = $Window.FindName('panel_CustomInteractiveAppId')
 $panel_InteractiveAppSelection = $Window.FindName('panel_InteractiveAppSelection')
 $txt_InteractiveAppId = $Window.FindName('txt_InteractiveAppId')
+$txt_InteractiveTenantId = $Window.FindName('txt_InteractiveTenantId')
+
+if ($null -ne $cmb_IntuneTenantEnvironment) {
+    $cmb_IntuneTenantEnvironment.Items.Clear()
+    foreach ($environment in Get-DATIntuneEnvironments) {
+        $item = [System.Windows.Controls.ComboBoxItem]::new()
+        $item.Content = $environment.DisplayName
+        $item.Tag = $environment.Name
+        [void]$cmb_IntuneTenantEnvironment.Items.Add($item)
+    }
+    if ($cmb_IntuneTenantEnvironment.Items.Count -gt 0) {
+        $cmb_IntuneTenantEnvironment.SelectedIndex = 0
+    }
+}
+
+function Get-DATSelectedIntuneTenantEnvironment {
+    if ($null -eq $cmb_IntuneTenantEnvironment -or $null -eq $cmb_IntuneTenantEnvironment.SelectedItem) {
+        return 'Commercial'
+    }
+
+    $tenantEnvironment = [string]$cmb_IntuneTenantEnvironment.SelectedItem.Tag
+    if ([string]::IsNullOrWhiteSpace($tenantEnvironment)) { return 'Commercial' }
+    return $tenantEnvironment
+}
+
+function Set-DATIntuneTenantEnvironmentSelection {
+    param (
+        [string]$TenantEnvironment = 'Commercial'
+    )
+
+    $environmentResult = Resolve-DATIntuneEnvironment -Environment $TenantEnvironment
+    $definition = Set-DATIntuneEnvironment -Environment $environmentResult.Name -Silent
+
+    if ($environmentResult.UsedFallback) {
+        $invalidTenantEnvironment = $environmentResult.RequestedEnvironment
+        try {
+            Set-DATRegistryValue -Name 'IntuneTenantEnvironment' -Value $definition.Name -Type String
+            Write-DATActivityLog "Unsupported saved Intune tenant environment '$invalidTenantEnvironment' -- reset to Commercial" -Level Warn
+        } catch { }
+        try {
+            if ($null -ne $txt_IntuneStatus) {
+                $txt_IntuneStatus.Text = "Unsupported saved tenant environment '$invalidTenantEnvironment'. Reset to Commercial."
+                $txt_IntuneStatus.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                    [System.Windows.Media.ColorConverter]::ConvertFromString(
+                        (Get-DATTheme -ThemeName $script:CurrentTheme)['StatusWarning']))
+            }
+        } catch { }
+    }
+
+    if ($null -ne $cmb_IntuneTenantEnvironment) {
+        foreach ($item in $cmb_IntuneTenantEnvironment.Items) {
+            if ([string]$item.Tag -eq [string]$definition.Name) {
+                $cmb_IntuneTenantEnvironment.SelectedItem = $item
+                break
+            }
+        }
+    }
+
+    return $definition.Name
+}
 
 $cmb_IntuneAuthMode.Add_SelectionChanged({
     if ($cmb_IntuneAuthMode.SelectedIndex -eq 2) {
@@ -18205,6 +20266,22 @@ $cmb_IntuneAuthMode.Add_SelectionChanged({
         $panel_InteractiveAppSelection.Visibility = 'Visible'
     }
     Set-DATRegistryValue -Name 'IntuneAuthMode' -Value $cmb_IntuneAuthMode.SelectedIndex -Type DWord
+})
+
+$cmb_IntuneTenantEnvironment.Add_SelectionChanged({
+    $tenantEnvironment = Get-DATSelectedIntuneTenantEnvironment
+    Set-DATIntuneEnvironment -Environment $tenantEnvironment -Silent | Out-Null
+    Set-DATRegistryValue -Name 'IntuneTenantEnvironment' -Value $tenantEnvironment -Type String
+
+    $authStatus = Get-DATIntuneAuthStatus -NoRefresh
+    if (-not [string]::IsNullOrEmpty($authStatus.Token)) {
+        Disconnect-DATIntuneGraph
+        Update-DATIntuneAuthUI
+        $txt_IntuneStatus.Text = "Tenant environment changed. Authenticate again."
+        $txt_IntuneStatus.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+            [System.Windows.Media.ColorConverter]::ConvertFromString(
+                (Get-DATTheme -ThemeName $script:CurrentTheme)['StatusWarning']))
+    }
 })
 
 # Show/hide custom App ID textbox based on app source selection
@@ -18222,6 +20299,11 @@ $txt_InteractiveAppId.Add_LostFocus({
     Set-DATRegistryValue -Name 'IntuneInteractiveAppId' -Value $val -Type String
 })
 
+$txt_InteractiveTenantId.Add_LostFocus({
+    $val = $txt_InteractiveTenantId.Text.Trim()
+    Set-DATRegistryValue -Name 'IntuneInteractiveTenantId' -Value $val -Type String
+})
+
 # Auth status update helper
 function Update-DATIntuneAuthUI {
     $authStatus = Get-DATIntuneAuthStatus
@@ -18230,7 +20312,7 @@ function Update-DATIntuneAuthUI {
             [System.Windows.Media.ColorConverter]::ConvertFromString(
                 (Get-DATTheme -ThemeName $script:CurrentTheme)['StatusSuccess']))
         $txt_IntuneAuthLabel.Text = "Connected"
-        $txt_IntuneGraphStatus.Text = "Connected to Microsoft Graph -- Tenant: $($authStatus.TenantId)"
+        $txt_IntuneGraphStatus.Text = "Connected to Microsoft Graph ($($authStatus.TenantEnvironmentDisplayName)) -- Tenant: $($authStatus.TenantId)"
         $txt_IntuneGraphStatus.Foreground = [System.Windows.Media.SolidColorBrush]::new(
             [System.Windows.Media.ColorConverter]::ConvertFromString(
                 (Get-DATTheme -ThemeName $script:CurrentTheme)['StatusSuccess']))
@@ -18325,6 +20407,10 @@ function Update-DATIntunePermissionUI {
             $icon.Text = [char]0xE73E  # Checkmark
             $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                 [System.Windows.Media.ColorConverter]::ConvertFromString('#22C55E'))
+        } elseif ($perm.Optional) {
+            $icon.Text = [char]0xE946  # Info -- optional permission not granted
+            $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                [System.Windows.Media.ColorConverter]::ConvertFromString('#F59E0B'))
         } else {
             $icon.Text = [char]0xE711  # X
             $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
@@ -18365,26 +20451,19 @@ function Invoke-DATIntunePermissionCheckAsync {
         [scriptblock]$OnComplete
     )
 
-    $authStatus = Get-DATIntuneAuthStatus
-    $token = $authStatus.Token
-    $tokenExpiry = $authStatus.ExpiresOn
     $script:PermCheckState = [hashtable]::Synchronized(@{
         Status = 'Running'
         Result = $null
     })
 
     $script:PermCheckPS = [powershell]::Create()
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:PermCheckPS -CaptureIntuneAuthContext
     $script:PermCheckPS.AddScript({
-        param ($CoreModulePath, $State, $Token, $TokenExpiry)
-        Import-Module $CoreModulePath -Force
-        Set-DATIntuneAuthToken -Token $Token -ExpiresOn $TokenExpiry
+        param ($State)
         $State.Result = Test-DATIntunePermissions
         $State.Status = 'Complete'
     })
-    [void]$script:PermCheckPS.AddArgument($CoreModulePath)
     [void]$script:PermCheckPS.AddArgument($script:PermCheckState)
-    [void]$script:PermCheckPS.AddArgument($token)
-    [void]$script:PermCheckPS.AddArgument($tokenExpiry)
     $script:PermCheckAsync = $script:PermCheckPS.BeginInvoke()
 
     $script:PermCheckTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -18421,12 +20500,14 @@ $script:IntuneTokenTimer.Add_Tick({
                 $savedAppId = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneAppId' -ErrorAction SilentlyContinue).IntuneAppId
                 $savedEncSecret = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneClientSecret' -ErrorAction SilentlyContinue).IntuneClientSecret
                 $savedAuthMode = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneAuthMode' -ErrorAction SilentlyContinue).IntuneAuthMode
+                $savedTenantEnvironment = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneTenantEnvironment' -ErrorAction SilentlyContinue).IntuneTenantEnvironment
+                if ([string]::IsNullOrEmpty($savedTenantEnvironment)) { $savedTenantEnvironment = Get-DATSelectedIntuneTenantEnvironment }
                 if ($savedAuthMode -eq 2 -and -not [string]::IsNullOrEmpty($savedTenantId) -and
                     -not [string]::IsNullOrEmpty($savedAppId) -and -not [string]::IsNullOrEmpty($savedEncSecret)) {
                     $secStr = ConvertTo-SecureString -String $savedEncSecret
                     $plainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
                         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secStr))
-                    $ccResult = Connect-DATIntuneGraphClientCredential -TenantId $savedTenantId -AppId $savedAppId -ClientSecret $plainSecret
+                    $ccResult = Connect-DATIntuneGraphClientCredential -TenantId $savedTenantId -AppId $savedAppId -ClientSecret $plainSecret -TenantEnvironment $savedTenantEnvironment
                     if ($ccResult.Success) {
                         $ccRenewed = $true
                         Write-DATActivityLog "Token renewed silently using saved client credentials" -Level Info
@@ -18466,12 +20547,14 @@ $script:IntuneTokenTimer.Add_Tick({
                     $savedAppId = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneAppId' -ErrorAction SilentlyContinue).IntuneAppId
                     $savedEncSecret = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneClientSecret' -ErrorAction SilentlyContinue).IntuneClientSecret
                     $savedAuthMode = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneAuthMode' -ErrorAction SilentlyContinue).IntuneAuthMode
+                    $savedTenantEnvironment = (Get-ItemProperty -Path $global:RegPath -Name 'IntuneTenantEnvironment' -ErrorAction SilentlyContinue).IntuneTenantEnvironment
+                    if ([string]::IsNullOrEmpty($savedTenantEnvironment)) { $savedTenantEnvironment = Get-DATSelectedIntuneTenantEnvironment }
                     if ($savedAuthMode -eq 2 -and -not [string]::IsNullOrEmpty($savedTenantId) -and
                         -not [string]::IsNullOrEmpty($savedAppId) -and -not [string]::IsNullOrEmpty($savedEncSecret)) {
                         $secStr = ConvertTo-SecureString -String $savedEncSecret
                         $plainSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
                             [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secStr))
-                        $ccResult = Connect-DATIntuneGraphClientCredential -TenantId $savedTenantId -AppId $savedAppId -ClientSecret $plainSecret
+                        $ccResult = Connect-DATIntuneGraphClientCredential -TenantId $savedTenantId -AppId $savedAppId -ClientSecret $plainSecret -TenantEnvironment $savedTenantEnvironment
                         if ($ccResult.Success) {
                             $ccProactive = $true
                             Write-DATActivityLog "Token renewed proactively using saved client credentials (was expiring in $($status.MinutesRemaining) min)" -Level Info
@@ -18676,8 +20759,13 @@ $btn_ConnectIntune.Add_Click({
         [System.Windows.Media.ColorConverter]::ConvertFromString(
             (Get-DATTheme -ThemeName $script:CurrentTheme)['StatusInfo']))
 
-    # Resolve the client ID to use for interactive flows
-    $interactiveClientId = if ($cmb_InteractiveAppSource.SelectedIndex -eq 1) {
+    # Resolve the client ID to use for interactive flows. Only relevant for the interactive auth
+    # modes (Browser = 0, Device Code = 1). App Registration (Client Credentials, mode 2) uses the
+    # Tenant ID / App ID / Client Secret fields instead, so the interactive app source must be
+    # ignored there -- otherwise a leftover "Custom App Registration" selection would wrongly block
+    # a client-credentials connect with "no App ID entered".
+    $isInteractiveAuthMode = ($cmb_IntuneAuthMode.SelectedIndex -ne 2)
+    $interactiveClientId = if ($isInteractiveAuthMode -and $cmb_InteractiveAppSource.SelectedIndex -eq 1) {
         $customId = $txt_InteractiveAppId.Text.Trim()
         if ([string]::IsNullOrEmpty($customId)) {
             $txt_IntuneStatus.Text = "Custom App Registration selected but no App ID entered."
@@ -18691,6 +20779,16 @@ $btn_ConnectIntune.Add_Click({
     } else {
         $null   # let the function use the built-in default
     }
+    # Optional tenant ID for single-tenant custom app registrations (interactive flows only).
+    $interactiveTenantId = if ($isInteractiveAuthMode -and $cmb_InteractiveAppSource.SelectedIndex -eq 1) {
+        $tid = $txt_InteractiveTenantId.Text.Trim()
+        if ([string]::IsNullOrEmpty($tid)) { $null } else { $tid }
+    } else {
+        $null
+    }
+    $tenantEnvironment = Get-DATSelectedIntuneTenantEnvironment
+    Set-DATIntuneEnvironment -Environment $tenantEnvironment -Silent | Out-Null
+    Set-DATRegistryValue -Name 'IntuneTenantEnvironment' -Value $tenantEnvironment -Type String
 
     if ($cmb_IntuneAuthMode.SelectedIndex -eq 0) {
         # --- Interactive (Browser) - Auth Code + PKCE ---
@@ -18711,6 +20809,8 @@ $btn_ConnectIntune.Add_Click({
             $browserParams['ClientId']   = $interactiveClientId
             $browserParams['FixedPort']  = 38400
         }
+        if ($null -ne $interactiveTenantId) { $browserParams['TenantId'] = $interactiveTenantId }
+        $browserParams['TenantEnvironment'] = $tenantEnvironment
         $setupResult = Connect-DATIntuneGraphInteractive @browserParams
 
         if (-not $setupResult.Success) {
@@ -18823,9 +20923,9 @@ $btn_ConnectIntune.Add_Click({
         }
 
         $txt_IntuneStatus.Text = "Authenticating with client credentials..."
-        Write-DATActivityLog "Authenticating with client credentials for tenant $tenantId" -Level Info
+        Write-DATActivityLog "Authenticating with client credentials for tenant $tenantId ($tenantEnvironment)" -Level Info
 
-        $result = Connect-DATIntuneGraphClientCredential -TenantId $tenantId -AppId $appId -ClientSecret $secret
+        $result = Connect-DATIntuneGraphClientCredential -TenantId $tenantId -AppId $appId -ClientSecret $secret -TenantEnvironment $tenantEnvironment
 
         if ($result.Success) {
             Update-DATIntuneAuthUI
@@ -18867,6 +20967,7 @@ $btn_ConnectIntune.Add_Click({
             Set-DATRegistryValue -Name 'IntuneTenantId' -Value $tenantId -Type String
             Set-DATRegistryValue -Name 'IntuneAppId' -Value $appId -Type String
             Set-DATRegistryValue -Name 'IntuneAuthMode' -Value 2 -Type DWord
+            Set-DATRegistryValue -Name 'IntuneTenantEnvironment' -Value $tenantEnvironment -Type String
             try {
                 $secSecret = ConvertTo-SecureString -String $secret -AsPlainText -Force
                 $encSecret = ConvertFrom-SecureString -SecureString $secSecret
@@ -18914,6 +21015,8 @@ $btn_ConnectIntune.Add_Click({
 
         $dcParams = @{}
         if ($null -ne $interactiveClientId) { $dcParams['ClientId'] = $interactiveClientId }
+        if ($null -ne $interactiveTenantId) { $dcParams['TenantId'] = $interactiveTenantId }
+        $dcParams['TenantEnvironment'] = $tenantEnvironment
         $dcResult = Connect-DATIntuneGraph @dcParams
 
         if (-not $dcResult.Success) {
@@ -19149,14 +21252,10 @@ $btn_VerifyIntunePermissions.Add_Click({
         @{ Name = 'DeviceManagementApps.ReadWrite.All'; Description = 'Create and manage Win32 app packages' }
         @{ Name = 'DeviceManagementManagedDevices.Read.All'; Description = 'Read managed devices for model lookup' }
         @{ Name = 'GroupMember.Read.All'; Description = 'Read group memberships for deployment targeting' }
+        # Optional -- only needed for the assignment filter feature. Always shown (mirrors
+        # Test-DATIntunePermissions) so it is never invisible; a missing result is informational.
+        @{ Name = 'DeviceManagementConfiguration.ReadWrite.All'; Description = 'Create and manage assignment filters (optional)'; Optional = $true }
     )
-
-    # Assignment filter automation requires an extra permission. The backend only checks
-    # it when AutoAssignmentFilter is enabled, so add the matching placeholder row here.
-    $autoFilterReg = (Get-ItemProperty -Path $global:RegPath -Name 'AutoAssignmentFilter' -ErrorAction SilentlyContinue).AutoAssignmentFilter
-    if ($null -ne $autoFilterReg -and $autoFilterReg -eq 1) {
-        $requiredPerms += @{ Name = 'DeviceManagementConfiguration.ReadWrite.All'; Description = 'Create and manage assignment filters' }
-    }
     $script:PermDlgIcons = @{}
     foreach ($rp in $requiredPerms) {
         $rpRow = [System.Windows.Controls.Grid]::new()
@@ -19214,25 +21313,18 @@ $btn_VerifyIntunePermissions.Add_Click({
     $script:PermDlg.Content = $permBorder
 
     # Start the permission check background runspace BEFORE showing the dialog
-    $authStatus = Get-DATIntuneAuthStatus
-    $token = $authStatus.Token
-    $tokenExpiry = $authStatus.ExpiresOn
     $script:PermVerifyState = [hashtable]::Synchronized(@{
         Status = 'Running'
         Result = $null
     })
     $script:PermVerifyPS = [powershell]::Create()
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:PermVerifyPS -CaptureIntuneAuthContext
     $script:PermVerifyPS.AddScript({
-        param ($ModulePath, $State, $Token, $TokenExpiry)
-        Import-Module $ModulePath -Force
-        Set-DATIntuneAuthToken -Token $Token -ExpiresOn $TokenExpiry
+        param ($State)
         $State.Result = Test-DATIntunePermissions
         $State.Status = 'Complete'
     })
-    [void]$script:PermVerifyPS.AddArgument($CoreModulePath)
     [void]$script:PermVerifyPS.AddArgument($script:PermVerifyState)
-    [void]$script:PermVerifyPS.AddArgument($token)
-    [void]$script:PermVerifyPS.AddArgument($tokenExpiry)
     $script:PermVerifyAsync = $script:PermVerifyPS.BeginInvoke()
 
     # Poll timer fires during the ShowDialog message pump
@@ -19249,6 +21341,10 @@ $btn_VerifyIntunePermissions.Add_Click({
                     $icon.Text = [string][char]0xE73E  # Checkmark
                     $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                         [System.Windows.Media.ColorConverter]::ConvertFromString('#22C55E'))
+                } elseif ($p.Optional) {
+                    $icon.Text = [string][char]0xE946  # Info -- optional permission not granted
+                    $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+                        [System.Windows.Media.ColorConverter]::ConvertFromString('#F59E0B'))
                 } else {
                     $icon.Text = [string][char]0xE711  # X
                     $icon.Foreground = [System.Windows.Media.SolidColorBrush]::new(
@@ -19265,7 +21361,7 @@ $btn_VerifyIntunePermissions.Add_Click({
                 $script:PermDlgSummary.Foreground = [System.Windows.Media.SolidColorBrush]::new(
                     [System.Windows.Media.ColorConverter]::ConvertFromString('#22C55E'))
             } else {
-                $denied = ($result.Permissions | Where-Object { $_.Status -ne 'Granted' }).Count
+                $denied = ($result.Permissions | Where-Object { $_.Status -ne 'Granted' -and -not $_.Optional }).Count
                 $script:PermDlgSummary.Inlines.Clear()
                 $iconRun = [System.Windows.Documents.Run]::new([string][char]0xE7BA + '  ')
                 $iconRun.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
@@ -19313,15 +21409,19 @@ $btn_ResetIntuneAuth.Add_Click({
     Remove-ItemProperty -Path $global:RegPath -Name 'IntuneAppId'               -Force -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $global:RegPath -Name 'IntuneClientSecret'        -Force -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $global:RegPath -Name 'IntuneAuthMode'            -Force -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $global:RegPath -Name 'IntuneTenantEnvironment'   -Force -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $global:RegPath -Name 'IntuneInteractiveAppSource' -Force -ErrorAction SilentlyContinue
     Remove-ItemProperty -Path $global:RegPath -Name 'IntuneInteractiveAppId'    -Force -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $global:RegPath -Name 'IntuneInteractiveTenantId' -Force -ErrorAction SilentlyContinue
 
     # Clear UI fields
     $txt_IntuneTenantId.Text = ''
     $txt_IntuneAppId.Text = ''
     $txt_IntuneClientSecret.Password = ''
     $txt_InteractiveAppId.Text = ''
+    $txt_InteractiveTenantId.Text = ''
     $cmb_IntuneAuthMode.SelectedIndex = 0
+    Set-DATIntuneTenantEnvironmentSelection -TenantEnvironment 'Commercial' | Out-Null
     $cmb_InteractiveAppSource.SelectedIndex = 0
     $panel_CustomInteractiveAppId.Visibility = 'Collapsed'
 
@@ -19367,12 +21467,14 @@ function Invoke-DATIntuneAppRefresh {
     })
 
     $script:AppRefreshPS = [powershell]::Create()
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:AppRefreshPS -CaptureIntuneAuthContext
     $script:AppRefreshPS.AddScript({
-        param ($CoreModulePath, $State, $Token, $TokenExpiry)
-        Import-Module $CoreModulePath -Force
-        Set-DATIntuneAuthToken -Token $Token -ExpiresOn $TokenExpiry
+        param ($State)
         try {
-            $allApps = Get-DATIntuneWin32Apps | Where-Object { $_.notes -eq 'Created by the Driver Automation Tool' }
+            # Match both the legacy exact notes value and the newer versioned form
+            # ("Created by the Driver Automation Tool v10.x.x (build ...)") so packages built on
+            # either release are listed.
+            $allApps = Get-DATIntuneWin32Apps | Where-Object { $_.notes -like 'Created by the Driver Automation Tool*' }
             $State.Apps = @($allApps)
             $State.Status = 'Complete'
         } catch {
@@ -19380,11 +21482,7 @@ function Invoke-DATIntuneAppRefresh {
             $State.Status = 'Failed'
         }
     })
-    $authStatus = Get-DATIntuneAuthStatus
-    [void]$script:AppRefreshPS.AddArgument($CoreModulePath)
     [void]$script:AppRefreshPS.AddArgument($script:AppRefreshState)
-    [void]$script:AppRefreshPS.AddArgument($authStatus.Token)
-    [void]$script:AppRefreshPS.AddArgument($authStatus.ExpiresOn)
     $script:AppRefreshAsync = $script:AppRefreshPS.BeginInvoke()
 
     $script:AppRefreshTimer = New-Object System.Windows.Threading.DispatcherTimer
@@ -19621,7 +21719,7 @@ $btn_Detail_CopyId.Add_Click({
 
 # Delete selected apps
 $btn_DeleteIntuneApp.Add_Click({
-    $selectedApps = @($script:IntuneAppsData | Where-Object { $_.Selected -eq $true })
+    $selectedApps = Get-DATCheckedIntuneApps
     if ($selectedApps.Count -eq 0) {
         $txt_IntuneStatus.Text = "No applications selected."
         return
@@ -19796,10 +21894,9 @@ $btn_DeleteIntuneApp.Add_Click({
 
     $script:deletePS = [powershell]::Create()
     $script:deletePS.Runspace = $script:deleteRunspace
+    Add-DATCoreRunspaceBootstrap -PowerShell $script:deletePS -CaptureIntuneAuthContext
     [void]$script:deletePS.AddScript({
-        param ($CoreModulePath, $AppIds, $AppNames, $State, $Token, $TokenExpiry)
-        Import-Module $CoreModulePath -Force
-        Set-DATIntuneAuthToken -Token $Token -ExpiresOn $TokenExpiry
+        param ($AppIds, $AppNames, $State)
         for ($i = 0; $i -lt $AppIds.Count; $i++) {
             if ($State.CancelRequested) {
                 $State.Cancelled = $true
@@ -19816,13 +21913,9 @@ $btn_DeleteIntuneApp.Add_Click({
         }
         $State.Done = $true
     })
-    $authStatus = Get-DATIntuneAuthStatus
-    [void]$script:deletePS.AddArgument($CoreModulePath)
     [void]$script:deletePS.AddArgument($appIds)
     [void]$script:deletePS.AddArgument($appNames)
     [void]$script:deletePS.AddArgument($script:deleteState)
-    [void]$script:deletePS.AddArgument($authStatus.Token)
-    [void]$script:deletePS.AddArgument($authStatus.ExpiresOn)
     $script:deleteAsync = $script:deletePS.BeginInvoke()
 
     # Poll timer to update modal UI
@@ -19890,7 +21983,7 @@ $btn_DeleteIntuneApp.Add_Click({
 })
 
 function Update-DATIntuneDeleteButtonState {
-    $selectedCount = @($script:IntuneAppsData | Where-Object { $_.Selected -eq $true }).Count
+    $selectedCount = (Get-DATCheckedIntuneApps).Count
     $btn_DeleteIntuneApp.IsEnabled = ($selectedCount -gt 0)
 }
 
@@ -21602,7 +23695,19 @@ try {
             Write-Host "Disabled" -ForegroundColor DarkYellow
         }
 
-        # Restore Create IntuneWin Only
+        # Restore Custom Deployment Target Group
+        Write-Host "  Target Group  : " -NoNewline -ForegroundColor DarkGray
+        if (-not [string]::IsNullOrEmpty($savedConfig.DeployTargetGroupId)) {
+            $groupName = if (-not [string]::IsNullOrEmpty($savedConfig.DeployTargetGroupName)) { $savedConfig.DeployTargetGroupName } else { $savedConfig.DeployTargetGroupId }
+            $txt_DeployGroupSelectedName.Text = $groupName
+            $txt_DeployGroupSelectedId.Text = $savedConfig.DeployTargetGroupId
+            $panel_DeployGroupSelected.Visibility = 'Visible'
+            Write-Host "$groupName" -ForegroundColor Cyan
+        } else {
+            $panel_DeployGroupSelected.Visibility = 'Collapsed'
+            Write-Host "All Devices (default)" -ForegroundColor DarkYellow
+        }
+
         Write-Host "  IntuneWin Only: " -NoNewline -ForegroundColor DarkGray
         if ($null -ne $savedConfig.IntuneCreateWinOnly -and $savedConfig.IntuneCreateWinOnly -eq 1) {
             $chk_CreateIntuneWinOnly.IsChecked = $true
@@ -22069,10 +24174,6 @@ try {
         Write-Host "  Console Folder: " -NoNewline -ForegroundColor DarkGray
         if ($null -ne $savedConfig.CustomConsoleFolderEnabled -and $savedConfig.CustomConsoleFolderEnabled -eq 1) {
             if ($null -ne $chk_CustomConsoleFolder) { $chk_CustomConsoleFolder.IsChecked = $true }
-            if ($null -ne $txt_CustomConsoleFolderState) {
-                $txt_CustomConsoleFolderState.Text = 'Custom Folder'
-                $txt_CustomConsoleFolderState.Foreground = $Window.FindResource('AccentColor')
-            }
             if ($null -ne $panel_ConsoleFolderPicker) { $panel_ConsoleFolderPicker.Visibility = 'Visible' }
             if (-not [string]::IsNullOrEmpty($savedConfig.ConsoleFolderPath)) {
                 if ($null -ne $txt_ConsoleFolderPath) { $txt_ConsoleFolderPath.Text = "Packages (Root)\$($savedConfig.ConsoleFolderPath)" }
@@ -22085,7 +24186,6 @@ try {
             }
         } else {
             if ($null -ne $chk_CustomConsoleFolder) { $chk_CustomConsoleFolder.IsChecked = $false }
-            if ($null -ne $txt_CustomConsoleFolderState) { $txt_CustomConsoleFolderState.Text = 'Use Default' }
             if ($null -ne $panel_ConsoleFolderPicker) { $panel_ConsoleFolderPicker.Visibility = 'Collapsed' }
             Write-Host "Use Default" -ForegroundColor DarkYellow
         }
@@ -22133,7 +24233,17 @@ try {
             Write-Host "Disabled" -ForegroundColor DarkYellow
         }
 
-        # Restore Intune Auth Mode and App Registration credentials
+        # Restore Intune tenant environment, auth mode, and app registration credentials
+        $savedTenantEnvironment = if (-not [string]::IsNullOrEmpty($savedConfig.IntuneTenantEnvironment)) {
+            $savedConfig.IntuneTenantEnvironment
+        } else {
+            'Commercial'
+        }
+        Set-DATIntuneTenantEnvironmentSelection -TenantEnvironment $savedTenantEnvironment | Out-Null
+        $tenantEnvironmentInfo = Get-DATIntuneEnvironment
+        Write-Host "  Intune Env    : " -NoNewline -ForegroundColor DarkGray
+        Write-Host $tenantEnvironmentInfo.DisplayName -ForegroundColor White
+
         if ($null -ne $savedConfig.IntuneAuthMode) {
             $cmb_IntuneAuthMode.SelectedIndex = [int]$savedConfig.IntuneAuthMode
             Write-Host "  Intune Auth   : " -NoNewline -ForegroundColor DarkGray
@@ -22166,6 +24276,11 @@ try {
             $txt_InteractiveAppId.Text = $savedConfig.IntuneInteractiveAppId
             Write-Host "  Custom App ID : " -NoNewline -ForegroundColor DarkGray
             Write-Host $savedConfig.IntuneInteractiveAppId -ForegroundColor White
+        }
+        if (-not [string]::IsNullOrEmpty($savedConfig.IntuneInteractiveTenantId)) {
+            $txt_InteractiveTenantId.Text = $savedConfig.IntuneInteractiveTenantId
+            Write-Host "  Interactive Tenant ID : " -NoNewline -ForegroundColor DarkGray
+            Write-Host $savedConfig.IntuneInteractiveTenantId -ForegroundColor White
         }
         if (-not [string]::IsNullOrEmpty($savedConfig.IntuneTenantId)) {
             $txt_IntuneTenantId.Text = $savedConfig.IntuneTenantId
@@ -22227,6 +24342,12 @@ try {
             '7zip'  { 'Controls compression when creating WIM packages. Fast (-mx=1) is recommended for most scenarios. Maximum (-mx=9) produces smaller files but is significantly slower.' }
             default { 'Controls compression when creating WIM packages. Fast (XPRESS) is recommended for most scenarios. Maximum (LZX) produces smaller files but is significantly slower.' }
         }
+        # 7-Zip does not support WIM compression -- hide the compression level options
+        $panel_WimCompression.Visibility = if ($restoredEngine -eq '7zip') {
+            [System.Windows.Visibility]::Collapsed
+        } else {
+            [System.Windows.Visibility]::Visible
+        }
 
         # Restore DISM Compression Level
         Write-Host "  DISM Compress : " -NoNewline -ForegroundColor DarkGray
@@ -22257,6 +24378,22 @@ try {
         } else {
             Write-Host "  Dist Priority : " -NoNewline -ForegroundColor DarkGray
             Write-Host "Normal (default)" -ForegroundColor DarkYellow
+        }
+
+        # Restore Download Engine (#876)
+        if ($null -ne $cmb_DownloadEngine) {
+            Write-Host "  Download Eng. : " -NoNewline -ForegroundColor DarkGray
+            if (-not [string]::IsNullOrEmpty($savedConfig.DownloadEngine)) {
+                Write-Host $savedConfig.DownloadEngine -ForegroundColor White
+                foreach ($item in $cmb_DownloadEngine.Items) {
+                    if ($item.Content -eq $savedConfig.DownloadEngine) {
+                        $cmb_DownloadEngine.SelectedItem = $item
+                        break
+                    }
+                }
+            } else {
+                Write-Host "CURL + .NET HttpClient (Fallback) (default)" -ForegroundColor DarkYellow
+            }
         }
 
         # Restore CURL Running Mode
@@ -22391,7 +24528,7 @@ if (Test-Path $logoPath) {
 
 # Read version from module manifest
 $manifestPath = Join-Path $AppRoot "Modules\DriverAutomationToolCore\DriverAutomationToolCore.psd1"
-$script:versionString = "v10.1.5"
+$script:versionString = "v10.1.8"
 if (Test-Path $manifestPath) {
     $manifestData = Import-PowerShellDataFile $manifestPath
     $ver = [version]$manifestData.ModuleVersion
@@ -22511,6 +24648,7 @@ $script:splash.ShowDialog() | Out-Null
 
 # Auto-connect Intune if App Registration (client credentials) mode was saved
 if ($cmb_IntuneAuthMode.SelectedIndex -eq 2) {
+    $autoTenantEnvironment = Get-DATSelectedIntuneTenantEnvironment
     $autoTenantId = $txt_IntuneTenantId.Text.Trim()
     $autoAppId    = $txt_IntuneAppId.Text.Trim()
     $autoSecret   = $txt_IntuneClientSecret.Password
@@ -22519,8 +24657,8 @@ if ($cmb_IntuneAuthMode.SelectedIndex -eq 2) {
         -not [string]::IsNullOrEmpty($autoSecret)) {
         Write-Host "  Intune        : " -NoNewline -ForegroundColor DarkGray
         Write-Host "Auto-connecting with saved client credentials..." -ForegroundColor Cyan
-        Write-DATActivityLog "Auto-connecting to Intune with saved client credentials (tenant: $autoTenantId)" -Level Info
-        $autoResult = Connect-DATIntuneGraphClientCredential -TenantId $autoTenantId -AppId $autoAppId -ClientSecret $autoSecret
+        Write-DATActivityLog "Auto-connecting to Intune with saved client credentials (environment: $autoTenantEnvironment, tenant: $autoTenantId)" -Level Info
+        $autoResult = Connect-DATIntuneGraphClientCredential -TenantId $autoTenantId -AppId $autoAppId -ClientSecret $autoSecret -TenantEnvironment $autoTenantEnvironment
         if ($autoResult.Success) {
             Update-DATIntuneAuthUI
             $script:IntuneTokenTimer.Start()
@@ -22560,6 +24698,9 @@ if ($cmb_Platform.SelectedItem -and $cmb_Platform.SelectedItem.Content -eq 'Intu
     Start-DATPanelAnimation -Panel $intuneSubPanel -Expand $true
     Set-DATActiveView -ViewName 'view_IntuneSettings' -NavButtonName 'nav_IntuneAuth'
 }
+
+# Reflect the restored 'Create .intunewin only' + platform state in the Model Selection banner.
+try { Update-DATCreateWinOnlyBanner } catch { }
 
 # Shutdown handler -- shows a modal with status messages during exit
 $script:WindowClosing = $false
@@ -23468,7 +25609,7 @@ $Window.Add_ContentRendered({
         # DispatcherFrame keeps the UI message pump alive while we wait -- so the calling code
         # below (update check, etc.) still runs sequentially after completion.
         $connState = [hashtable]::Synchronized(@{
-            Current = 0; Total = 0; Url = 'Preparing...'; Done = $false; Results = $null
+            Current = 0; Total = 0; Url = 'Preparing...'; Done = $false; Results = $null; TimedOut = $false
         })
 
         $connRunspace = [runspacefactory]::CreateRunspace()
@@ -23477,7 +25618,9 @@ $Window.Add_ContentRendered({
         $connRunspace.SessionStateProxy.SetVariable('ConnState', $connState)
         $connPS = [powershell]::Create()
         $connPS.Runspace = $connRunspace
+        $intuneConnectivityEnvironment = Get-DATIntuneEnvironment
         [void]$connPS.AddScript({
+            param ($AuthorityHost, $GraphResource)
             [System.Net.ServicePointManager]::SecurityProtocol =
                 [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
 
@@ -23490,47 +25633,72 @@ $Window.Add_ContentRendered({
                 @{ URL = 'https://ftp.hp.com';                 Description = 'HP driver catalog and SoftPaqs' }
                 @{ URL = 'https://download.lenovo.com';        Description = 'Lenovo driver catalog' }
                 @{ URL = 'https://global-download.acer.com';   Description = 'Acer driver and BIOS catalog' }
-                @{ URL = 'https://login.microsoftonline.com';  Description = 'Microsoft Entra ID (Intune authentication)' }
-                @{ URL = 'https://graph.microsoft.com';        Description = 'Microsoft Graph API (Intune management)' }
+                @{ URL = $AuthorityHost;                       Description = 'Microsoft Entra ID (Intune authentication)' }
+                @{ URL = $GraphResource;                       Description = 'Microsoft Graph API (Intune management)' }
             )
             $ConnState.Total = $endpoints.Count
+            # One retry (2 attempts) clears the common cold-start timeout without dragging startup
+            # out. Only endpoints that fail the first attempt pay for the retry.
+            $connMaxAttempts = 2
             $results = foreach ($ep in $endpoints) {
-                $ConnState.Url = $ep.URL
                 $reachable = $false
-                try {
-                    $request = [System.Net.HttpWebRequest]::Create($ep.URL)
-                    $request.Method = 'HEAD'
-                    $request.Timeout = 8000
-                    $request.AllowAutoRedirect = $true
+                # Retry transient failures. The first hit to a host pays the full cold-start
+                # DNS + TCP + TLS cost (which can exceed the timeout at startup or behind a proxy);
+                # retries reuse cached DNS/connections and clear most false failures. Only DNS/TCP/
+                # TLS/timeout errors count as unreachable, and only after every attempt has failed.
+                for ($connAttempt = 1; $connAttempt -le $connMaxAttempts; $connAttempt++) {
+                    # Surface the current activity (including retries) so the overlay label never
+                    # sits frozen while a slow endpoint is being re-probed.
+                    $ConnState.Url = if ($connAttempt -eq 1) { $ep.URL } else { "$($ep.URL)  --  retry $connAttempt of $connMaxAttempts" }
                     try {
-                        $response = $request.GetResponse()
-                        $response.Close()
-                        $reachable = $true
-                    } catch [System.Net.WebException] {
-                        # Any HTTP response (4xx/5xx) means the host IS reachable
-                        if ($null -ne $_.Exception.Response) {
+                        $request = [System.Net.HttpWebRequest]::Create($ep.URL)
+                        $request.Method = 'HEAD'
+                        # Give the cold first attempt more headroom; retries hit warm DNS/connections.
+                        $request.Timeout = if ($connAttempt -eq 1) { 8000 } else { 5000 }
+                        $request.AllowAutoRedirect = $true
+                        $request.UserAgent = 'DriverAutomationTool/ConnectivityCheck'
+                        try {
+                            $response = $request.GetResponse()
+                            $response.Close()
                             $reachable = $true
-                            $_.Exception.Response.Close()
+                        } catch [System.Net.WebException] {
+                            # Any HTTP response (4xx/5xx) means the host IS reachable
+                            if ($null -ne $_.Exception.Response) {
+                                $reachable = $true
+                                $_.Exception.Response.Close()
+                            }
                         }
-                    }
-                } catch { $reachable = $false }
+                    } catch { $reachable = $false }
+                    if ($reachable) { break }
+                    if ($connAttempt -lt $connMaxAttempts) { Start-Sleep -Milliseconds (400 * $connAttempt) }
+                }
                 $ConnState.Current++
                 [PSCustomObject]@{ URL = $ep.URL; Description = $ep.Description; Reachable = $reachable }
             }
             $ConnState.Results = @($results)
             $ConnState.Done = $true
         })
+        [void]$connPS.AddArgument($intuneConnectivityEnvironment.AuthorityHost)
+        [void]$connPS.AddArgument($intuneConnectivityEnvironment.GraphResource)
         $connAsync = $connPS.BeginInvoke()
 
         # DispatcherFrame keeps the UI pumping; the timer ends the frame when the probe finishes.
         $connFrame = [System.Windows.Threading.DispatcherFrame]::new()
         $connTimer = [System.Windows.Threading.DispatcherTimer]::new()
         $connTimer.Interval = [TimeSpan]::FromMilliseconds(120)
+        # Failsafe: never let the overlay block startup indefinitely. Worst-case sequential
+        # probing (all endpoints failing both attempts) is well under this budget, so the
+        # deadline only fires if the background runspace stalls or crashes.
+        $connDeadlineTick = [Environment]::TickCount + 150000
         $connTimer.Add_Tick({
             $connUrlLabel.Text = [string]$connState.Url
             if ($connState.Total -gt 0) {
                 $connProgress.Value = [math]::Round(($connState.Current / $connState.Total) * 100)
                 $connCounter.Text = "$($connState.Current) of $($connState.Total)"
+            }
+            if (-not $connState.Done -and [Environment]::TickCount -ge $connDeadlineTick) {
+                $connState.TimedOut = $true
+                $connState.Done = $true
             }
             if ($connState.Done) {
                 $connTimer.Stop()
@@ -23540,8 +25708,13 @@ $Window.Add_ContentRendered({
         $connTimer.Start()
         [System.Windows.Threading.Dispatcher]::PushFrame($connFrame)
 
-        # Probe complete -- collect results and tear down the runspace
-        try { $connPS.EndInvoke($connAsync) } catch { }
+        # Probe complete (or failsafe deadline reached) -- collect results and tear down the runspace
+        if ($connState.TimedOut) {
+            Write-DATActivityLog "Connectivity check exceeded its time budget -- continuing startup without blocking" -Level Warn
+            try { $connPS.Stop() } catch { }
+        } else {
+            try { $connPS.EndInvoke($connAsync) } catch { }
+        }
         $connPS.Dispose()
         $connRunspace.Dispose()
         $connectivityResults = @($connState.Results)

@@ -4,7 +4,7 @@
      Organization:  MSEndpointMgr / Patch My PC
      Filename:      DriverAutomationToolCore.psm1
      Purpose:       Core functions for Driver Automation Tool v2.0
-     Version:       10.1.5.0
+     Version:       10.1.8.0
     ===========================================================================
 #>
 
@@ -37,8 +37,8 @@ if ($PSVersionTable.PSVersion.Major -le 5) {
 
 #region Variables
 
-[version]$global:ScriptRelease = "10.1.5.0"
-$global:ScriptBuildDate = "25-06-2026"
+[version]$global:ScriptRelease = "10.1.8.0"
+$global:ScriptBuildDate = "24-07-2026"
 $global:ReleaseNotesURL = "https://raw.githubusercontent.com/maurice-daly/DriverAutomationTool/master/Data/DriverAutomationToolNotes.txt"
 $OEMLinksURL = "https://raw.githubusercontent.com/maurice-daly/DriverAutomationTool/master/Data/OEMLinks.xml"
 
@@ -1024,11 +1024,20 @@ function Invoke-DATContentDownload {
     $curlSource = (Get-ItemProperty -Path $global:RegPath -Name 'CurlSource' -ErrorAction SilentlyContinue).CurlSource
     $useBuiltInOnly = ($curlSource -eq 'Built-in (System)')
 
-    if (-not $useBuiltInOnly -and -not [string]::IsNullOrEmpty($global:ToolsDirectory)) {
+    # Download engine preference (#876): allow skipping curl entirely and downloading via
+    # the native .NET HttpClient. When set, curl detection/execution is bypassed and the
+    # HttpClient path below runs as the primary engine (with Invoke-WebRequest/BITS fallback).
+    $downloadEngine = (Get-ItemProperty -Path $global:RegPath -Name 'DownloadEngine' -ErrorAction SilentlyContinue).DownloadEngine
+    $forceHttpClient = ($downloadEngine -eq '.NET HttpClient')
+    if ($forceHttpClient) {
+        Write-DATLogEntry -Value "- Download engine set to .NET HttpClient -- skipping curl" -Severity 1
+    }
+
+    if (-not $forceHttpClient -and -not $useBuiltInOnly -and -not [string]::IsNullOrEmpty($global:ToolsDirectory)) {
         $CurlProcess = Get-ChildItem -Path "$global:ToolsDirectory" -Recurse -Filter "Curl.exe" -ErrorAction SilentlyContinue |
             Select-Object -First 1 -ExpandProperty FullName
     }
-    $useCurl = (-not $useBuiltInOnly) -and (-not [string]::IsNullOrEmpty($CurlProcess)) -and (Test-Path -Path "$CurlProcess")
+    $useCurl = (-not $forceHttpClient) -and (-not $useBuiltInOnly) -and (-not [string]::IsNullOrEmpty($CurlProcess)) -and (Test-Path -Path "$CurlProcess")
 
     if ($useCurl) {
         Write-DATLogEntry -Value "- CURL detected at $CurlProcess" -Severity 1
@@ -1088,7 +1097,7 @@ function Invoke-DATContentDownload {
     }
 
     # Fall back to system curl.exe (built-in on Windows 10 1803+)
-    if (-not $useCurl) {
+    if (-not $useCurl -and -not $forceHttpClient) {
         if ($useBuiltInOnly) {
             Write-DATLogEntry -Value "- CURL source set to Built-in (System) -- skipping bundled curl" -Severity 1
         }
@@ -1441,6 +1450,18 @@ function Invoke-DATContentDownload {
                 }
             } finally {
                 $httpClient.Dispose()
+            }
+
+            # Verify the downloaded size matches the expected Content-Length (#876). HttpClient
+            # is now a selectable primary engine, so guard against a silently truncated stream
+            # (server closes early without raising an exception). A mismatch throws to trigger
+            # the retry loop rather than being treated as a completed download.
+            if ($DownloadSize -gt 0 -and (Test-Path -Path $DownloadDestination)) {
+                $finalSize = (Get-Item -Path $DownloadDestination).Length
+                if ($finalSize -ne $DownloadSize) {
+                    throw "Downloaded size mismatch. Expected $DownloadSize bytes, got $finalSize bytes (possible truncated download)."
+                }
+                Write-DATLogEntry -Value "- File size verified: $finalSize bytes" -Severity 1
             }
 
             Set-DATRegistryValue -Name "RunningState" -Value "Running" -Type String
@@ -2701,6 +2722,35 @@ function Get-DATDistributionPointGroups {
     return $DPGroups
 }
 
+function ConvertTo-DATSafePathSegment {
+    <#
+    .SYNOPSIS
+        Normalizes a single folder-name segment so it matches the folder Windows will
+        actually create on disk.
+    .DESCRIPTION
+        Windows silently strips trailing dots and spaces from directory names, and
+        rejects a set of reserved characters. A manufacturer such as "Onyx Healcare inc."
+        therefore produces a folder named "Onyx Healcare inc" while the raw string keeps
+        the dot. Using the raw string to build a ConfigMgr PkgSourcePath then points the
+        package at a non-existent folder and distribution to distribution points fails
+        (issue #861). Sanitizing each path segment keeps the stored source path in sync
+        with the folder that is created.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Segment
+    )
+
+    if ([string]::IsNullOrEmpty($Segment)) { return $Segment }
+
+    # Remove characters that are invalid in Windows file/folder names.
+    $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+    $clean = -join ($Segment.ToCharArray() | Where-Object { $invalidChars -notcontains $_ })
+
+    # Windows trims trailing dots and spaces from directory names -- mirror that here.
+    return $clean.TrimEnd([char]'.', [char]' ')
+}
+
 function New-DATConfigMgrPkg {
     [CmdletBinding()]
     param (
@@ -2746,6 +2796,17 @@ function New-DATConfigMgrPkg {
             "$packagePrefix - $OEM $Model - $OS $Architecture"
         }
         $folderName = if ($PackageType -eq 'BIOS') { "BIOS Packages" } else { "Driver Packages" }
+
+        # Build filesystem-safe folder segments for the package source path. The raw
+        # manufacturer/model values are retained for the package name and metadata, but
+        # the on-disk folder path must use sanitized segments so the stored PkgSourcePath
+        # matches the folder Windows actually creates (issue #861 -- trailing dot in names
+        # such as "Onyx Healcare inc." was stripped from the folder but kept in the path).
+        $safeOEM   = ConvertTo-DATSafePathSegment -Segment $OEM
+        $safeModel = ConvertTo-DATSafePathSegment -Segment $Model
+        $safeOS    = ConvertTo-DATSafePathSegment -Segment $OS
+        $safeArch  = ConvertTo-DATSafePathSegment -Segment $Architecture
+        $safeVer   = ConvertTo-DATSafePathSegment -Segment $Version
 
         # Create CIM session with auth fallback for all WMI operations in this function
         $cimSess = New-DATCimSession -ComputerName $SiteServer
@@ -2797,9 +2858,9 @@ function New-DATConfigMgrPkg {
             if ([string]::IsNullOrEmpty($existingSourcePath)) {
                 Write-DATLogEntry -Value "[Warning] - Existing package $pkgId has no source path, falling back to default" -Severity 2
                 $existingSourcePath = if ($PackageType -eq 'BIOS') {
-                    Join-Path -Path $PackagePath -ChildPath "$OEM\$Model\BIOS\$Version"
+                    Join-Path -Path $PackagePath -ChildPath "$safeOEM\$safeModel\BIOS\$safeVer"
                 } else {
-                    Join-Path -Path $PackagePath -ChildPath "$OEM\$Model\$OS\$Architecture\$Version"
+                    Join-Path -Path $PackagePath -ChildPath "$safeOEM\$safeModel\$safeOS\$safeArch\$safeVer"
                 }
             }
 
@@ -2895,9 +2956,9 @@ function New-DATConfigMgrPkg {
 
         # --- Stage 2: Copy WIM to destination (filesystem, no CM drive needed) ---
         $DestPath = if ($PackageType -eq 'BIOS') {
-            Join-Path -Path $PackagePath -ChildPath "$OEM\$Model\BIOS\$Version"
+            Join-Path -Path $PackagePath -ChildPath "$safeOEM\$safeModel\BIOS\$safeVer"
         } else {
-            Join-Path -Path $PackagePath -ChildPath "$OEM\$Model\$OS\$Architecture\$Version"
+            Join-Path -Path $PackagePath -ChildPath "$safeOEM\$safeModel\$safeOS\$safeArch\$safeVer"
         }
         if (-not (Test-Path $DestPath)) { New-Item -Path $DestPath -ItemType Directory -Force | Out-Null }
 
@@ -3440,6 +3501,7 @@ function Start-DATModelProcessing {
         [string]$IntuneRefreshToken,
         [string]$IntuneAuthClientId,
         [int]$IntuneTokenExpiresInSec = 0,
+        [object]$IntuneAuthContext,
         [string]$SiteServer,
         [string]$SiteCode,
         [string]$PackageType = 'Drivers',
@@ -3512,25 +3574,25 @@ function Start-DATModelProcessing {
         if (-not (Test-Path $dir)) { New-Item -Path $dir -ItemType Directory -Force | Out-Null }
     }
 
-    # Set Intune auth token if provided (for background runspace)
-    if (-not [string]::IsNullOrEmpty($IntuneAuthToken) -and $RunningMode -eq 'Intune') {
-        $script:IntuneAuthToken = $IntuneAuthToken
-        # Use real expiry if provided, otherwise estimate conservatively
-        if ($IntuneTokenExpiresInSec -gt 0) {
-            $script:IntuneTokenExpiry = (Get-Date).AddSeconds($IntuneTokenExpiresInSec)
-        } else {
-            $script:IntuneTokenExpiry = (Get-Date).AddMinutes(55)
-        }
-        # Store the client ID used during auth (required for refresh token to work with custom app registrations)
-        if (-not [string]::IsNullOrEmpty($IntuneAuthClientId)) {
-            $script:IntuneAuthClientId = $IntuneAuthClientId
-        }
-        # Store refresh token for automatic renewal during long builds
-        if (-not [string]::IsNullOrEmpty($IntuneRefreshToken)) {
-            $script:IntuneRefreshToken = $IntuneRefreshToken
-            Write-DATLogEntry -Value "[Intune] Auth token and refresh token set for background runspace -- token expires $($script:IntuneTokenExpiry)" -Severity 1
-        } else {
-            Write-DATLogEntry -Value "[Intune] Auth token set for background runspace -- token expires $($script:IntuneTokenExpiry) (no refresh token; will attempt client credentials renewal if needed)" -Severity 1
+    # Set Intune auth context if provided (for background runspace)
+    if ($RunningMode -eq 'Intune') {
+        if ($null -ne $IntuneAuthContext) {
+            Set-DATIntuneAuthContext -AuthContext $IntuneAuthContext | Out-Null
+            Write-DATLogEntry -Value "[Intune] Auth context set for background runspace ($script:IntuneTenantEnvironment) -- token expires $($script:IntuneTokenExpiry)" -Severity 1
+        } elseif (-not [string]::IsNullOrEmpty($IntuneAuthToken)) {
+            $legacyAuthContext = @{
+                Token             = $IntuneAuthToken
+                ExpiresInSec      = if ($IntuneTokenExpiresInSec -gt 0) { $IntuneTokenExpiresInSec } else { 3300 }
+                RefreshToken      = $IntuneRefreshToken
+                AuthClientId      = $IntuneAuthClientId
+                TenantEnvironment = $script:IntuneTenantEnvironment
+            }
+            Set-DATIntuneAuthContext -AuthContext $legacyAuthContext | Out-Null
+            if (-not [string]::IsNullOrEmpty($IntuneRefreshToken)) {
+                Write-DATLogEntry -Value "[Intune] Auth token and refresh token set for background runspace -- token expires $($script:IntuneTokenExpiry)" -Severity 1
+            } else {
+                Write-DATLogEntry -Value "[Intune] Auth token set for background runspace -- token expires $($script:IntuneTokenExpiry) (no refresh token; will attempt client credentials renewal if needed)" -Severity 1
+            }
         }
     }
 
@@ -3550,7 +3612,23 @@ function Start-DATModelProcessing {
     $biosNoMatchCount = 0
     $driverPackageSuccessCount = 0
     $biosPackageSuccessCount = 0
+    # Packages where real work was actually done (downloaded + WIM/Intune packaged). Unlike the
+    # success counters above, this is NOT incremented when a package is skipped because it is
+    # already current, so it reflects genuinely created/updated packages for the progress modal.
+    $packagesCreated = 0
     $currentIndex = 0
+
+    # Reset the per-build progress counters in the registry so the completion summary reflects
+    # ONLY this build. The per-model writes below are bypassed when a model is skipped (its
+    # package is already current), so without this reset the CompletedDriverPackages /
+    # CompletedBiosPackages values left by a PREVIOUS build would carry over and be shown in
+    # this build's summary dialog -- e.g. a 20-model Dell run followed by a 1-model Lenovo run
+    # would report 20 driver packages against 1 processed model. TotalJobs is stamped from the
+    # authoritative model count so "Models Processed" always matches what is actually processed.
+    Set-DATRegistryValue -Name "TotalJobs" -Value "$totalModels" -Type String
+    Set-DATRegistryValue -Name "CompletedJobs" -Value "0" -Type String
+    Set-DATRegistryValue -Name "CompletedDriverPackages" -Value "0" -Type String
+    Set-DATRegistryValue -Name "CompletedBiosPackages" -Value "0" -Type String
 
     # Pre-fetch existing Intune Win32 apps once (avoids per-model Graph queries)
     $cachedIntuneApps = @()
@@ -3625,6 +3703,16 @@ function Start-DATModelProcessing {
         $modelForceUpdate     = [bool]$model.ForceUpdate
         $modelDownloadURL     = if ($model.DownloadURL) { [string]$model.DownloadURL } else { '' }
 
+        # Per-model package-type narrowing. The UI passes a PackageType per model derived from the
+        # deployed-version scan, so a model that only needs a BIOS update (driver already current)
+        # processes BIOS only -- and vice versa. Only narrows within the global effective type; it
+        # never widens it, and defaults to the global type when unspecified.
+        $modelPackageType = $effectivePackageType
+        if ($effectivePackageType -eq 'All' -and -not [string]::IsNullOrEmpty($model.PackageType)) {
+            $requestedType = if ($isPilotBuild) { ($model.PackageType -replace '\s+Pilot$', '').Trim() } else { [string]$model.PackageType }
+            if ($requestedType -in @('Drivers', 'BIOS', 'All')) { $modelPackageType = $requestedType }
+        }
+
         Set-DATRegistryValue -Name "CurrentJob" -Value "$currentIndex" -Type String
         Set-DATRegistryValue -Name "RunningMessage" -Value "[$currentIndex/$totalModels] $oem $modelName" -Type String
         Set-DATRegistryValue -Name "RunningState" -Value "Running" -Type String
@@ -3645,11 +3733,11 @@ function Start-DATModelProcessing {
 
         try {
             # ── Driver processing (when PackageType is 'Drivers' or 'All') ──────────
-            if ($effectivePackageType -in @('Drivers', 'All')) {
+            if ($modelPackageType -in @('Drivers', 'All')) {
                 $modelBIOSOnly = [bool]$model.BIOSOnly
                 if ($modelBIOSOnly) {
                     Write-DATLogEntry -Value "[Warning] [$currentIndex/$totalModels] SKIPPED driver processing -- no driver package available for $oem $modelName ($windowsVersion $windowsBuild) -- BIOS only model" -Severity 2
-                    if ($effectivePackageType -eq 'Drivers') {
+                    if ($modelPackageType -eq 'Drivers') {
                         Set-DATRegistryValue -Name "PackagePhase" -Value "Drivers" -Type String
                         Set-DATRegistryValue -Name "RunningMode" -Value "DriverNoMatch" -Type String
                     }
@@ -3833,7 +3921,6 @@ function Start-DATModelProcessing {
                             Architecture       = $arch
                             WimFilePath        = $wimPath
                             PackageDestination = $PackagePath
-                            IntuneAuthToken    = $IntuneAuthToken
                         }
                         if ($isPilotBuild) { $intuneParams['NamePrefix'] = $driverNamePrefix }
                         $resolvedVersion = if (-not [string]::IsNullOrEmpty($catalogVersion)) { "$catalogVersion" } elseif (-not [string]::IsNullOrEmpty($catalogDriverVersion)) { "$catalogDriverVersion" } else { '' }
@@ -3888,16 +3975,18 @@ function Start-DATModelProcessing {
                         if ($null -ne $intuneResult -and -not [string]::IsNullOrEmpty($intuneResult.AppId)) {
                             $deployReg = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
 
-                            # Deploy to All Devices (no filter)
+                            # Deploy to target group (All Devices by default, or a custom Entra group override)
                             if ($null -ne $deployReg.DeployAllDevices -and $deployReg.DeployAllDevices -eq 1 -and
                                 ($null -eq $deployReg.AutoAssignmentFilter -or $deployReg.AutoAssignmentFilter -ne 1)) {
                                 try {
+                                    $targetGroupId = if (-not [string]::IsNullOrEmpty($deployReg.DeployTargetGroupId)) { $deployReg.DeployTargetGroupId } else { 'adadadad-808e-44e2-905a-0b7873a8a531' }
+                                    $targetGroupName = if (-not [string]::IsNullOrEmpty($deployReg.DeployTargetGroupName)) { $deployReg.DeployTargetGroupName } else { 'All Devices' }
                                     Set-DATRegistryValue -Name "RunningMode" -Value "Deploying" -Type String
-                                    Set-DATRegistryValue -Name "RunningMessage" -Value "Deploying to All Devices: $oem $modelName" -Type String
-                                    Set-DATIntuneAppAssignment -AppId $intuneResult.AppId -GroupId 'adadadad-808e-44e2-905a-0b7873a8a531' -Intent 'Required'
-                                    Write-DATLogEntry -Value "[Intune] Auto-deployed driver package to All Devices: $oem $modelName" -Severity 1
+                                    Set-DATRegistryValue -Name "RunningMessage" -Value "Deploying to ${targetGroupName}: $oem $modelName" -Type String
+                                    Set-DATIntuneAppAssignment -AppId $intuneResult.AppId -GroupId $targetGroupId -Intent 'Required'
+                                    Write-DATLogEntry -Value "[Intune] Auto-deployed driver package to ${targetGroupName}: $oem $modelName" -Severity 1
                                 } catch {
-                                    Write-DATLogEntry -Value "[Intune] Auto-deploy to All Devices failed: $($_.Exception.Message)" -Severity 2
+                                    Write-DATLogEntry -Value "[Intune] Auto-deploy to target group failed: $($_.Exception.Message)" -Severity 2
                                 }
                             }
 
@@ -3913,6 +4002,7 @@ function Start-DATModelProcessing {
                                         FilterMode   = $filterMode
                                     }
                                     if ($filterMode -eq 'Model') { $filterParams['Model'] = $modelName }
+                                    if (-not [string]::IsNullOrEmpty($deployReg.DeployTargetGroupId)) { $filterParams['TargetGroupId'] = $deployReg.DeployTargetGroupId }
                                     Invoke-DATAutoAssignmentFilter @filterParams
                                     Write-DATLogEntry -Value "[Intune] Auto-assignment filter applied for driver package: $oem $modelName ($filterMode)" -Severity 1
                                 } catch {
@@ -4008,14 +4098,20 @@ function Start-DATModelProcessing {
                                     [void](Update-DATHPSoftPaqManifestReference -Key $spRefKey -Field 'configMgrPackageId' -Value "$cmResult")
                                 }
 
-                                # Telemetry: driver report with WIM hash (before cleanup)
+                                # Telemetry: driver report with WIM hash (before cleanup). The hash
+                                # runs on a timeout-guarded runspace so a stalled file read can never
+                                # hang the build; the surrounding log lines make the previously-silent
+                                # post-creation stretch diagnosable (#853).
                                 try {
                                     if (Test-Path $driverSource -PathType Leaf) {
                                         # Compressed WIM -- hash the single file
+                                        Write-DATLogEntry -Value "[$oem] Post-package: hashing driver WIM for telemetry ($driverSource)" -Severity 1
                                         $drvHash = Get-DATPackageHash -FilePath $driverSource
                                         $drvSize = (Get-Item $driverSource).Length
+                                        Write-DATLogEntry -Value "[$oem] Post-package: driver WIM hashing complete" -Severity 1
                                     } else {
                                         # Expanded driver content -- sum the directory size, no single-file hash
+                                        Write-DATLogEntry -Value "[$oem] Post-package: measuring expanded driver content for telemetry" -Severity 1
                                         $drvHash = $null
                                         $drvSize = [int64](Get-ChildItem -Path $driverSource -Recurse -File -ErrorAction SilentlyContinue |
                                             Measure-Object -Property Length -Sum).Sum
@@ -4029,6 +4125,7 @@ function Start-DATModelProcessing {
                                 }
 
                                 # Clean up staging content now that it has been copied to the CM package source
+                                Write-DATLogEntry -Value "[$oem] Post-package: cleaning up staging content" -Severity 1
                                 if (Test-Path $driverSource -PathType Leaf) {
                                     # Compressed WIM -- remove the file then its parent if empty
                                     Remove-Item -Path $driverSource -Force -ErrorAction SilentlyContinue
@@ -4121,15 +4218,15 @@ function Start-DATModelProcessing {
                     # Download Only skips WIM packaging -- success = downloaded file exists in destination
                     $dlDestDir = Join-Path $StoragePath "$oem\$modelName"
                     $dlFileExists = (Test-Path $dlDestDir) -and @(Get-ChildItem -Path $dlDestDir -File -ErrorAction SilentlyContinue).Count -gt 0
-                    if ($dlFileExists) { $driverPackageSuccessCount++ }
-                } elseif ((Test-Path $drvWimCheck) -or $script:driverPipelineSuccess) { $driverPackageSuccessCount++ }
+                    if ($dlFileExists) { $driverPackageSuccessCount++; $packagesCreated++ }
+                } elseif ((Test-Path $drvWimCheck) -or $script:driverPipelineSuccess) { $driverPackageSuccessCount++; $packagesCreated++ }
                 $script:driverPipelineSuccess = $false
                 } # end if (-not $skipDriverDownload)
             } # end if (-not $modelBIOSOnly)
             }
 
             # ── BIOS processing (when PackageType is 'BIOS' or 'All') ──────────────
-            if ($effectivePackageType -in @('BIOS', 'All')) {
+            if ($modelPackageType -in @('BIOS', 'All')) {
                 # Microsoft Surface BIOS updates are delivered via driver injection -- skip BIOS packaging
                 if ($oem -eq 'Microsoft') {
                     Write-DATLogEntry -Value "[$currentIndex/$totalModels] SKIPPED -- Microsoft Surface BIOS updates are handled via driver injection, no separate BIOS package required" -Severity 1
@@ -4255,7 +4352,7 @@ function Start-DATModelProcessing {
                     Write-DATLogEntry -Value "[Warning] - No BIOS update available for $oem $modelName -- skipping BIOS" -Severity 2
                     $biosNoMatchCount++
                     $thisBiosNoMatch = $true
-                    if ($effectivePackageType -eq 'BIOS') {
+                    if ($modelPackageType -eq 'BIOS') {
                         # Signal the UI via RunningMode -- tied to CurrentJob so no race conditions
                         Set-DATRegistryValue -Name "RunningMode" -Value "BiosNoMatch" -Type String
                     }
@@ -4290,11 +4387,10 @@ function Start-DATModelProcessing {
                                     Architecture       = $arch
                                     WimFilePath        = $biosPackagePath
                                     PackageDestination = $PackagePath
-                                    IntuneAuthToken    = $IntuneAuthToken
                                     UpdateType         = 'BIOS'
                                 }
                                 if ($isPilotBuild) { $intuneParams['NamePrefix'] = $biosNamePrefix }
-                if (-not [string]::IsNullOrEmpty($biosEntry.Version)) { $intuneParams['Version'] = "$($biosEntry.Version)" }
+                                if (-not [string]::IsNullOrEmpty($biosEntry.Version)) { $intuneParams['Version'] = "$($biosEntry.Version)" }
                                 if (-not [string]::IsNullOrEmpty($biosEntry.ReleaseDate)) { $intuneParams['ReleaseDate'] = $biosEntry.ReleaseDate }
                                 if ($DisableToast) { $intuneParams['DisableToast'] = $true }
                                 if ($DisableRestart) { $intuneParams['DisableRestart'] = $true }
@@ -4344,16 +4440,18 @@ function Start-DATModelProcessing {
                                 if ($null -ne $biosIntuneResult -and -not [string]::IsNullOrEmpty($biosIntuneResult.AppId)) {
                                     $deployReg = Get-ItemProperty -Path $RegPath -ErrorAction SilentlyContinue
 
-                                    # Deploy to All Devices (no filter)
+                                    # Deploy to target group (All Devices by default, or a custom Entra group override)
                                     if ($null -ne $deployReg.DeployAllDevices -and $deployReg.DeployAllDevices -eq 1 -and
                                         ($null -eq $deployReg.AutoAssignmentFilter -or $deployReg.AutoAssignmentFilter -ne 1)) {
                                         try {
+                                            $targetGroupId = if (-not [string]::IsNullOrEmpty($deployReg.DeployTargetGroupId)) { $deployReg.DeployTargetGroupId } else { 'adadadad-808e-44e2-905a-0b7873a8a531' }
+                                            $targetGroupName = if (-not [string]::IsNullOrEmpty($deployReg.DeployTargetGroupName)) { $deployReg.DeployTargetGroupName } else { 'All Devices' }
                                             Set-DATRegistryValue -Name "RunningMode" -Value "Deploying" -Type String
-                                            Set-DATRegistryValue -Name "RunningMessage" -Value "Deploying BIOS to All Devices: $oem $modelName" -Type String
-                                            Set-DATIntuneAppAssignment -AppId $biosIntuneResult.AppId -GroupId 'adadadad-808e-44e2-905a-0b7873a8a531' -Intent 'Required'
-                                            Write-DATLogEntry -Value "[Intune] Auto-deployed BIOS package to All Devices: $oem $modelName" -Severity 1
+                                            Set-DATRegistryValue -Name "RunningMessage" -Value "Deploying BIOS to ${targetGroupName}: $oem $modelName" -Type String
+                                            Set-DATIntuneAppAssignment -AppId $biosIntuneResult.AppId -GroupId $targetGroupId -Intent 'Required'
+                                            Write-DATLogEntry -Value "[Intune] Auto-deployed BIOS package to ${targetGroupName}: $oem $modelName" -Severity 1
                                         } catch {
-                                            Write-DATLogEntry -Value "[Intune] Auto-deploy BIOS to All Devices failed: $($_.Exception.Message)" -Severity 2
+                                            Write-DATLogEntry -Value "[Intune] Auto-deploy BIOS to target group failed: $($_.Exception.Message)" -Severity 2
                                         }
                                     }
 
@@ -4369,6 +4467,7 @@ function Start-DATModelProcessing {
                                                 FilterMode   = $filterMode
                                             }
                                             if ($filterMode -eq 'Model') { $filterParams['Model'] = $modelName }
+                                            if (-not [string]::IsNullOrEmpty($deployReg.DeployTargetGroupId)) { $filterParams['TargetGroupId'] = $deployReg.DeployTargetGroupId }
                                             Invoke-DATAutoAssignmentFilter @filterParams
                                             Write-DATLogEntry -Value "[Intune] Auto-assignment filter applied for BIOS package: $oem $modelName ($filterMode)" -Severity 1
                                         } catch {
@@ -4465,6 +4564,7 @@ function Start-DATModelProcessing {
 
                             Write-DATLogEntry -Value "- $oem $modelName BIOS processing completed" -Severity 1
                             $biosPackageSuccessCount++
+                            $packagesCreated++
                             $processedBiosModels["$oem|$modelName"] = $true
 
                             # Telemetry: BIOS report for Download Only mode
@@ -4503,13 +4603,13 @@ function Start-DATModelProcessing {
         # A package type counts as failed when it was in scope for this build but its
         # success counter did not advance for this model.
         $modelIsBIOSOnly = [bool]$model.BIOSOnly
-        if ($effectivePackageType -in @('Drivers', 'All') -and $driverPackageSuccessCount -le $drvSuccessBefore) {
+        if ($modelPackageType -in @('Drivers', 'All') -and $driverPackageSuccessCount -le $drvSuccessBefore) {
             $drvReason = if (-not [string]::IsNullOrEmpty($modelFailReason)) { $modelFailReason }
                          elseif ($modelIsBIOSOnly) { 'No driver package available (BIOS-only model)' }
                          else { 'Driver package was not created -- see log for details' }
             $buildFailures.Add([pscustomobject]@{ OEM = $oem; Model = $modelName; PackageType = 'Drivers'; OS = "$os"; Reason = $drvReason })
         }
-        if ($effectivePackageType -in @('BIOS', 'All') -and $biosPackageSuccessCount -le $biosSuccessBefore) {
+        if ($modelPackageType -in @('BIOS', 'All') -and $biosPackageSuccessCount -le $biosSuccessBefore) {
             # Microsoft Surface BIOS ships via driver injection -- not a failure
             if ($oem -ne 'Microsoft') {
                 $biosReason = if ($thisBiosNoMatch) { 'No BIOS update found in catalog' }
@@ -4522,6 +4622,20 @@ function Start-DATModelProcessing {
         Set-DATRegistryValue -Name "CompletedJobs" -Value "$completedCount" -Type String
         Set-DATRegistryValue -Name "CompletedDriverPackages" -Value "$driverPackageSuccessCount" -Type String
         Set-DATRegistryValue -Name "CompletedBiosPackages" -Value "$biosPackageSuccessCount" -Type String
+        Set-DATRegistryValue -Name "FailedPackages" -Value "$($buildFailures.Count)" -Type String
+        Set-DATRegistryValue -Name "PackagesCreated" -Value "$packagesCreated" -Type String
+
+        # Persist the structured failure list live (per model), not just at the end of the build,
+        # so the progress modal can mark the exact failed rows in real time. Without this the modal
+        # relies on a CurrentJob/CompletedJobs heuristic that misses a failure when the failed model
+        # is immediately followed by a skipped/successful model in the same poll -- the row then
+        # shows green while the "Failed" tile shows a count, and the two disagree.
+        if ($buildFailures.Count -gt 0) {
+            try {
+                $liveFailJson = ConvertTo-Json -InputObject @($buildFailures) -Depth 4 -Compress
+                Set-DATRegistryValue -Name 'BuildFailures' -Value $liveFailJson -Type String
+            } catch { }
+        }
 
         # Check for user abort between models -- do not continue processing or overwrite Aborted state
         $interModelReg = Get-ItemProperty -Path $global:RegPath -ErrorAction SilentlyContinue
@@ -4634,7 +4748,7 @@ function Send-DATTeamsNotification {
                                     items = @(
                                         @{
                                             type  = 'Image'
-                                            url   = 'https://raw.githubusercontent.com/maurice-daly/DriverAutomationTool/master/Resources/DATIcon.png'
+                                            url   = 'https://raw.githubusercontent.com/maurice-daly/DriverAutomationTool/master/Content/Screenshots/Dat_Logo.png'
                                             size  = 'Small'
                                             style = 'Default'
                                         }
@@ -4731,7 +4845,10 @@ function Export-DATBuildConfig {
         [string]$MaintenanceWindowMode = 'Daily',
         [array]$MaintenanceWindows,
         [bool]$CleanTempOnExit = $true,
-        [bool]$CreateIntuneWinOnly = $false
+        [bool]$CreateIntuneWinOnly = $false,
+        [bool]$PackageRetentionEnabled = $false,
+        [int]$PackageRetentionCount = 0,
+        [bool]$DeleteSourceFolderOnRemoval = $false
     )
 
     $modelArray = foreach ($m in $Models) {
@@ -4766,11 +4883,16 @@ function Export-DATBuildConfig {
         CreateIntuneWinOnly        = $CreateIntuneWinOnly
         TeamsWebhookUrl            = if ($TeamsWebhookUrl) { $TeamsWebhookUrl } else { '' }
         TeamsNotificationsEnabled  = $TeamsNotificationsEnabled
-        Intune                     = if ($Intune) { $Intune } else { [ordered]@{ TenantId = ''; AppId = ''; AppSecret = '' } }
+        Intune                     = if ($Intune) { $Intune } else { [ordered]@{ TenantEnvironment = 'Commercial'; TenantId = ''; AppId = ''; AppSecret = '' } }
         ConfigMgr                  = if ($ConfigMgr) { $ConfigMgr } else { [ordered]@{ SiteServer = ''; SiteCode = ''; DistributionPointGroups = @(); DistributionPriority = 'Normal' } }
         MaintenanceWindowEnabled   = $MaintenanceWindowEnabled
         MaintenanceWindowMode      = $MaintenanceWindowMode
         MaintenanceWindows         = @($MaintenanceWindows)
+        PackageRetention           = [ordered]@{
+            Enabled                     = $PackageRetentionEnabled
+            RetainCount                 = $PackageRetentionCount
+            DeleteSourceFolderOnRemoval = $DeleteSourceFolderOnRemoval
+        }
         Models                     = @($modelArray)
     }
 
@@ -6487,7 +6609,45 @@ $script:GraphScopes = @(
     "DeviceManagementManagedDevices.Read.All"
     "GroupMember.Read.All"
 )
-$script:GraphBaseUrl = "https://graph.microsoft.com/beta"
+$script:GraphEnvironmentDefinitions = [ordered]@{
+    Commercial = [ordered]@{
+        Name          = 'Commercial'
+        DisplayName   = 'Commercial'
+        AuthorityHost = 'https://login.microsoftonline.com'
+        GraphResource = 'https://graph.microsoft.com'
+        GraphBaseUrl  = 'https://graph.microsoft.com/beta'
+    }
+    GCC = [ordered]@{
+        Name          = 'GCC'
+        DisplayName   = 'GCC'
+        AuthorityHost = 'https://login.microsoftonline.com'
+        GraphResource = 'https://graph.microsoft.com'
+        GraphBaseUrl  = 'https://graph.microsoft.com/beta'
+    }
+    GCCHigh = [ordered]@{
+        Name          = 'GCCHigh'
+        DisplayName   = 'GCC High / US Gov L4'
+        AuthorityHost = 'https://login.microsoftonline.us'
+        GraphResource = 'https://graph.microsoft.us'
+        GraphBaseUrl  = 'https://graph.microsoft.us/beta'
+    }
+    DoD = [ordered]@{
+        Name          = 'DoD'
+        DisplayName   = 'DoD / US Gov L5'
+        AuthorityHost = 'https://login.microsoftonline.us'
+        GraphResource = 'https://dod-graph.microsoft.us'
+        GraphBaseUrl  = 'https://dod-graph.microsoft.us/beta'
+    }
+    China = [ordered]@{
+        Name          = 'China'
+        DisplayName   = 'China (21Vianet)'
+        AuthorityHost = 'https://login.partner.microsoftonline.cn'
+        GraphResource = 'https://microsoftgraph.chinacloudapi.cn'
+        GraphBaseUrl  = 'https://microsoftgraph.chinacloudapi.cn/beta'
+    }
+}
+$script:IntuneTenantEnvironment = 'Commercial'
+$script:GraphBaseUrl = $script:GraphEnvironmentDefinitions.Commercial.GraphBaseUrl
 
 # In-memory token store - discarded when the process exits
 $script:IntuneAuthToken = $null
@@ -6495,9 +6655,128 @@ $script:IntuneTokenExpiry = [datetime]::MinValue
 $script:IntuneTenantId = $null
 $script:IntuneRefreshToken = $null
 $script:IntuneAuthClientId = $null  # Tracks which client ID was used during auth (for refresh)
+# Authority tenant segment used at sign-in ('organizations', 'common', or a specific tenant GUID).
+# Custom single-tenant app registrations require their tenant ID here; the built-in multi-tenant
+# Microsoft Graph PowerShell app works with 'organizations'. Reused for silent token refresh.
+$script:IntuneAuthTenantEndpoint = 'organizations'
 
 # Device code flow state - active only during sign-in
 $script:DeviceCodeContext = $null
+
+function ConvertTo-DATIntuneEnvironmentName {
+    [OutputType([string])]
+    param (
+        [string]$Environment = 'Commercial'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Environment)) { return 'Commercial' }
+
+    switch -Regex ($Environment.Trim()) {
+        '^(Commercial|Global|Public|Worldwide)$' { return 'Commercial' }
+        '^(GCC|USGovGCC|US Government GCC)$' { return 'GCC' }
+        '^(GCCHigh|GCC High|USGov|US Gov|US Government|USGovernment|L4)$' { return 'GCCHigh' }
+        '^(DoD|DOD|USGovDoD|US Government DoD|L5)$' { return 'DoD' }
+        '^(China|China21Vianet|21Vianet)$' { return 'China' }
+        default { throw "Unsupported Intune tenant environment '$Environment'." }
+    }
+}
+
+function Get-DATIntuneEnvironmentDefinition {
+    [OutputType([hashtable])]
+    param (
+        [string]$Environment = $script:IntuneTenantEnvironment
+    )
+
+    $name = ConvertTo-DATIntuneEnvironmentName -Environment $Environment
+    return $script:GraphEnvironmentDefinitions[$name]
+}
+
+function Set-DATIntuneEnvironment {
+    [CmdletBinding()]
+    param (
+        [string]$Environment = 'Commercial',
+        [switch]$Silent
+    )
+
+    $definition = Get-DATIntuneEnvironmentDefinition -Environment $Environment
+    $script:IntuneTenantEnvironment = $definition.Name
+    $script:GraphBaseUrl = $definition.GraphBaseUrl
+
+    if (-not $Silent) {
+        Write-DATLogEntry -Value "[Intune Auth] Tenant environment set to $($definition.DisplayName) ($($definition.GraphBaseUrl))" -Severity 1
+    }
+
+    return $definition
+}
+
+function Get-DATIntuneEnvironment {
+    [OutputType([hashtable])]
+    param ()
+
+    return Get-DATIntuneEnvironmentDefinition -Environment $script:IntuneTenantEnvironment
+}
+
+function Resolve-DATIntuneEnvironment {
+    [OutputType([PSCustomObject])]
+    param (
+        [string]$Environment = 'Commercial',
+        [string]$FallbackEnvironment = 'Commercial'
+    )
+
+    $requestedEnvironment = if ([string]::IsNullOrWhiteSpace($Environment)) { 'Commercial' } else { $Environment }
+
+    try {
+        $definition = Get-DATIntuneEnvironmentDefinition -Environment $requestedEnvironment
+        [PSCustomObject]@{
+            Name                 = $definition.Name
+            DisplayName          = $definition.DisplayName
+            Definition           = $definition
+            RequestedEnvironment = $requestedEnvironment
+            UsedFallback         = $false
+            Error                = $null
+        }
+    } catch {
+        $fallbackDefinition = Get-DATIntuneEnvironmentDefinition -Environment $FallbackEnvironment
+        [PSCustomObject]@{
+            Name                 = $fallbackDefinition.Name
+            DisplayName          = $fallbackDefinition.DisplayName
+            Definition           = $fallbackDefinition
+            RequestedEnvironment = $requestedEnvironment
+            UsedFallback         = $true
+            Error                = $_.Exception.Message
+        }
+    }
+}
+
+function Get-DATIntuneEnvironments {
+    [OutputType([PSCustomObject[]])]
+    param ()
+
+    foreach ($name in $script:GraphEnvironmentDefinitions.Keys) {
+        $definition = $script:GraphEnvironmentDefinitions[$name]
+        [PSCustomObject]@{
+            Name          = $definition.Name
+            DisplayName   = $definition.DisplayName
+            AuthorityHost = $definition.AuthorityHost
+            GraphResource = $definition.GraphResource
+            GraphBaseUrl  = $definition.GraphBaseUrl
+        }
+    }
+}
+
+function Get-DATGraphScopeString {
+    [OutputType([string])]
+    param (
+        [hashtable]$EnvironmentDefinition = (Get-DATIntuneEnvironment)
+    )
+
+    $graphResource = $EnvironmentDefinition.GraphResource.TrimEnd('/')
+    $qualifiedScopes = foreach ($scope in $script:GraphScopes) {
+        if ($scope -match '^https://') { $scope } else { "$graphResource/$scope" }
+    }
+
+    return (($qualifiedScopes + @('openid', 'profile', 'offline_access')) -join ' ')
+}
 
 function ConvertTo-DATIntuneMinimumOS {
     <#
@@ -6552,15 +6831,20 @@ function Connect-DATIntuneGraph {
     [CmdletBinding()]
     param (
         # Optional: override the built-in Microsoft Graph PowerShell client ID with a custom app registration.
-        [string]$ClientId = $script:GraphClientId
+        [string]$ClientId = $script:GraphClientId,
+        # Optional: tenant ID (GUID or verified domain) for single-tenant custom app registrations.
+        # When omitted the multi-tenant 'organizations' authority is used.
+        [string]$TenantId,
+        [string]$TenantEnvironment = $script:IntuneTenantEnvironment
     )
 
-    $tenantEndpoint = "organizations"
-    $scopeString = ($script:GraphScopes -join " ") + " openid profile offline_access"
+    $environment = Set-DATIntuneEnvironment -Environment $TenantEnvironment
+    $tenantEndpoint = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId.Trim() } else { 'organizations' }
+    $scopeString = Get-DATGraphScopeString -EnvironmentDefinition $environment
 
-    $deviceCodeUrl = "https://login.microsoftonline.com/$tenantEndpoint/oauth2/v2.0/devicecode"
+    $deviceCodeUrl = "$($environment.AuthorityHost)/$tenantEndpoint/oauth2/v2.0/devicecode"
 
-    Write-DATLogEntry -Value "[Intune Auth] Requesting device code for interactive sign-in (client: $ClientId)" -Severity 1
+    Write-DATLogEntry -Value "[Intune Auth] Requesting device code for interactive sign-in (client: $ClientId, tenant: $tenantEndpoint, environment: $($environment.DisplayName))" -Severity 1
 
     try {
         $proxyParams = Get-DATWebRequestProxy
@@ -6576,6 +6860,9 @@ function Connect-DATIntuneGraph {
             Interval     = [math]::Max([int]$dcResponse.interval, 5)
             ExpiresAt    = (Get-Date).AddSeconds([int]$dcResponse.expires_in)
             ClientId     = $ClientId
+            Environment  = $environment.Name
+            AuthorityHost = $environment.AuthorityHost
+            TenantEndpoint = $tenantEndpoint
         }
 
         Write-DATLogEntry -Value "[Intune Auth] Device code: $($dcResponse.user_code) - open $($dcResponse.verification_uri)" -Severity 1
@@ -6617,8 +6904,9 @@ function Complete-DATDeviceCodeAuth {
         return @{ Status = 'Failed'; Error = "Device code expired. Please try again." }
     }
 
-    $tenantEndpoint = "organizations"
-    $tokenUrl = "https://login.microsoftonline.com/$tenantEndpoint/oauth2/v2.0/token"
+    $tenantEndpoint = if ($script:DeviceCodeContext.TenantEndpoint) { $script:DeviceCodeContext.TenantEndpoint } else { 'organizations' }
+    $authorityHost = if ($script:DeviceCodeContext.AuthorityHost) { $script:DeviceCodeContext.AuthorityHost } else { (Get-DATIntuneEnvironment).AuthorityHost }
+    $tokenUrl = "$authorityHost/$tenantEndpoint/oauth2/v2.0/token"
 
     try {
         $proxyParams = Get-DATWebRequestProxy
@@ -6632,6 +6920,10 @@ function Complete-DATDeviceCodeAuth {
         $script:IntuneAuthToken = $tokenResponse.access_token
         $script:IntuneTokenExpiry = (Get-Date).AddSeconds([int]$tokenResponse.expires_in - 60)
         $script:IntuneAuthClientId = $script:DeviceCodeContext.ClientId
+        $script:IntuneAuthTenantEndpoint = $tenantEndpoint
+        if ($script:DeviceCodeContext.Environment) {
+            Set-DATIntuneEnvironment -Environment $script:DeviceCodeContext.Environment -Silent | Out-Null
+        }
         # Store refresh token for silent renewal (device code flow includes offline_access)
         if ($tokenResponse.refresh_token) {
             $script:IntuneRefreshToken = $tokenResponse.refresh_token
@@ -6698,19 +6990,22 @@ function Connect-DATIntuneGraphClientCredential {
     param (
         [Parameter(Mandatory)][string]$TenantId,
         [Parameter(Mandatory)][string]$AppId,
-        [Parameter(Mandatory)][string]$ClientSecret
+        [Parameter(Mandatory)][string]$ClientSecret,
+        [string]$TenantEnvironment = $script:IntuneTenantEnvironment
     )
 
-    $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+    $environment = Set-DATIntuneEnvironment -Environment $TenantEnvironment
+    $tokenUrl = "$($environment.AuthorityHost)/$TenantId/oauth2/v2.0/token"
+    $defaultScope = "$($environment.GraphResource.TrimEnd('/'))/.default"
 
-    Write-DATLogEntry -Value "[Intune Auth] Authenticating with client credentials for tenant: $TenantId" -Severity 1
+    Write-DATLogEntry -Value "[Intune Auth] Authenticating with client credentials for tenant: $TenantId (environment: $($environment.DisplayName))" -Severity 1
 
     try {
         $proxyParams = Get-DATWebRequestProxy
         $tokenResponse = Invoke-RestMethod -Method POST -Uri $tokenUrl -Body @{
             client_id     = $AppId
             client_secret = $ClientSecret
-            scope         = "https://graph.microsoft.com/.default"
+            scope         = $defaultScope
             grant_type    = "client_credentials"
         } -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop @proxyParams
 
@@ -6724,6 +7019,7 @@ function Connect-DATIntuneGraphClientCredential {
             Success   = $true
             ExpiresOn = $script:IntuneTokenExpiry
             TenantId  = $TenantId
+            TenantEnvironment = $environment.Name
         }
     }
     catch {
@@ -6750,12 +7046,18 @@ function Connect-DATIntuneGraphInteractive {
         # When a custom ClientId is supplied, use this fixed port so the user only needs
         # to register one redirect URI (http://localhost:38400/) in their app registration.
         # The built-in Microsoft Graph PowerShell app accepts any port via http://localhost.
-        [int]$FixedPort = 0
+        [int]$FixedPort = 0,
+        # Optional: tenant ID (GUID or verified domain) for single-tenant custom app registrations.
+        # When omitted the multi-tenant 'organizations' authority is used.
+        [string]$TenantId,
+        [string]$TenantEnvironment = $script:IntuneTenantEnvironment
     )
 
-    $scopeString = ($script:GraphScopes -join " ") + " openid profile offline_access"
+    $environment = Set-DATIntuneEnvironment -Environment $TenantEnvironment
+    $tenantEndpoint = if (-not [string]::IsNullOrWhiteSpace($TenantId)) { $TenantId.Trim() } else { 'organizations' }
+    $scopeString = Get-DATGraphScopeString -EnvironmentDefinition $environment
 
-    Write-DATLogEntry -Value "[Intune Auth] Starting interactive browser sign-in (Auth Code + PKCE, client: $ClientId)" -Severity 1
+    Write-DATLogEntry -Value "[Intune Auth] Starting interactive browser sign-in (Auth Code + PKCE, client: $ClientId, tenant: $tenantEndpoint, environment: $($environment.DisplayName))" -Severity 1
 
     try {
         # 1. Generate PKCE code verifier & challenge
@@ -6781,7 +7083,7 @@ function Connect-DATIntuneGraphInteractive {
 
         # 3. Build the authorize URL with PKCE and CSRF state
         $state = [guid]::NewGuid().ToString('N')
-        $authUrl = "https://login.microsoftonline.com/organizations/oauth2/v2.0/authorize?" + (
+        $authUrl = "$($environment.AuthorityHost)/$tenantEndpoint/oauth2/v2.0/authorize?" + (
             @(
                 "client_id=$([uri]::EscapeDataString($ClientId))"
                 "response_type=code"
@@ -6807,6 +7109,9 @@ function Connect-DATIntuneGraphInteractive {
             RedirectUri  = $redirectUri
             ScopeString  = $scopeString
             ClientId     = $ClientId
+            Environment  = $environment.Name
+            AuthorityHost = $environment.AuthorityHost
+            TenantEndpoint = $tenantEndpoint
             StartedAt    = Get-Date
             TimeoutSec   = 120
         }
@@ -6889,7 +7194,8 @@ function Complete-DATBrowserAuth {
         $authCode = $query['code']
 
         # Exchange auth code + verifier for tokens
-        $tokenUrl = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
+        $tokenTenantEndpoint = if ($ctx.TenantEndpoint) { $ctx.TenantEndpoint } else { 'organizations' }
+        $tokenUrl = "$($ctx.AuthorityHost)/$tokenTenantEndpoint/oauth2/v2.0/token"
         $proxyParams = Get-DATWebRequestProxy
         $tokenResponse = Invoke-RestMethod -Method POST -Uri $tokenUrl -Body @{
             client_id     = $ctx.ClientId
@@ -6905,6 +7211,10 @@ function Complete-DATBrowserAuth {
         $script:IntuneTokenExpiry = (Get-Date).AddSeconds([int]$tokenResponse.expires_in - 60)
         $script:IntuneRefreshToken = $tokenResponse.refresh_token
         $script:IntuneAuthClientId = $ctx.ClientId
+        $script:IntuneAuthTenantEndpoint = $tokenTenantEndpoint
+        if ($ctx.Environment) {
+            Set-DATIntuneEnvironment -Environment $ctx.Environment -Silent | Out-Null
+        }
 
         # Extract tenant ID from JWT
         $tokenParts = $script:IntuneAuthToken.Split('.')
@@ -6959,8 +7269,11 @@ function Invoke-DATTokenRefresh {
 
     # Use the client ID that was used during the original auth (critical for custom app registrations)
     $refreshClientId = if (-not [string]::IsNullOrEmpty($script:IntuneAuthClientId)) { $script:IntuneAuthClientId } else { $script:GraphClientId }
-    $scopeString = ($script:GraphScopes -join " ") + " openid profile offline_access"
-    $tokenUrl = "https://login.microsoftonline.com/organizations/oauth2/v2.0/token"
+    $environment = Get-DATIntuneEnvironment
+    $scopeString = Get-DATGraphScopeString -EnvironmentDefinition $environment
+    # Refresh against the same authority tenant segment used at sign-in (required for single-tenant apps).
+    $tenantEndpoint = if (-not [string]::IsNullOrWhiteSpace($script:IntuneAuthTenantEndpoint)) { $script:IntuneAuthTenantEndpoint } else { 'organizations' }
+    $tokenUrl = "$($environment.AuthorityHost)/$tenantEndpoint/oauth2/v2.0/token"
 
     try {
         $proxyParams = Get-DATWebRequestProxy
@@ -6978,7 +7291,7 @@ function Invoke-DATTokenRefresh {
             $script:IntuneRefreshToken = $tokenResponse.refresh_token
         }
 
-        Write-DATLogEntry -Value "[Intune Auth] Token refreshed silently (client: $refreshClientId) - expires $($script:IntuneTokenExpiry)" -Severity 1
+        Write-DATLogEntry -Value "[Intune Auth] Token refreshed silently (client: $refreshClientId, environment: $($environment.DisplayName)) - expires $($script:IntuneTokenExpiry)" -Severity 1
         return @{ Success = $true; ExpiresOn = $script:IntuneTokenExpiry }
     }
     catch {
@@ -7021,45 +7334,51 @@ function Test-DATIntunePermissions {
         "Content-Type"  = "application/json"
     }
 
+    $environment = Get-DATIntuneEnvironment
+    $graphBaseUrl = $environment.GraphBaseUrl.TrimEnd('/')
+    $graphV1Url = "$($environment.GraphResource.TrimEnd('/'))/v1.0"
     $permChecks = @(
-        @{ Name = "DeviceManagementApps.ReadWrite.All"; TestUri = "https://graph.microsoft.com/beta/deviceAppManagement/mobileApps?`$top=1"; Description = "Create and manage Win32 app packages" }
-        @{ Name = "DeviceManagementManagedDevices.Read.All"; TestUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices?`$top=1"; Description = "Read managed devices for model lookup" }
-        @{ Name = "GroupMember.Read.All"; TestUri = "https://graph.microsoft.com/v1.0/groups?`$top=1"; Description = "Read group memberships for deployment targeting" }
+        @{ Name = "DeviceManagementApps.ReadWrite.All"; TestUri = "$graphBaseUrl/deviceAppManagement/mobileApps?`$top=1"; Description = "Create and manage Win32 app packages" }
+        @{ Name = "DeviceManagementManagedDevices.Read.All"; TestUri = "$graphBaseUrl/deviceManagement/managedDevices?`$top=1"; Description = "Read managed devices for model lookup" }
+        @{ Name = "GroupMember.Read.All"; TestUri = "$graphV1Url/groups?`$top=1"; Description = "Read group memberships for deployment targeting" }
     )
 
-    # Add assignment filter permission check when auto-filter is enabled
-    $regConfig = Get-ItemProperty -Path $global:RegPath -ErrorAction SilentlyContinue
-    if ($null -ne $regConfig.AutoAssignmentFilter -and $regConfig.AutoAssignmentFilter -eq 1) {
-        $permChecks += @{ Name = "DeviceManagementConfiguration.ReadWrite.All"; TestUri = "https://graph.microsoft.com/beta/deviceManagement/assignmentFilters?`$top=1"; Description = "Create and manage assignment filters" }
-    }
+    # DeviceManagementConfiguration.ReadWrite.All is OPTIONAL -- it is only needed for the
+    # assignment filter feature (auto-filter on build, and the manual Update/Remove filter
+    # action in Package Management). It is ALWAYS checked so it is never invisible in the
+    # logs or UI, but a missing/denied result does NOT fail the overall permission check.
+    $permChecks += @{ Name = "DeviceManagementConfiguration.ReadWrite.All"; TestUri = "$graphBaseUrl/deviceManagement/assignmentFilters?`$top=1"; Description = "Create and manage assignment filters (optional)"; Optional = $true }
 
     $results = @()
     $allGranted = $true
 
     foreach ($perm in $permChecks) {
+        $isOptional = [bool]$perm.Optional
         try {
             $proxyParams = Get-DATWebRequestProxy
             Invoke-RestMethod -Method GET -Uri $perm.TestUri -Headers $headers -ErrorAction Stop @proxyParams | Out-Null
-            $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Granted" }
+            $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Granted"; Optional = $isOptional }
             Write-DATLogEntry -Value "[Intune Auth] Permission check: $($perm.Name) - Granted" -Severity 1
         } catch {
             $statusCode = $null
             if ($_.Exception.Response) {
                 $statusCode = [int]$_.Exception.Response.StatusCode
             }
+            # Optional permissions are reported but never fail the overall check.
+            $optionalSuffix = if ($isOptional) { ' (optional)' } else { '' }
             if ($statusCode -eq 403) {
-                $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Denied" }
-                $allGranted = $false
-                Write-DATLogEntry -Value "[Intune Auth] Permission check: $($perm.Name) - Denied (403)" -Severity 2
+                $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Denied"; Optional = $isOptional }
+                if (-not $isOptional) { $allGranted = $false }
+                Write-DATLogEntry -Value "[Intune Auth] Permission check: $($perm.Name) - Denied (403)$optionalSuffix" -Severity 2
             } elseif ($statusCode -eq 401) {
-                $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Unauthorized" }
-                $allGranted = $false
-                Write-DATLogEntry -Value "[Intune Auth] Permission check: $($perm.Name) - Unauthorized (401)" -Severity 3
+                $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Unauthorized"; Optional = $isOptional }
+                if (-not $isOptional) { $allGranted = $false }
+                Write-DATLogEntry -Value "[Intune Auth] Permission check: $($perm.Name) - Unauthorized (401)$optionalSuffix" -Severity 3
             } else {
                 # Other errors (e.g. network) - treat as unknown
-                $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Error" }
-                $allGranted = $false
-                Write-DATLogEntry -Value "[Intune Auth] Permission check: $($perm.Name) - Error: $($_.Exception.Message)" -Severity 3
+                $results += @{ Name = $perm.Name; Description = $perm.Description; Status = "Error"; Optional = $isOptional }
+                if (-not $isOptional) { $allGranted = $false }
+                Write-DATLogEntry -Value "[Intune Auth] Permission check: $($perm.Name) - Error: $($_.Exception.Message)$optionalSuffix" -Severity 3
             }
         }
     }
@@ -7090,6 +7409,13 @@ function Test-DATIntuneAuth {
         return $false
     }
     return $true
+}
+
+function Test-DATIntuneAuthTokenValid {
+    [OutputType([bool])]
+    param ()
+
+    return (-not [string]::IsNullOrEmpty($script:IntuneAuthToken) -and (Get-Date) -lt $script:IntuneTokenExpiry)
 }
 
 function Update-DATIntuneTokenIfNeeded {
@@ -7140,6 +7466,7 @@ function Update-DATIntuneTokenIfNeeded {
         $appId = $regValues.IntuneAppId
         $encSecret = $regValues.IntuneClientSecret
         $tenantId = $regValues.IntuneTenantId
+        $tenantEnvironment = if ($regValues.IntuneTenantEnvironment) { $regValues.IntuneTenantEnvironment } else { 'Commercial' }
 
         if ($authMode -eq 2 -and -not [string]::IsNullOrEmpty($appId) -and
             -not [string]::IsNullOrEmpty($encSecret) -and -not [string]::IsNullOrEmpty($tenantId)) {
@@ -7150,8 +7477,8 @@ function Update-DATIntuneTokenIfNeeded {
             $clientSecret = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
             [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
 
-            Write-DATLogEntry -Value "[Intune Auth] Attempting client credentials refresh for tenant $tenantId" -Severity 1
-            $ccResult = Connect-DATIntuneGraphClientCredential -TenantId $tenantId -AppId $appId -ClientSecret $clientSecret
+            Write-DATLogEntry -Value "[Intune Auth] Attempting client credentials refresh for tenant $tenantId ($tenantEnvironment)" -Severity 1
+            $ccResult = Connect-DATIntuneGraphClientCredential -TenantId $tenantId -AppId $appId -ClientSecret $clientSecret -TenantEnvironment $tenantEnvironment
             if ($ccResult.Success) {
                 Write-DATLogEntry -Value "[Intune Auth] Token refreshed via client credentials -- new expiry: $($ccResult.ExpiresOn)" -Severity 1
                 return $true
@@ -7180,10 +7507,155 @@ function Set-DATIntuneAuthToken {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)][string]$Token,
-        [Parameter(Mandatory)][datetime]$ExpiresOn
+        [Parameter(Mandatory)][datetime]$ExpiresOn,
+        [string]$TenantEnvironment = $script:IntuneTenantEnvironment
     )
-    $script:IntuneAuthToken = $Token
-    $script:IntuneTokenExpiry = $ExpiresOn
+
+    if ([string]::IsNullOrWhiteSpace($TenantEnvironment)) {
+        $TenantEnvironment = $script:IntuneTenantEnvironment
+    }
+
+    Set-DATIntuneAuthContext -AuthContext @{
+        Token             = $Token
+        ExpiresOn         = $ExpiresOn
+        TenantEnvironment = $TenantEnvironment
+    } | Out-Null
+}
+
+function ConvertTo-DATIntuneAuthContextMap {
+    [OutputType([hashtable])]
+    param (
+        [Parameter(Mandatory)]$AuthContext
+    )
+
+    $knownFields = @(
+        'Token',
+        'ExpiresOn',
+        'ExpiresInSec',
+        'RefreshToken',
+        'AuthClientId',
+        'TenantId',
+        'TenantEnvironment'
+    )
+    $context = @{}
+
+    if ($AuthContext -is [System.Collections.IDictionary]) {
+        foreach ($field in $knownFields) {
+            if ($AuthContext.Contains($field)) {
+                $context[$field] = $AuthContext[$field]
+            }
+        }
+    } else {
+        $properties = $AuthContext.PSObject.Properties
+        foreach ($field in $knownFields) {
+            $property = $properties[$field]
+            if ($null -ne $property) {
+                $context[$field] = $property.Value
+            }
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$context['TenantEnvironment'])) {
+        throw "Intune auth context is missing TenantEnvironment."
+    }
+
+    if ($context.ContainsKey('Token') -and -not [string]::IsNullOrEmpty([string]$context['Token'])) {
+        $expiresInSecValue = 0
+        $hasExpiresOn = $context.ContainsKey('ExpiresOn') -and -not [string]::IsNullOrWhiteSpace([string]$context['ExpiresOn'])
+        $hasExpiresInSec = $context.ContainsKey('ExpiresInSec') -and
+            [int]::TryParse([string]$context['ExpiresInSec'], [ref]$expiresInSecValue) -and
+            $expiresInSecValue -gt 0
+
+        if (-not $hasExpiresOn -and -not $hasExpiresInSec) {
+            throw "Intune auth context token requires ExpiresOn or positive ExpiresInSec."
+        }
+    }
+
+    return $context
+}
+
+function Get-DATIntuneAuthContext {
+    <#
+    .SYNOPSIS
+        Returns the complete Intune auth state needed by a background runspace.
+    #>
+    [OutputType([hashtable])]
+    param (
+        [switch]$NoRefresh
+    )
+
+    $status = Get-DATIntuneAuthStatus -NoRefresh:$NoRefresh
+    $expiresInSec = if ($status.IsAuthenticated) {
+        [math]::Max(0, [int](($script:IntuneTokenExpiry - (Get-Date)).TotalSeconds))
+    } else { 0 }
+
+    return @{
+        Token                        = $script:IntuneAuthToken
+        ExpiresOn                    = $script:IntuneTokenExpiry
+        ExpiresInSec                 = $expiresInSec
+        RefreshToken                 = $script:IntuneRefreshToken
+        AuthClientId                 = $script:IntuneAuthClientId
+        TenantId                     = $script:IntuneTenantId
+        TenantEnvironment            = $status.TenantEnvironment
+        TenantEnvironmentDisplayName = $status.TenantEnvironmentDisplayName
+        GraphBaseUrl                 = $status.GraphBaseUrl
+        GraphResource                = $status.GraphResource
+        AuthorityHost                = $status.AuthorityHost
+        IsAuthenticated              = $status.IsAuthenticated
+        MinutesRemaining             = $status.MinutesRemaining
+    }
+}
+
+function Set-DATIntuneAuthContext {
+    <#
+    .SYNOPSIS
+        Restores Intune auth state in the current runspace.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)]$AuthContext
+    )
+
+    $context = ConvertTo-DATIntuneAuthContextMap -AuthContext $AuthContext
+    $tenantEnvironment = [string]$context['TenantEnvironment']
+    Set-DATIntuneEnvironment -Environment $tenantEnvironment -Silent | Out-Null
+
+    if ($context.ContainsKey('Token')) {
+        $token = [string]$context['Token']
+        if ([string]::IsNullOrEmpty($token)) {
+            $script:IntuneAuthToken = $null
+            $script:IntuneTokenExpiry = [datetime]::MinValue
+        } else {
+            $script:IntuneAuthToken = $token
+
+            $expiresOn = if ($context.ContainsKey('ExpiresOn')) { $context['ExpiresOn'] } else { $null }
+            $expiresInSec = if ($context.ContainsKey('ExpiresInSec')) { $context['ExpiresInSec'] } else { $null }
+            if ($null -ne $expiresOn -and $expiresOn -is [datetime]) {
+                $script:IntuneTokenExpiry = $expiresOn
+            } elseif ($null -ne $expiresOn -and -not [string]::IsNullOrWhiteSpace([string]$expiresOn)) {
+                $script:IntuneTokenExpiry = [datetime]$expiresOn
+            } elseif ($null -ne $expiresInSec -and [int]$expiresInSec -gt 0) {
+                $script:IntuneTokenExpiry = (Get-Date).AddSeconds([int]$expiresInSec)
+            }
+        }
+    }
+
+    if ($context.ContainsKey('TenantId')) {
+        $tenantId = $context['TenantId']
+        $script:IntuneTenantId = if ($null -eq $tenantId -or [string]::IsNullOrEmpty([string]$tenantId)) { $null } else { [string]$tenantId }
+    }
+
+    if ($context.ContainsKey('RefreshToken')) {
+        $refreshToken = $context['RefreshToken']
+        $script:IntuneRefreshToken = if ($null -eq $refreshToken -or [string]::IsNullOrEmpty([string]$refreshToken)) { $null } else { [string]$refreshToken }
+    }
+
+    if ($context.ContainsKey('AuthClientId')) {
+        $authClientId = $context['AuthClientId']
+        $script:IntuneAuthClientId = if ($null -eq $authClientId -or [string]::IsNullOrEmpty([string]$authClientId)) { $null } else { [string]$authClientId }
+    }
+
+    return Get-DATIntuneAuthStatus -NoRefresh
 }
 
 function Disconnect-DATIntuneGraph {
@@ -7196,6 +7668,7 @@ function Disconnect-DATIntuneGraph {
     $script:IntuneTenantId = $null
     $script:IntuneRefreshToken = $null
     $script:IntuneAuthClientId = $null
+    $script:IntuneAuthTenantEndpoint = 'organizations'
     Write-DATLogEntry -Value "[Intune Auth] Disconnected - token discarded" -Severity 1
 }
 
@@ -7243,6 +7716,8 @@ function Invoke-DATGraphRequest {
                 Uri         = $fullUri
                 Headers     = $headers
                 ErrorAction = 'Stop'
+                TimeoutSec  = 100   # Never block indefinitely on a stalled connection; a timeout
+                                    # is retried as a transient connection error (see catch below).
             }
             if ($Body -and $Method -in @('POST', 'PATCH')) {
                 $splat['Body'] = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 -Compress }
@@ -7261,18 +7736,28 @@ function Invoke-DATGraphRequest {
                     if ($_.Exception.Response) {
                         $retryStatusCode = [int]$_.Exception.Response.StatusCode
                     }
-                    $isTransient = $retryStatusCode -in @(429, 500, 502, 503, 504)
+                    # Connection-level failures surface as .NET exceptions with NO HTTP response
+                    # (e.g. "Cannot access a disposed object. Object name: 'System.Net.Connection'"
+                    # when a pooled keep-alive connection is reused after the background runspace
+                    # that opened it was disposed, or connection resets/timeouts). These are
+                    # transient -- a retry drops the bad connection and establishes a fresh one.
+                    $connMsg = "$($_.Exception.Message) $(if ($_.Exception.InnerException) { $_.Exception.InnerException.Message })"
+                    $isConnLevel = ($null -eq $_.Exception.Response) -and
+                                   ($connMsg -match "disposed object|System\.Net\.Connection|underlying connection was closed|forcibly closed|connection was reset|operation has timed out|timed out|HttpClient\.Timeout|task was canceled|request was canceled|Unable to connect|request was aborted|actively refused|error occurred while sending the request|connection attempt failed")
+                    $isTransient = ($retryStatusCode -in @(429, 500, 502, 503, 504)) -or $isConnLevel
 
                     if ($isTransient -and $attempt -le $maxRetries) {
-                        # Use Retry-After header if present (for 429), otherwise exponential backoff
-                        $waitSec = $retryDelaySec * [math]::Pow(2, $attempt - 1)
+                        # Connection-level errors resolve on an immediate retry (fresh connection);
+                        # HTTP 5xx/429 use exponential backoff. Honour Retry-After for 429.
+                        $waitSec = if ($isConnLevel) { 1 } else { $retryDelaySec * [math]::Pow(2, $attempt - 1) }
                         if ($retryStatusCode -eq 429 -and $_.Exception.Response.Headers) {
                             try {
                                 $retryAfter = $_.Exception.Response.Headers | Where-Object { $_.Key -eq 'Retry-After' } | Select-Object -ExpandProperty Value -First 1
                                 if ($retryAfter) { $waitSec = [math]::Max([int]$retryAfter, 1) }
                             } catch { }
                         }
-                        Write-DATLogEntry -Value "[Graph API] HTTP $retryStatusCode on $Method $Uri -- retry $attempt/$maxRetries in ${waitSec}s..." -Severity 2
+                        $reason = if ($isConnLevel) { "connection error ($($_.Exception.Message))" } else { "HTTP $retryStatusCode" }
+                        Write-DATLogEntry -Value "[Graph API] $reason on $Method $Uri -- retry $attempt/$maxRetries in ${waitSec}s..." -Severity 2
                         Start-Sleep -Seconds $waitSec
                         continue
                     }
@@ -7333,6 +7818,7 @@ function Invoke-DATGraphRequest {
                         Method      = $Method
                         Uri         = if ($Uri -match '^https://') { $Uri } else { "$($script:GraphBaseUrl)/$($Uri.TrimStart('/'))" }
                         Headers     = $headers
+                        TimeoutSec  = 100
                         ErrorAction = 'Stop'
                     }
                     if ($Body -and $Method -in @('POST', 'PATCH')) {
@@ -7357,6 +7843,34 @@ function Invoke-DATGraphRequest {
         if ($Body -and $Method -in @('POST', 'PATCH')) {
             $bodyJson = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 10 }
             Write-DATLogEntry -Value "[Graph API] Request body: $bodyJson" -Severity 2
+        }
+        # Rethrow with the descriptive Graph reason instead of a generic "(400) Bad Request".
+        # The useful detail lives in the JSON response body's error.message; without this,
+        # callers (e.g. the assignment dialog) surface a blank/uninformative failure.
+        $graphDetail = $null
+        if ($responseBody) {
+            try {
+                $parsed = $responseBody | ConvertFrom-Json -ErrorAction Stop
+                if ($parsed.error -and $parsed.error.message) {
+                    $graphDetail = [string]$parsed.error.message
+                } elseif ($parsed.Message) {
+                    # Some Intune services (e.g. StatelessAppMetadata) return a non-standard shape
+                    # with a top-level "Message" rather than the usual { error: { message } }.
+                    $graphDetail = [string]$parsed.Message
+                }
+            } catch {
+                $graphDetail = $responseBody
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($graphDetail)) {
+            # Drop the diagnostic trailer (Operation ID / Activity ID) from the thrown message --
+            # the full raw response body is already written to the log above, so the caller-facing
+            # message stays short while full detail remains available in the CMTrace log.
+            $graphDetail = ($graphDetail -split ' - Operation ID')[0]
+            $graphDetail = ($graphDetail -split ' - Activity ID')[0]
+            $graphDetail = $graphDetail.Trim()
+            $prefix = if ($statusCode) { "Graph API $statusCode" } else { "Graph API request failed" }
+            throw "${prefix}: $graphDetail"
         }
         throw
     }
@@ -7492,6 +8006,391 @@ function Remove-DATIntuneApp {
     return Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId" -Method DELETE
 }
 
+function Remove-DATIntuneAppAssignments {
+    <#
+    .SYNOPSIS
+        Removes ALL group/target assignments from an Intune Win32 app without deleting the app.
+        Uses the /assign action with an empty assignment set (Graph replaces all assignments
+        with none). Returns the number of assignments that were present before removal.
+    #>
+    [CmdletBinding()]
+    param ([Parameter(Mandatory)][string]$AppId)
+
+    $existing = Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId/assignments" -NoPagination
+    $count = @($existing).Count
+    if ($count -eq 0) { return 0 }
+
+    Write-DATLogEntry -Value "[Intune] Removing $count assignment(s) from app $AppId" -Severity 1
+    # Pass a literal JSON string: Windows PowerShell 5.1's ConvertTo-Json serialises an empty array
+    # (@()) as null, which Graph rejects with "400 Bad Request". An explicit '[]' guarantees a valid
+    # empty assignment set so the /assign action clears all assignments.
+    Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId/assign" -Method POST -Body '{"mobileAppAssignments":[]}' | Out-Null
+    return $count
+}
+
+function Get-DATIntuneAppScriptMetadata {
+    <#
+    .SYNOPSIS
+        Parses the OEM / Model / OS / Version / UpdateType / Baseboards / ReleaseDate /
+        MaintenanceWindowsJson out of an existing DAT-generated detection and/or requirement
+        rule script so the script(s) can be regenerated with the current template WITHOUT
+        recreating the whole Intune app.
+    .DESCRIPTION
+        Both the detection and requirement scripts carry the same header block (OEM/Model/OS/
+        Version/UpdateType) and the same `$expectedValues = @('..','..')` baseboard array.
+        The BIOS detection script additionally embeds the 8-digit package release date, and the
+        requirement script embeds the maintenance-window schedule JSON. This reads whatever is
+        available from either script and returns a single metadata hashtable.
+    #>
+    [CmdletBinding()]
+    param (
+        [AllowEmptyString()][string]$DetectionScript = '',
+        [AllowEmptyString()][string]$RequirementScript = ''
+    )
+
+    $meta = @{
+        OEM                    = ''
+        Model                  = ''
+        OS                     = ''
+        Version                = ''
+        UpdateType             = 'Drivers'
+        Baseboards             = ''
+        ReleaseDate            = ''
+        MaintenanceWindowsJson = ''
+    }
+
+    # Prefer the requirement script for header/baseboard parsing when present (it always exists
+    # for DAT apps), otherwise fall back to the detection script -- both share the same format.
+    $headerSource = if (-not [string]::IsNullOrWhiteSpace($RequirementScript)) { $RequirementScript } else { $DetectionScript }
+
+    if ($headerSource -match '(?m)^\s*OEM:\s*(.+?)\s*$')        { $meta.OEM = $Matches[1].Trim() }
+    if ($headerSource -match '(?m)^\s*Model:\s*(.+?)\s*$')      { $meta.Model = $Matches[1].Trim() }
+    if ($headerSource -match '(?m)^\s*OS:\s*(.+?)\s*$')         { $meta.OS = $Matches[1].Trim() }
+    if ($headerSource -match '(?m)^\s*Version:\s*(.+?)\s*$')    { $meta.Version = $Matches[1].Trim() }
+    if ($headerSource -match '(?m)^\s*UpdateType:\s*(.+?)\s*$') { $meta.UpdateType = $Matches[1].Trim() }
+
+    # Baseboard/SKU values: $expectedValues = @('0CC7','0CC8')
+    if ($headerSource -match "\`$expectedValues\s*=\s*@\(([^)]*)\)") {
+        $vals = [regex]::Matches($Matches[1], "'([^']*)'") | ForEach-Object { $_.Groups[1].Value }
+        $meta.Baseboards = ($vals -join ',')
+    }
+
+    # BIOS release date stamp. Older scripts embed it as `$packageReleaseDate = "20260501"`;
+    # current scripts pass it to the shared Compare-BIOSVersion as `-AvailableReleaseDate "20260501"`.
+    # Accept either form so the rule round-trips cleanly across repeated in-place patches. Prefer
+    # the detection script, then fall back to the requirement script.
+    foreach ($src in @($DetectionScript, $RequirementScript)) {
+        if ([string]::IsNullOrWhiteSpace($src)) { continue }
+        if ($src -match '\$packageReleaseDate\s*=\s*"(\d{8})"' -or
+            $src -match '-AvailableReleaseDate\s+"(\d{8})"') {
+            $meta.ReleaseDate = $Matches[1]
+            break
+        }
+    }
+
+    # Maintenance-window schedule (requirement script only): $mwJson = '[...]'
+    if (-not [string]::IsNullOrWhiteSpace($RequirementScript) -and
+        $RequirementScript -match "(?m)^\s*\`$mwJson\s*=\s*'(.*)'\s*$") {
+        # The generator doubles single quotes for safety; undo that here.
+        $meta.MaintenanceWindowsJson = $Matches[1].Replace("''", "'")
+    }
+
+    return $meta
+}
+
+function Update-DATIntuneAppRuleScript {
+    <#
+    .SYNOPSIS
+        Regenerates a DAT-created Win32 app's detection OR requirement rule script from the
+        current templates and PATCHes it into the EXISTING Intune app -- so template fixes can be
+        pushed to already-published packages without deleting and recreating the whole app
+        (which would require repackaging and re-uploading the .intunewin content).
+    .DESCRIPTION
+        Reads the app's existing PowerShell detection and requirement rule scripts, parses the
+        package metadata out of them, regenerates the requested script with the current template,
+        and issues a PATCH that replaces only the target rule's scriptContent while preserving the
+        other rule verbatim. The install content (.intunewin) is untouched.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][string]$AppId,
+        [Parameter(Mandatory)][ValidateSet('Detection','Requirement')][string]$ScriptType
+    )
+
+    $app = Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId" -NoPagination
+    if ($null -eq $app) { throw "Intune app '$AppId' was not found." }
+
+    $rules = @($app.rules)
+    $detRule = $rules | Where-Object { $_.'@odata.type' -match 'PowerShellScriptRule' -and $_.ruleType -eq 'detection' }   | Select-Object -First 1
+    $reqRule = $rules | Where-Object { $_.'@odata.type' -match 'PowerShellScriptRule' -and $_.ruleType -eq 'requirement' } | Select-Object -First 1
+
+    if ($ScriptType -eq 'Detection'   -and $null -eq $detRule) { throw "This app has no PowerShell detection rule to update." }
+    if ($ScriptType -eq 'Requirement' -and $null -eq $reqRule) { throw "This app has no PowerShell requirement rule to update." }
+
+    $detText = if ($detRule -and $detRule.scriptContent) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($detRule.scriptContent)) } else { '' }
+    $reqText = if ($reqRule -and $reqRule.scriptContent) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($reqRule.scriptContent)) } else { '' }
+
+    $meta = Get-DATIntuneAppScriptMetadata -DetectionScript $detText -RequirementScript $reqText
+    if ([string]::IsNullOrWhiteSpace($meta.OEM) -or [string]::IsNullOrWhiteSpace($meta.Model) -or [string]::IsNullOrWhiteSpace($meta.Baseboards)) {
+        throw "Could not read the package metadata (OEM / Model / Baseboards) from the existing script -- this may not be a Driver Automation Tool package."
+    }
+
+    # Regenerate the requested script from the current template into a temp file.
+    $tempScript = Join-Path $env:TEMP ("DAT_{0}_{1}.ps1" -f $ScriptType, ([Guid]::NewGuid().ToString('N')))
+    try {
+        if ($ScriptType -eq 'Detection') {
+            New-DATIntuneDetectionScript -OutputPath $tempScript -OEM $meta.OEM -Model $meta.Model `
+                -Baseboards $meta.Baseboards -OS $meta.OS -Version $meta.Version `
+                -UpdateType $meta.UpdateType -ReleaseDate $meta.ReleaseDate | Out-Null
+        } else {
+            New-DATIntuneRequirementScript -OutputPath $tempScript -OEM $meta.OEM -Model $meta.Model `
+                -Baseboards $meta.Baseboards -OS $meta.OS -Version $meta.Version `
+                -UpdateType $meta.UpdateType -ReleaseDate $meta.ReleaseDate `
+                -MaintenanceWindowsJson $meta.MaintenanceWindowsJson | Out-Null
+        }
+        $newScriptB64 = ConvertTo-DATNoBomScriptBase64 -Path $tempScript
+    } finally {
+        if (Test-Path $tempScript) { Remove-Item $tempScript -Force -ErrorAction SilentlyContinue }
+    }
+
+    # Choose the (possibly updated) base64 content for each rule.
+    $detB64 = if ($detRule) { $detRule.scriptContent } else { $null }
+    $reqB64 = if ($reqRule) { $reqRule.scriptContent } else { $null }
+    if ($ScriptType -eq 'Detection') { $detB64 = $newScriptB64 } else { $reqB64 = $newScriptB64 }
+
+    # Rebuild the rules collection exactly as the creation pipeline does. Graph requires the full
+    # rules set on a Win32 app PATCH, so both rules are always sent.
+    $newRules = @()
+    if ($detB64) {
+        $newRules += @{
+            "@odata.type"         = "#microsoft.graph.win32LobAppPowerShellScriptRule"
+            ruleType              = "detection"
+            scriptContent         = $detB64
+            enforceSignatureCheck = $false
+            runAs32Bit            = $false
+        }
+    }
+    if ($reqB64) {
+        $newRules += @{
+            "@odata.type"         = "#microsoft.graph.win32LobAppPowerShellScriptRule"
+            ruleType              = "requirement"
+            scriptContent         = $reqB64
+            enforceSignatureCheck = $false
+            runAs32Bit            = $false
+            runAsAccount          = "system"
+            displayName           = "DAT Model Requirement"
+            operationType         = "string"
+            comparisonValue       = "Requirement met"
+            operator              = "equal"
+        }
+    }
+
+    $patchBody = @{
+        "@odata.type" = "#microsoft.graph.win32LobApp"
+        rules         = $newRules
+    }
+    Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId" -Method PATCH -Body $patchBody | Out-Null
+    Write-DATLogEntry -Value "[Intune] Updated $ScriptType rule script on app $AppId ($($meta.OEM) $($meta.Model) $($meta.UpdateType) v$($meta.Version))" -Severity 1
+
+    return [PSCustomObject]@{
+        AppId      = $AppId
+        ScriptType = $ScriptType
+        OEM        = $meta.OEM
+        Model      = $meta.Model
+        Version    = $meta.Version
+        UpdateType = $meta.UpdateType
+    }
+}
+
+function Get-DATIntunePackageNotes {
+    <#
+    .SYNOPSIS
+        The standard Intune Win32 app "notes" string, stamping the Driver Automation Tool version
+        and build that produced/updated the package -- for troubleshooting.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    return "Created by the Driver Automation Tool v$($global:ScriptRelease) (build $($global:ScriptBuildDate))"
+}
+
+function Get-DATIntunePackageDescription {
+    <#
+    .SYNOPSIS
+        Builds the standard Intune Win32 app "description" for a DAT package -- used by the
+        "Republish Metadata" action and kept in the same format the creation pipeline emits:
+        OEM/Model, OS (drivers only), architecture, baseboards, version and the package release date.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param (
+        [Parameter(Mandatory)][string]$OEM,
+        [Parameter(Mandatory)][string]$Model,
+        [string]$OS,
+        [string]$Architecture = 'x64',
+        [string]$Baseboards,
+        [string]$Version,
+        [string]$ReleaseDate,
+        [ValidateSet('Drivers','BIOS')][string]$UpdateType = 'Drivers'
+    )
+
+    $releaseDateStamp = ConvertTo-DATReleaseDateStamp -ReleaseDate $ReleaseDate
+    $releaseDateLine = if (-not [string]::IsNullOrEmpty($releaseDateStamp)) {
+        "`nRelease Date: {0}-{1}-{2}" -f $releaseDateStamp.Substring(0, 4), $releaseDateStamp.Substring(4, 2), $releaseDateStamp.Substring(6, 2)
+    } else { '' }
+
+    if ($UpdateType -eq 'BIOS') {
+        "$UpdateType package for $OEM $Model`nArchitecture: $Architecture`nBaseboards/SKU: $Baseboards`nVersion: $Version$releaseDateLine`nCreated by Driver Automation Tool"
+    } else {
+        "$UpdateType package for $OEM $Model`nOS: $OS`nArchitecture: $Architecture`nBaseboards/SKU: $Baseboards`nVersion: $Version$releaseDateLine`nCreated by Driver Automation Tool"
+    }
+}
+
+function Update-DATIntuneAppMetadata {
+    <#
+    .SYNOPSIS
+        Republishes the metadata (description, information URL, notes, and logo) of an existing
+        DAT-created Win32 app from the current templates/branding via a Graph PATCH. The installer
+        content (.intunewin) and the detection/requirement rules are left untouched, so there is no
+        need to recreate the app.
+    #>
+    [CmdletBinding()]
+    param ([Parameter(Mandatory)][string]$AppId)
+
+    $app = Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId" -NoPagination
+    if ($null -eq $app) { throw "Intune app '$AppId' was not found." }
+
+    # Recover the package identity from the existing rule scripts (same source the rule-update uses).
+    $rules = @($app.rules)
+    $detRule = $rules | Where-Object { $_.'@odata.type' -match 'PowerShellScriptRule' -and $_.ruleType -eq 'detection' }   | Select-Object -First 1
+    $reqRule = $rules | Where-Object { $_.'@odata.type' -match 'PowerShellScriptRule' -and $_.ruleType -eq 'requirement' } | Select-Object -First 1
+    $detText = if ($detRule -and $detRule.scriptContent) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($detRule.scriptContent)) } else { '' }
+    $reqText = if ($reqRule -and $reqRule.scriptContent) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($reqRule.scriptContent)) } else { '' }
+
+    $meta = Get-DATIntuneAppScriptMetadata -DetectionScript $detText -RequirementScript $reqText
+    if ([string]::IsNullOrWhiteSpace($meta.OEM) -or [string]::IsNullOrWhiteSpace($meta.Model)) {
+        throw "Could not read the package metadata (OEM / Model) from the existing scripts -- this may not be a Driver Automation Tool package."
+    }
+
+    # Architecture: use the app's applicableArchitectures (Arm64 vs x64), defaulting to x64.
+    $archValue = [string]$app.applicableArchitectures
+    $arch = if (-not [string]::IsNullOrWhiteSpace($archValue) -and $archValue -match 'arm64' -and $archValue -notmatch 'x64') { 'Arm64' } else { 'x64' }
+
+    $description = Get-DATIntunePackageDescription -OEM $meta.OEM -Model $meta.Model -OS $meta.OS `
+        -Architecture $arch -Baseboards $meta.Baseboards -Version $meta.Version `
+        -ReleaseDate $meta.ReleaseDate -UpdateType $meta.UpdateType
+
+    $patchBody = @{
+        "@odata.type"  = "#microsoft.graph.win32LobApp"
+        description    = $description
+        notes          = (Get-DATIntunePackageNotes)
+        informationUrl = "https://www.driverautomationtool.com"
+    }
+
+    # Refresh the logo from the bundled Driver Automation Tool branding, when available. Guarded so
+    # a missing ScriptDirectory/logo simply leaves the existing icon in place rather than failing.
+    $iconPath = $null
+    if (-not [string]::IsNullOrEmpty($global:ScriptDirectory)) {
+        $iconPath = Join-Path -Path $global:ScriptDirectory -ChildPath 'Branding\DATLogo.png'
+    }
+    if ($iconPath -and (Test-Path $iconPath)) {
+        $iconBase64 = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($iconPath))
+        $patchBody.largeIcon = @{
+            "@odata.type" = "#microsoft.graph.mimeContent"
+            type          = "image/png"
+            value         = $iconBase64
+        }
+    } else {
+        Write-DATLogEntry -Value "[Intune] Republish metadata: logo not found -- icon left unchanged for app $AppId" -Severity 2
+    }
+
+    Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId" -Method PATCH -Body $patchBody | Out-Null
+    Write-DATLogEntry -Value "[Intune] Republished metadata on app $AppId ($($meta.OEM) $($meta.Model) $($meta.UpdateType) v$($meta.Version))" -Severity 1
+
+    return [PSCustomObject]@{
+        AppId      = $AppId
+        OEM        = $meta.OEM
+        Model      = $meta.Model
+        Version    = $meta.Version
+        UpdateType = $meta.UpdateType
+    }
+}
+
+function Get-DATIntuneAssignmentTargetKey {
+    <#
+    .SYNOPSIS
+        Maps an Intune app assignment target object to a comparable key so assignments that
+        point at the same audience -- a specific group, All Devices, or All Users -- can be
+        matched across two versions of an app. Returns $null for unrecognised targets.
+        NOTE: the exclusion-group check must come before the include-group check because the
+        exclusion type name also ends with "groupAssignmentTarget".
+    #>
+    [CmdletBinding()]
+    param ($Target)
+
+    if ($null -eq $Target) { return $null }
+    $odataType = [string]$Target.'@odata.type'
+    if ($odataType -like '*allDevicesAssignmentTarget')       { return 'ALLDEVICES' }
+    if ($odataType -like '*allLicensedUsersAssignmentTarget') { return 'ALLUSERS' }
+    if ($odataType -like '*exclusionGroupAssignmentTarget')   { if ($Target.groupId) { return "EXCLUDE:$($Target.groupId)" } }
+    if ($odataType -like '*groupAssignmentTarget')            { if ($Target.groupId) { return "GROUP:$($Target.groupId)" } }
+    return $null
+}
+
+function Get-DATIntuneAppAssignmentTargetKeys {
+    <#
+    .SYNOPSIS
+        Returns the distinct set of target keys (group / All Devices / All Users) currently
+        assigned to an Intune Win32 app. Used to determine which target(s) a superseded version
+        must be unassigned from so only the newest version stays deployed to that audience.
+    .OUTPUTS
+        [string[]] of target keys (empty when the app has no assignments).
+    #>
+    [CmdletBinding()]
+    param ([Parameter(Mandatory)][string]$AppId)
+
+    $assignments = @(Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId/assignments" -NoPagination)
+    $keys = [System.Collections.Generic.List[string]]::new()
+    foreach ($a in $assignments) {
+        $k = Get-DATIntuneAssignmentTargetKey -Target $a.target
+        if ($k -and -not $keys.Contains($k)) { [void]$keys.Add($k) }
+    }
+    return $keys.ToArray()
+}
+
+function Remove-DATIntuneAppAssignmentTargets {
+    <#
+    .SYNOPSIS
+        Removes only the assignments of an Intune Win32 app whose target matches one of the
+        supplied target keys (from Get-DATIntuneAppAssignmentTargetKeys). Assignments to other
+        audiences (e.g. a separate pilot group) are left intact. Deletes each matching
+        assignment individually so non-overlapping assignments are preserved.
+    .OUTPUTS
+        [int] the number of assignments removed.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][string]$AppId,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$TargetKeys
+    )
+
+    if ($null -eq $TargetKeys -or $TargetKeys.Count -eq 0) { return 0 }
+    $keySet = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($k in $TargetKeys) { if (-not [string]::IsNullOrEmpty($k)) { [void]$keySet.Add($k) } }
+
+    $assignments = @(Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId/assignments" -NoPagination)
+    $removed = 0
+    foreach ($a in $assignments) {
+        $k = Get-DATIntuneAssignmentTargetKey -Target $a.target
+        if ($k -and $keySet.Contains($k) -and -not [string]::IsNullOrEmpty($a.id)) {
+            Write-DATLogEntry -Value "[Intune] Removing assignment $($a.id) (target: $k) from app $AppId" -Severity 1
+            Invoke-DATGraphRequest -Uri "/deviceAppManagement/mobileApps/$AppId/assignments/$($a.id)" -Method DELETE | Out-Null
+            $removed++
+        }
+    }
+    return $removed
+}
+
 function ConvertTo-DATPackageDate {
     <#
     .SYNOPSIS
@@ -7510,6 +8409,44 @@ function ConvertTo-DATPackageDate {
     $parsed = [datetime]::MinValue
     if ([datetime]::TryParse($text, [ref]$parsed)) { return $parsed }
     return [datetime]::MinValue
+}
+
+function ConvertTo-DATReleaseDateStamp {
+    <#
+    .SYNOPSIS
+        Normalises a catalog release-date string to a strict 8-digit yyyyMMdd stamp.
+    .DESCRIPTION
+        Parses culture-invariantly against an explicit set of expected formats (so a US-style
+        catalog date is not misread on a non-US build host, and vice-versa). Returns an empty
+        string when the value is missing or cannot be parsed -- callers must treat an empty
+        result as "no usable date" and fall back to a registry/version marker rather than feed a
+        raw, un-normalised string into a lexical (yyyyMMdd) comparison. The output is guaranteed
+        to be either exactly 8 digits or an empty string.
+    #>
+    [CmdletBinding()]
+    param ([string]$ReleaseDate)
+
+    if ([string]::IsNullOrWhiteSpace($ReleaseDate)) { return '' }
+
+    $inv    = [System.Globalization.CultureInfo]::InvariantCulture
+    $styles = [System.Globalization.DateTimeStyles]::None
+    # Ordered, explicit expected formats. ISO first (the catalog's canonical form); ambiguous
+    # slash/dash forms are resolved deterministically by list order (MM/dd before dd-MM).
+    $formats = @(
+        'yyyy-MM-dd', 'yyyyMMdd', 'yyyy/MM/dd',
+        'yyyy-MM-ddTHH:mm:ss', 'yyyy-MM-ddTHH:mm:ssZ', 'yyyy-MM-dd HH:mm:ss',
+        'MM/dd/yyyy', 'dd-MM-yyyy'
+    )
+    $parsed = [datetime]::MinValue
+    if ([datetime]::TryParseExact($ReleaseDate.Trim(), [string[]]$formats, $inv, $styles, [ref]$parsed)) {
+        return $parsed.ToString('yyyyMMdd', $inv)
+    }
+    # Final invariant fallback for ISO variants with fractional seconds / offsets. Still strictly
+    # culture-invariant -- never a raw string passthrough.
+    if ([datetime]::TryParse($ReleaseDate.Trim(), $inv, $styles, [ref]$parsed)) {
+        return $parsed.ToString('yyyyMMdd', $inv)
+    }
+    return ''
 }
 
 function Get-DATVersionSortKey {
@@ -7552,10 +8489,26 @@ function Invoke-DATPackageRetention {
         [string]$SiteServer,
         [string]$SiteCode,
         # Intune: pass $true to clean up Intune Win32 apps (requires valid Graph token)
-        [switch]$Intune
+        [switch]$Intune,
+        # Also delete the package source folder on disk (ConfigMgr only -- uses PkgSourcePath)
+        [switch]$DeleteSourceFolder,
+        # Optional progress callback invoked with a single status string for each package that
+        # is scanned/removed/unassigned, so the UI can show live detail (name + package id).
+        [scriptblock]$OnProgress,
+        # Optional pre-fetched Intune Win32 app list (from Get-DATIntuneWin32Apps). Supplying it
+        # avoids a full paginated Graph query per model when cleaning many models at once.
+        [object[]]$IntuneApps,
+        # Optional pre-created CIM session to the site server, reused across models.
+        [object]$CimSession
     )
 
     $results = [System.Collections.Generic.List[pscustomobject]]::new()
+
+    # Fire the progress callback if one was supplied (never let a UI callback break retention).
+    $emitProgress = {
+        param([string]$Message)
+        if ($OnProgress) { try { & $OnProgress $Message } catch { } }
+    }
 
     # --- ConfigMgr cleanup ---
     if ($SiteServer -and $SiteCode) {
@@ -7568,17 +8521,19 @@ function Invoke-DATPackageRetention {
             # caller only supplies the base OS ("Windows 11"). Match with an anchored LIKE
             # pattern so the build segment between the OS and architecture is tolerated --
             # an exact name match would otherwise find nothing and delete nothing.
-            $cimSess = New-DATCimSession -ComputerName $SiteServer
+            $cimSess = if ($CimSession) { $CimSession } else { New-DATCimSession -ComputerName $SiteServer }
             if ($PackageType -eq 'BIOS') {
                 $pkgName  = "$packagePrefix - $OEM $Model"
                 $whereClause = "Name = '$($pkgName -replace "'","''")'"
                 Write-DATLogEntry -Value "[Retention][CM] Querying superseded packages for: $pkgName" -Severity 1
+                & $emitProgress "Scanning ConfigMgr: $pkgName"
             } else {
                 $namePattern = "$packagePrefix - $OEM $Model - $OS%$Architecture"
                 $whereClause = "Name LIKE '$($namePattern -replace "'","''")'"
                 Write-DATLogEntry -Value "[Retention][CM] Querying superseded packages matching: $namePattern" -Severity 1
+                & $emitProgress "Scanning ConfigMgr: $packagePrefix - $OEM $Model"
             }
-            $wmiQuery = "SELECT PackageID, Name, Version, SourceDate FROM SMS_Package WHERE $whereClause"
+            $wmiQuery = "SELECT PackageID, Name, Version, SourceDate, PkgSourcePath FROM SMS_Package WHERE $whereClause"
             $allPkgs  = @(Invoke-DATRemoteQuery -CimSession $cimSess -ComputerName $SiteServer -Namespace $smsNamespace -Query $wmiQuery)
             # Group by package name so each distinct package line keeps its own newest
             # version(s); retention is applied per-name, not across different packages.
@@ -7598,6 +8553,7 @@ function Invoke-DATPackageRetention {
 
             foreach ($pkg in $toDelete) {
                 Write-DATLogEntry -Value "[Retention][CM] Removing $($pkg.Name) v$($pkg.Version) ($($pkg.PackageID))" -Severity 1
+                & $emitProgress "Removing (ConfigMgr): $($pkg.Name) v$($pkg.Version) [$($pkg.PackageID)]"
                 try {
                     if ($null -ne $cimSess) {
                         Get-CimInstance -CimSession $cimSess -Namespace $smsNamespace `
@@ -7608,6 +8564,23 @@ function Invoke-DATPackageRetention {
                         $wmiObj | ForEach-Object { $_.Delete() }
                     }
                     $results.Add([pscustomobject]@{ Platform='ConfigMgr'; Name=$pkg.Name; Version=$pkg.Version; PackageId=$pkg.PackageID; Action='Deleted'; Error='' })
+
+                    # Optionally remove the package source folder on disk. Only runs after the
+                    # SMS_Package object was removed successfully so a failed delete never orphans
+                    # content that is still referenced. Non-fatal -- a missing/locked share is
+                    # logged as a warning rather than failing the whole retention pass (#849).
+                    if ($DeleteSourceFolder -and -not [string]::IsNullOrWhiteSpace($pkg.PkgSourcePath)) {
+                        try {
+                            if (Test-Path -LiteralPath $pkg.PkgSourcePath) {
+                                Remove-Item -LiteralPath $pkg.PkgSourcePath -Recurse -Force -ErrorAction Stop
+                                Write-DATLogEntry -Value "[Retention][CM] Deleted source folder: $($pkg.PkgSourcePath)" -Severity 1
+                            } else {
+                                Write-DATLogEntry -Value "[Retention][CM] Source folder not found (skipped): $($pkg.PkgSourcePath)" -Severity 2
+                            }
+                        } catch {
+                            Write-DATLogEntry -Value "[Retention][CM] Failed to delete source folder '$($pkg.PkgSourcePath)': $($_.Exception.Message)" -Severity 2
+                        }
+                    }
                 } catch {
                     $results.Add([pscustomobject]@{ Platform='ConfigMgr'; Name=$pkg.Name; Version=$pkg.Version; PackageId=$pkg.PackageID; Action='Failed'; Error=$_.Exception.Message })
                 }
@@ -7621,8 +8594,9 @@ function Invoke-DATPackageRetention {
     if ($Intune) {
         try {
             $displayPrefix = if ($PackageType -eq 'BIOS') { 'BIOS' } else { 'Drivers' }
+            & $emitProgress "Scanning Intune: $displayPrefix - $OEM $Model"
             # Intune display names: "<Prefix> - <OEM> <Model> - <OS> <Arch>" or just "<Prefix> - <OEM> <Model>" for BIOS
-            $allApps = Get-DATIntuneWin32Apps
+            $allApps = if ($null -ne $IntuneApps) { $IntuneApps } else { Get-DATIntuneWin32Apps }
             if ($PackageType -eq 'BIOS') {
                 $baseSearch = "$displayPrefix - $OEM $Model"
                 Write-DATLogEntry -Value "[Retention][Intune] Querying Win32 apps matching: $baseSearch*" -Severity 1
@@ -7648,11 +8622,44 @@ function Invoke-DATPackageRetention {
 
             foreach ($app in $toDelete) {
                 Write-DATLogEntry -Value "[Retention][Intune] Removing $($app.displayName) v$($app.displayVersion) ($($app.id))" -Severity 1
+                & $emitProgress "Removing (Intune): $($app.displayName) v$($app.displayVersion) [$($app.id)]"
                 try {
                     Remove-DATIntuneApp -AppId $app.id | Out-Null
                     $results.Add([pscustomobject]@{ Platform='Intune'; Name=$app.displayName; Version=$app.displayVersion; PackageId=$app.id; Action='Deleted'; Error='' })
                 } catch {
                     $results.Add([pscustomobject]@{ Platform='Intune'; Name=$app.displayName; Version=$app.displayVersion; PackageId=$app.id; Action='Failed'; Error=$_.Exception.Message })
+                }
+            }
+
+            # Unassign superseded-but-retained versions from the CURRENT version's target(s).
+            # When RetainCount >= 1 the older version(s) are kept for rollback, but leaving them
+            # assigned to the same audience as the newest version means two Win32 apps for the
+            # same make/model deploy to the same devices and conflict. Only the target(s) the
+            # newest version is assigned to (a specific group, All Devices, or All Users) are
+            # removed from the retained older versions -- any separate assignment (e.g. a pilot
+            # group unique to the older version) is left intact. The kept set is the first
+            # (RetainCount + 1) newest apps: index 0 is the current version (untouched);
+            # indexes 1..RetainCount are the retained-older versions to unassign.
+            if ($RetainCount -gt 0 -and $sorted.Count -gt 1) {
+                $newest = $sorted[0]
+                $newestTargetKeys = @(Get-DATIntuneAppAssignmentTargetKeys -AppId $newest.id)
+                if ($newestTargetKeys.Count -gt 0) {
+                    $retainedOlder = @($sorted | Select-Object -Skip 1 -First $RetainCount)
+                    foreach ($app in $retainedOlder) {
+                        try {
+                            & $emitProgress "Unassigning (Intune): $($app.displayName) v$($app.displayVersion) [$($app.id)]"
+                            $removed = Remove-DATIntuneAppAssignmentTargets -AppId $app.id -TargetKeys $newestTargetKeys
+                            if ($removed -gt 0) {
+                                Write-DATLogEntry -Value "[Retention][Intune] Unassigned superseded version $($app.displayName) v$($app.displayVersion) ($($app.id)) from the current version's target(s) -- removed $removed assignment(s)" -Severity 1
+                                $results.Add([pscustomobject]@{ Platform='Intune'; Name=$app.displayName; Version=$app.displayVersion; PackageId=$app.id; Action='Unassigned'; Error='' })
+                            }
+                        } catch {
+                            Write-DATLogEntry -Value "[Retention][Intune] Failed to unassign $($app.displayName) v$($app.displayVersion): $($_.Exception.Message)" -Severity 2
+                            $results.Add([pscustomobject]@{ Platform='Intune'; Name=$app.displayName; Version=$app.displayVersion; PackageId=$app.id; Action='Failed'; Error=$_.Exception.Message })
+                        }
+                    }
+                } else {
+                    Write-DATLogEntry -Value "[Retention][Intune] Current version has no assignments -- skipping unassign of retained older versions (no conflict)" -Severity 1
                 }
             }
         } catch {
@@ -7683,6 +8690,71 @@ function Search-DATEntraGroups {
     $uri = "/groups?`$filter=startswith(displayName,'$safe')&`$select=id,displayName,description,groupTypes,mailEnabled,securityEnabled&`$top=$MaxResults&`$orderby=displayName&`$count=true"
     $results = Invoke-DATGraphRequest -Uri $uri -NoPagination -AdditionalHeaders @{ 'ConsistencyLevel' = 'eventual' }
     return $results
+}
+
+function Get-DATDeployedPackageVersions {
+    <#
+    .SYNOPSIS
+        Returns the display name and version of every driver/BIOS package currently deployed
+        to the given platform, so the UI can flag models whose catalog version is newer than
+        what is already published (issue: "show newer BIOS/driver available").
+    .DESCRIPTION
+        Intune uses Win32 app display names of the form:
+            "Drivers - <OEM> <Model> - <OS> <Arch>"   and   "BIOS - <OEM> <Model>"
+        ConfigMgr uses SMS_Package names of the form:
+            "Drivers - <OEM> <Model> - <OS> <Arch>"   and   "BIOS Update - <OEM> <Model>"
+        (plus the "* Pilot" variants). This returns a flat list of @{ Name; Version } objects
+        that the caller parses into a lookup keyed by make/model/OS.
+    .OUTPUTS
+        Array of [pscustomobject]@{ Name = <string>; Version = <string> }.
+    #>
+    [CmdletBinding()]
+    param (
+        [Parameter(Mandatory)][ValidateSet('Intune', 'ConfigMgr')][string]$Platform,
+        [string]$SiteServer,
+        [string]$SiteCode
+    )
+
+    $out = New-Object System.Collections.Generic.List[object]
+
+    if ($Platform -eq 'Intune') {
+        if (-not (Test-DATIntuneAuth)) {
+            Write-DATLogEntry -Value "[DeployedVersions] Intune not authenticated -- skipping deployed-version scan" -Severity 2
+            return @()
+        }
+        $apps = Get-DATIntuneWin32Apps
+        foreach ($a in $apps) {
+            if ([string]::IsNullOrEmpty($a.displayName)) { continue }
+            if ($a.displayName -like 'Drivers -*' -or $a.displayName -like 'Drivers Pilot -*' -or
+                $a.displayName -like 'BIOS -*'    -or $a.displayName -like 'BIOS Pilot -*') {
+                $out.Add([pscustomobject]@{ Name = $a.displayName; Version = $a.displayVersion })
+            }
+        }
+        Write-DATLogEntry -Value "[DeployedVersions] Intune: collected $($out.Count) driver/BIOS app version(s)" -Severity 1
+    }
+    else {
+        if ([string]::IsNullOrEmpty($SiteServer) -or [string]::IsNullOrEmpty($SiteCode)) {
+            Write-DATLogEntry -Value "[DeployedVersions] ConfigMgr site not configured -- skipping deployed-version scan" -Severity 2
+            return @()
+        }
+        try {
+            $ns = "root\SMS\Site_$SiteCode"
+            $cim = New-DATCimSession -ComputerName $SiteServer
+            $query = "SELECT Name, Version FROM SMS_Package WHERE Name LIKE 'Drivers -%' OR Name LIKE 'BIOS -%' OR Name LIKE 'BIOS Update -%'"
+            $pkgs = Invoke-DATRemoteQuery -CimSession $cim -ComputerName $SiteServer -Namespace $ns -Query $query
+            foreach ($p in $pkgs) {
+                if (-not [string]::IsNullOrEmpty($p.Name)) {
+                    $out.Add([pscustomobject]@{ Name = $p.Name; Version = $p.Version })
+                }
+            }
+            Write-DATLogEntry -Value "[DeployedVersions] ConfigMgr: collected $($out.Count) driver/BIOS package version(s)" -Severity 1
+        } catch {
+            Write-DATLogEntry -Value "[DeployedVersions] ConfigMgr query failed: $($_.Exception.Message)" -Severity 2
+            return @()
+        }
+    }
+
+    return $out.ToArray()
 }
 
 function Set-DATIntuneAppAssignment {
@@ -7832,12 +8904,17 @@ function Find-DATIntuneAssignmentFilter {
     <#
     .SYNOPSIS
         Searches existing assignment filters for a matching manufacturer/model rule.
-        Returns the filter if found, $null otherwise.
+        Returns the filter if found, $null otherwise. Matches on the deterministic
+        display name first (the most reliable dedup key), then falls back to a
+        whitespace/case-normalized rule comparison. The Graph API can reformat the
+        rule string it stores (spacing around operators/parentheses), so an exact
+        string match is unreliable and causes duplicate filters to be created.
     #>
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)][string]$Manufacturer,
-        [string]$Model
+        [string]$Model,
+        [string]$FilterName
     )
 
     $filters = Get-DATIntuneAssignmentFilters
@@ -7853,8 +8930,28 @@ function Find-DATIntuneAssignmentFilter {
         $targetRule = "(device.manufacturer -contains `"$Manufacturer`")"
     }
 
+    # Normalize a rule string for tolerant comparison: collapse all whitespace runs
+    # to a single space, trim, and lower-case. Graph reformats the stored rule which
+    # breaks an exact match and results in duplicate filters being created.
+    $normalize = {
+        param($ruleText)
+        if ([string]::IsNullOrEmpty($ruleText)) { return '' }
+        return (($ruleText -replace '\s+', ' ').Trim()).ToLowerInvariant()
+    }
+    $targetRuleNorm = & $normalize $targetRule
+
     foreach ($f in $filters) {
-        if ($f.rule -eq $targetRule) {
+        # Primary match: deterministic display name (case-insensitive). Both the
+        # driver and BIOS builds generate the identical filter name, so this is the
+        # most reliable way to detect and reuse an already-created filter.
+        if (-not [string]::IsNullOrEmpty($FilterName) -and
+            -not [string]::IsNullOrEmpty($f.displayName) -and
+            $f.displayName.Trim().Equals($FilterName.Trim(), [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $f
+        }
+
+        # Secondary match: whitespace/case-normalized rule comparison.
+        if ((& $normalize $f.rule) -eq $targetRuleNorm) {
             return $f
         }
     }
@@ -7928,13 +9025,17 @@ function Invoke-DATAutoAssignmentFilter {
         The device model name. Only used when FilterMode is 'Model'.
     .PARAMETER FilterMode
         'Make' = one filter per manufacturer. 'Model' = one filter per make+model.
+    .PARAMETER TargetGroupId
+        Optional. The Entra group Object ID to assign the app to. Defaults to the built-in
+        All Devices group. Supply a custom security group Object ID to scope the deployment.
     #>
     [CmdletBinding()]
     param (
         [Parameter(Mandatory)][string]$AppId,
         [Parameter(Mandatory)][string]$Manufacturer,
         [string]$Model,
-        [Parameter(Mandatory)][ValidateSet('Make', 'Model')][string]$FilterMode
+        [Parameter(Mandatory)][ValidateSet('Make', 'Model')][string]$FilterMode,
+        [string]$TargetGroupId = 'adadadad-808e-44e2-905a-0b7873a8a531'
     )
 
     # Check current filter count against limit
@@ -7957,13 +9058,16 @@ function Invoke-DATAutoAssignmentFilter {
         'DATFilter-%MAKE%'
     }
 
-    # Determine filter name from template and lookup parameters
+    # Determine filter name from template and lookup parameters. The resolved
+    # filter name is passed to the lookup so an already-created filter is reused
+    # (via a deterministic display-name match) rather than duplicated -- e.g. when
+    # a driver package and a BIOS package are built for the same model in one run.
     if ($FilterMode -eq 'Model' -and -not [string]::IsNullOrEmpty($Model)) {
         $filterName = $nameTemplate -replace '%MAKE%', $Manufacturer -replace '%MODEL%', $Model
-        $existingFilter = Find-DATIntuneAssignmentFilter -Manufacturer $Manufacturer -Model $Model
+        $existingFilter = Find-DATIntuneAssignmentFilter -Manufacturer $Manufacturer -Model $Model -FilterName $filterName
     } else {
         $filterName = ($nameTemplate -replace '%MAKE%', $Manufacturer -replace '%MODEL%', '').Trim()
-        $existingFilter = Find-DATIntuneAssignmentFilter -Manufacturer $Manufacturer
+        $existingFilter = Find-DATIntuneAssignmentFilter -Manufacturer $Manufacturer -FilterName $filterName
     }
 
     # Reuse existing or create new
@@ -7991,10 +9095,9 @@ function Invoke-DATAutoAssignmentFilter {
         Write-DATLogEntry -Value "[Intune] Created assignment filter: $filterName ($filterId)" -Severity 1
     }
 
-    # Assign to All Devices with the filter in include mode
-    $allDevicesId = 'adadadad-808e-44e2-905a-0b7873a8a531'
-    Set-DATIntuneAppAssignmentWithFilter -AppId $AppId -GroupId $allDevicesId -Intent 'Required' -FilterId $filterId -FilterType 'include'
-    Write-DATLogEntry -Value "[Intune] App $AppId assigned to All Devices with filter $filterName" -Severity 1
+    # Assign to the target group (All Devices by default, or a custom Entra group) with the filter in include mode
+    Set-DATIntuneAppAssignmentWithFilter -AppId $AppId -GroupId $TargetGroupId -Intent 'Required' -FilterId $filterId -FilterType 'include'
+    Write-DATLogEntry -Value "[Intune] App $AppId assigned to group $TargetGroupId with filter $filterName" -Severity 1
 }
 
 #endregion Assignment Filter Functions
@@ -9209,9 +10312,12 @@ function Show-DATStatusToast {
     $scriptContent = $scriptContent.Replace('{{Model}}', $Model)
     $scriptContent = $scriptContent.Replace('{{OS}}', $OS)
     $scriptContent = $scriptContent.Replace('{{Version}}', $Version)
-    $releaseDate8 = ''
-    if (-not [string]::IsNullOrEmpty($ReleaseDate)) {
-        try { $releaseDate8 = ([datetime]$ReleaseDate).ToString('yyyyMMdd') } catch { $releaseDate8 = $ReleaseDate }
+    # Normalise the release date to a strict 8-digit yyyyMMdd stamp (or empty). The BIOS install
+    # template's Compare-BIOSVersion does a lexical date compare, so a raw/culture-ambiguous value
+    # must never be baked in.
+    $releaseDate8 = ConvertTo-DATReleaseDateStamp -ReleaseDate $ReleaseDate
+    if (-not [string]::IsNullOrWhiteSpace($ReleaseDate) -and [string]::IsNullOrEmpty($releaseDate8)) {
+        Write-DATLogEntry -Value "[Intune] WARNING: Could not parse BIOS ReleaseDate '$ReleaseDate' for $OEM $Model -- install-time date comparison disabled, using version-string comparison" -Severity 2
     }
     $scriptContent = $scriptContent.Replace('{{ReleaseDate}}', $releaseDate8)
     $scriptContent = $scriptContent.Replace('{{Generated}}', (Get-Date -Format "yyyy-MM-dd HH:mm:ss"))
@@ -9230,14 +10336,59 @@ function Show-DATStatusToast {
     return $OutputPath
 }
 
+function Get-DATBiosCompareBlock {
+    <#
+    .SYNOPSIS
+        Returns the manufacturer-aware Compare-BIOSVersion function source (single source of
+        truth: the Install-BIOS.ps1 template) plus a no-op Write-CMTraceLog shim, ready to embed
+        in the Intune requirement and detection rule scripts. This lets applicability and detection
+        use the SAME comparison the installer uses -- Dell/HP/Surface/Acer by version, Lenovo by
+        release date -- so all three stages agree.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:BiosCompareBlockCache) { return $script:BiosCompareBlockCache }
+
+    $templatePath = Join-Path $PSScriptRoot 'Templates\Install-BIOS.ps1'
+    if (-not (Test-Path $templatePath)) { throw "Install-BIOS.ps1 template not found at: $templatePath" }
+    $tpl = Get-Content -Path $templatePath -Raw
+
+    $startMarker = 'function Compare-BIOSVersion {'
+    $endMarker   = '{{TOAST_FUNCTIONS}}'
+    $startIdx = $tpl.IndexOf($startMarker)
+    $endIdx   = $tpl.IndexOf($endMarker)
+    if ($startIdx -lt 0 -or $endIdx -lt 0 -or $endIdx -le $startIdx) {
+        throw "Could not extract Compare-BIOSVersion from the Install-BIOS.ps1 template"
+    }
+    $funcText = $tpl.Substring($startIdx, $endIdx - $startIdx).TrimEnd()
+
+    # Shim: Compare-BIOSVersion logs via Write-CMTraceLog, which does not exist in the lightweight
+    # requirement/detection context. A no-op keeps the shared logic working without a log file.
+    $shim = @'
+# No-op logger so the shared Compare-BIOSVersion runs without a log file in the Intune rule context.
+function Write-CMTraceLog { param([Parameter(Mandatory)][string]$Message, [string]$Severity = '1', [string]$Component = '') }
+'@
+
+    $script:BiosCompareBlockCache = "$shim`r`n`r`n$funcText"
+    return $script:BiosCompareBlockCache
+}
+
 function New-DATIntuneRequirementScript {
     <#
     .SYNOPSIS
-        Generates a requirement rule script that checks:
+        Generates a requirement rule script that determines whether a package is APPLICABLE
+        to the device -- i.e. whether it is the right hardware. It checks:
         - Device manufacturer matches the OEM
         - WMI SystemSKU, Baseboard Product or system Model matches one of the model's values
         - OS matches the target OS (Drivers only -- BIOS packages are OS-agnostic)
-        - Package version is newer than any previously installed version (ddMMyyyy comparison)
+
+        Recency ("is a newer version already installed?") is intentionally NOT evaluated here.
+        That decision belongs to the detection rule (New-DATIntuneDetectionScript): a device that
+        is the correct hardware is always applicable, and detection reports whether it is already
+        up to date. This avoids up-to-date devices showing as "Not Applicable" instead of
+        "Installed", and keeps applicability tied to the true hardware identifier (SKU/baseboard).
+        The ReleaseDate/Version parameters are retained for signature compatibility.
     #>
     [CmdletBinding()]
     param (
@@ -9275,77 +10426,10 @@ function New-DATIntuneRequirementScript {
 "@
     }
 
-    # Build Check 4: version/release-date comparison block
-    $releaseDate8 = ''
-    if (-not [string]::IsNullOrEmpty($ReleaseDate)) {
-        try { $releaseDate8 = ([datetime]$ReleaseDate).ToString('yyyyMMdd') } catch { $releaseDate8 = $ReleaseDate }
-    }
-    $versionCheckBlock = if ($UpdateType -eq 'BIOS' -and -not [string]::IsNullOrEmpty($releaseDate8)) {
-        @"
-    # Check 4: BIOS release date comparison
-    try {
-        `$currentBIOS = Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop
-        `$currentReleaseDate = `$currentBIOS.ReleaseDate.ToString('yyyyMMdd')
-        `$packageReleaseDate = "$releaseDate8"
-        if (`$packageReleaseDate -le `$currentReleaseDate) {
-            Write-Output "BIOS release date not newer: package=`$packageReleaseDate, current=`$currentReleaseDate"
-            exit 0
-        }
-    } catch { }
-
-    # Also check if this exact version is already installed via registry
-    `$regPath = "HKLM:\SOFTWARE\DriverAutomationTool\$regSubKey\$OEM\$Model"
-    if (Test-Path `$regPath) {
-        `$installedVer = (Get-ItemProperty -Path `$regPath -Name 'Version' -ErrorAction SilentlyContinue).Version
-        if (`$installedVer -eq "$Version") {
-            Write-Output "Package already installed: version=$Version"
-            exit 0
-        }
-    }
-"@
-    } elseif ($UpdateType -eq 'BIOS') {
-        # BIOS without a catalog release date -- registry exact-match only
-        # (ddMMyyyy parsing is not valid for OEM BIOS version strings like M43KT32A)
-        @"
-    # Check 4: BIOS version check - registry exact match
-    `$regPath = "HKLM:\SOFTWARE\DriverAutomationTool\$regSubKey\$OEM\$Model"
-    if (Test-Path `$regPath) {
-        `$installedVer = (Get-ItemProperty -Path `$regPath -Name 'Version' -ErrorAction SilentlyContinue).Version
-        if (`$installedVer -eq "$Version") {
-            Write-Output "Package already installed: version=$Version"
-            exit 0
-        }
-    }
-"@
-    } else {
-        @"
-    # Check 4: Version check - registry-based installed version
-    `$packageVersion = "$Version"
-    `$regPath = "HKLM:\SOFTWARE\DriverAutomationTool\$regSubKey\$OEM\$Model"
-
-    if (Test-Path `$regPath) {
-        `$installedVer = (Get-ItemProperty -Path `$regPath -Name 'Version' -ErrorAction SilentlyContinue).Version
-        if (-not [string]::IsNullOrEmpty(`$installedVer)) {
-            try {
-                `$pkgDay = [int]`$packageVersion.Substring(0, 2)
-                `$pkgMonth = [int]`$packageVersion.Substring(2, 2)
-                `$pkgYear = [int]`$packageVersion.Substring(4, 4)
-                `$pkgDate = [datetime]::new(`$pkgYear, `$pkgMonth, `$pkgDay)
-
-                `$instDay = [int]`$installedVer.Substring(0, 2)
-                `$instMonth = [int]`$installedVer.Substring(2, 2)
-                `$instYear = [int]`$installedVer.Substring(4, 4)
-                `$instDate = [datetime]::new(`$instYear, `$instMonth, `$instDay)
-
-                if (`$pkgDate -le `$instDate) {
-                    Write-Output "Version not newer: package=`$packageVersion, installed=`$installedVer"
-                    exit 0
-                }
-            } catch { }
-        }
-    }
-"@
-    }
+    # NOTE: No version/recency gate here. Applicability is based purely on the hardware
+    # identifier (manufacturer + SKU/baseboard) and OS. Whether a newer version still needs
+    # installing is decided by the detection rule, so up-to-date devices report as "Installed"
+    # rather than "Not Applicable".
 
     # Build the maintenance-window gate (Check 0). Empty when no schedule is supplied, so
     # packages built without a maintenance window behave exactly as before.
@@ -9398,6 +10482,60 @@ function New-DATIntuneRequirementScript {
 "@
     }
 
+    # Build the deferral snooze gate (Check 0.5). This mirrors the install-time snooze check so a
+    # user "Remind Me Later" deferral parks the package as NOT APPLICABLE in Intune for the
+    # duration of the snooze, instead of the install exiting 1618 and burning Intune's 3-attempt
+    # retry budget (issue #843). Detection is intentionally left untouched, so a device is never
+    # falsely reported as "Installed" while the update is still pending -- during the snooze it
+    # simply reports "Not applicable" (temporarily not required), exactly like a maintenance window.
+    # The block is always emitted; it is a no-op when no snooze value is present (e.g. toast
+    # disabled, or the deferral has expired and been cleared).
+    $deferralSnoozeBlock = @'
+    # Check 0.5: Deferral snooze -- not applicable while a "Remind Me Later" deferral is active
+    $datSnoozeRegPath = 'HKLM:\SOFTWARE\DriverAutomationTool\Toast'
+    $datSnoozeUntil = (Get-ItemProperty -Path $datSnoozeRegPath -Name 'SnoozeUntil' -ErrorAction SilentlyContinue).SnoozeUntil
+    if ($datSnoozeUntil) {
+        try {
+            $datSnoozeTime = [datetime]::Parse($datSnoozeUntil)
+            if ((Get-Date) -lt $datSnoozeTime) {
+                Write-Output "Deferred until $datSnoozeUntil (Remind Me Later active) -- not applicable"
+                exit 0
+            }
+        } catch {
+            # Malformed snooze timestamp -- ignore and treat the package as applicable
+        }
+    }
+'@
+
+    # BIOS applicability gate (Check 4, BIOS only). Reuse the installer's manufacturer-aware
+    # Compare-BIOSVersion so applicability exactly matches what the installer would do:
+    # Dell/HP/Surface/Acer compare by version, Lenovo by release date. The package is applicable
+    # only when an update is actually needed; an up-to-date device reports "Not applicable".
+    # Drivers are unaffected.
+    $biosCompareFuncs = ''
+    $biosRecencyBlock = ''
+    if ($UpdateType -eq 'BIOS') {
+        $releaseDate8 = ConvertTo-DATReleaseDateStamp -ReleaseDate $ReleaseDate
+        if (-not [string]::IsNullOrWhiteSpace($ReleaseDate) -and [string]::IsNullOrEmpty($releaseDate8)) {
+            Write-DATLogEntry -Value "[Intune] WARNING: Could not parse BIOS ReleaseDate '$ReleaseDate' for $OEM $Model -- Lenovo date comparison will be limited (version fallback)" -Severity 2
+        }
+        $biosCompareFuncs = Get-DATBiosCompareBlock
+        $biosRecencyBlock = @"
+    # Check 4: BIOS recency -- applicable only when the installer's own comparison says an update
+    # is needed (Dell/HP/Surface/Acer by version, Lenovo by release date). Independent of the
+    # registry marker, so an already-current device correctly reports "Not applicable".
+    try {
+        `$biosUpdateNeeded = Compare-BIOSVersion -AvailableBIOSVersion "$Version" -Manufacturer "$OEM" -AvailableReleaseDate "$releaseDate8"
+        if (-not `$biosUpdateNeeded) {
+            Write-Output "BIOS already current for $OEM $Model (v$Version) -- not required"
+            exit 0
+        }
+    } catch {
+        # Comparison failed -- fall through and treat as applicable (safer to offer the update).
+    }
+"@
+    }
+
     $scriptContent = @'
 <#
     Driver Automation Tool - Requirement Script
@@ -9411,11 +10549,12 @@ function New-DATIntuneRequirementScript {
     Returns JSON output for Intune requirement rule evaluation.
     Output must contain a property that Intune can evaluate.
 #>
-
+%%BIOS_COMPARE_FUNCS%%
 $RequirementMet = $false
 
 try {{
 %%MAINTENANCE_WINDOW%%
+%%DEFERRAL_SNOOZE%%
     # Check 1: Manufacturer must match OEM
     $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Manufacturer
     $expectedOEM = "{0}"
@@ -9457,8 +10596,7 @@ try {{
     }}
 
 {8}
-%%VERSION_CHECK%%
-
+%%BIOS_RECENCY%%
     # All checks passed
     $RequirementMet = $true
 }}
@@ -9474,8 +10612,10 @@ if ($RequirementMet) {{
 }}
 '@ -f $OEM, $Model, $OS, $Version, $bbValues, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $osNumber, $UpdateType, $osCheckBlock, $regSubKey
 
-    $scriptContent = $scriptContent.Replace('%%VERSION_CHECK%%', $versionCheckBlock)
     $scriptContent = $scriptContent.Replace('%%MAINTENANCE_WINDOW%%', $maintenanceWindowBlock)
+    $scriptContent = $scriptContent.Replace('%%DEFERRAL_SNOOZE%%', $deferralSnoozeBlock)
+    $scriptContent = $scriptContent.Replace('%%BIOS_COMPARE_FUNCS%%', $biosCompareFuncs)
+    $scriptContent = $scriptContent.Replace('%%BIOS_RECENCY%%', $biosRecencyBlock)
 
     # UTF-8 WITHOUT BOM -- Intune requirement rule scripts must not carry a BOM, otherwise
     # the portal/IME treats it as literal content (surfaces as mojibake at the top of the script).
@@ -9524,34 +10664,81 @@ function New-DATIntuneDetectionScript {
 "@
     }
 
-    # Build release date for BIOS detection
-    $releaseDate8 = ''
-    if (-not [string]::IsNullOrEmpty($ReleaseDate)) {
-        try { $releaseDate8 = ([datetime]$ReleaseDate).ToString('yyyyMMdd') } catch { $releaseDate8 = $ReleaseDate }
+    # Build release date for BIOS detection. Normalise to a strict 8-digit yyyyMMdd stamp (or
+    # empty) using culture-invariant parsing; if the catalog value cannot be parsed we leave this
+    # empty and fall back to the registry version marker rather than feeding a malformed value
+    # into a lexical date comparison (which could otherwise flip detection results).
+    $releaseDate8 = ConvertTo-DATReleaseDateStamp -ReleaseDate $ReleaseDate
+    if (-not [string]::IsNullOrWhiteSpace($ReleaseDate) -and [string]::IsNullOrEmpty($releaseDate8)) {
+        Write-DATLogEntry -Value "[Intune] WARNING: Could not parse BIOS ReleaseDate '$ReleaseDate' for $OEM $Model -- release-date detection disabled, using registry version marker only" -Severity 2
     }
 
     # Build Check 4: detection block
-    $detectionCheckBlock = if ($UpdateType -eq 'BIOS' -and -not [string]::IsNullOrEmpty($releaseDate8)) {
+    #
+    # PendingReboot guard: the install scripts stage BIOS/driver updates that only take effect
+    # after a reboot (Dell BIOS exit 1/2, PNPUtil exit 3010, etc.). Because the install script
+    # cannot confirm the update actually applied until after that reboot, it writes a
+    # 'PendingReboot' flag + the device's boot time (LastBootUpTime) alongside the version
+    # marker instead of treating the marker as gospel immediately. Detection here only trusts
+    # the registry marker once the device's current boot time differs from the boot time
+    # recorded when the marker was written -- proof a reboot has actually happened since the
+    # update was staged. Without this guard, a device whose reboot is deferred (Focus Assist,
+    # "Disable Automatic Restart" policy, or a user who simply never restarts) would report as
+    # permanently "Detected"/Installed in Intune even though the BIOS/driver was never actually
+    # applied (issue: maintenance-window-style false positive on the detection side).
+    $pendingRebootGuard = @'
+                $mkTrusted = $true
+                $mkPendingReboot = (Get-ItemProperty -Path $regPath -Name 'PendingReboot' -ErrorAction SilentlyContinue).PendingReboot
+                if ($mkPendingReboot -eq 1) {
+                    $mkBootTimeAtWrite = (Get-ItemProperty -Path $regPath -Name 'PendingRebootBootTime' -ErrorAction SilentlyContinue).PendingRebootBootTime
+                    try {
+                        $mkCurrentBootTime = (Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+                        if ($mkBootTimeAtWrite -and [datetime]$mkBootTimeAtWrite -eq $mkCurrentBootTime) {
+                            # No reboot has occurred since the update was staged -- do not trust the marker yet
+                            $mkTrusted = $false
+                        }
+                    } catch { }
+                }
+'@
+
+    $detectionCheckBlock = if ($UpdateType -eq 'BIOS') {
         @"
-    # Check 4: BIOS detection via release date and registry
-    # Detected if the device BIOS release date is at or newer than the package date,
-    # OR the registry version stamp matches exactly (covers pre-reboot detection).
+    # Check 4: BIOS detection. Detected when the installer's own manufacturer-aware comparison
+    # reports the BIOS is already current (Dell/HP/Surface/Acer by version, Lenovo by release
+    # date). The registry version marker is only a FALLBACK for when the live BIOS version cannot
+    # be read: a flash that was staged but silently failed (or was rolled back) leaves the marker
+    # tattooed AHEAD of the real firmware, so trusting it would wrongly report the update as
+    # installed and permanently block any re-run of the upgrade. We therefore only trust the marker
+    # when the live BIOS version is unreadable; if the live version IS readable and the comparison
+    # still says an update is needed, the marker is stale and is ignored so the upgrade can proceed.
     `$detected = `$false
+    `$biosUpdateNeeded = `$true
     try {
-        `$currentBIOS = Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop
-        `$currentReleaseDate = `$currentBIOS.ReleaseDate.ToString('yyyyMMdd')
-        `$packageReleaseDate = "$releaseDate8"
-        if (`$currentReleaseDate -ge `$packageReleaseDate) {
-            `$detected = `$true
-        }
+        `$biosUpdateNeeded = Compare-BIOSVersion -AvailableBIOSVersion "$Version" -Manufacturer "$OEM" -AvailableReleaseDate "$releaseDate8"
+        if (-not `$biosUpdateNeeded) { `$detected = `$true }
     } catch { }
 
     if (-not `$detected) {
+        # Can the live BIOS version be read? If so, the comparison above is authoritative and a
+        # registry marker must not override a genuine "update needed" result (guards against a
+        # marker that is ahead of the actual installed BIOS after a failed/rolled-back flash).
+        `$liveBiosReadable = `$false
+        try {
+            `$liveBios = Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop
+            if (`$liveBios -and -not [string]::IsNullOrWhiteSpace([string]`$liveBios.SMBIOSBIOSVersion)) { `$liveBiosReadable = `$true }
+        } catch { `$liveBiosReadable = `$false }
+
         `$regPath = "HKLM:\SOFTWARE\DriverAutomationTool\$regSubKey\$OEM\$Model"
         if (Test-Path `$regPath) {
             `$installedVer = (Get-ItemProperty -Path `$regPath -Name 'Version' -ErrorAction SilentlyContinue).Version
             if (`$installedVer -eq "$Version") {
-                `$detected = `$true
+$pendingRebootGuard
+                if (`$mkTrusted -and -not `$liveBiosReadable) {
+                    # Live version unreadable -- trust the marker as a last resort.
+                    `$detected = `$true
+                } elseif (`$mkTrusted -and `$liveBiosReadable) {
+                    Write-Output "Registry marker (`$installedVer) is ahead of the live BIOS -- ignoring stale marker so the update can run"
+                }
             }
         }
     }
@@ -9563,17 +10750,24 @@ function New-DATIntuneDetectionScript {
 "@
     } else {
         @"
-    # Check 4: Version marker in registry
+    # Check 4: Version marker in registry (only trusted once any pending reboot has occurred)
     `$regPath = "HKLM:\SOFTWARE\DriverAutomationTool\$regSubKey\$OEM\$Model"
     if (Test-Path `$regPath) {
         `$installedVersion = (Get-ItemProperty -Path `$regPath -Name 'Version' -ErrorAction SilentlyContinue).Version
         if (`$installedVersion -eq "$Version") {
-            Write-Output "Detected: $OEM $Model $detectionLabel version $Version"
-            exit 0
+$pendingRebootGuard
+            if (`$mkTrusted) {
+                Write-Output "Detected: $OEM $Model $detectionLabel version $Version"
+                exit 0
+            }
         }
     }
 "@
     }
+
+    # Embed the shared manufacturer-aware Compare-BIOSVersion for BIOS detection (empty for drivers).
+    $biosCompareFuncs = ''
+    if ($UpdateType -eq 'BIOS') { $biosCompareFuncs = Get-DATBiosCompareBlock }
 
     $scriptContent = @'
 <#
@@ -9588,7 +10782,7 @@ function New-DATIntuneDetectionScript {
     Exits 0 with STDOUT = app detected (installed).
     Exits 0 with no STDOUT = app not detected (not installed).
 #>
-
+%%BIOS_COMPARE_FUNCS%%
 try {{
     # Check 1: Manufacturer match
     $manufacturer = (Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop).Manufacturer
@@ -9636,6 +10830,7 @@ catch {{
 }}
 '@ -f $OEM, $Model, $OS, $Version, $bbValues, (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $osNumber, $UpdateType, $osCheckBlock, $regSubKey, $detectionLabel
 
+    $scriptContent = $scriptContent.Replace('%%BIOS_COMPARE_FUNCS%%', $biosCompareFuncs)
     $scriptContent = $scriptContent.Replace('%%DETECTION_CHECK%%', $detectionCheckBlock)
 
     # UTF-8 WITHOUT BOM -- Intune detection rule scripts must not carry a BOM, otherwise
@@ -9908,8 +11103,8 @@ function Invoke-DATIntuneWin32AppUpload {
             description                              = $Description
             publisher                                = $Publisher
             developer                                = "Maurice Daly"
-            notes                                    = "Created by the Driver Automation Tool"
-            informationUrl                           = "https://msendpointmgr.com"
+            notes                                    = (Get-DATIntunePackageNotes)
+            informationUrl                           = "https://www.driverautomationtool.com"
             displayVersion                           = $Version
             fileName                                 = $encInfo.FileName
             setupFilePath                            = $encInfo.SetupFile
@@ -10377,10 +11572,15 @@ function Invoke-DATIntunePackageCreation {
         "$displayPrefix - $OEM $Model - $OS $Architecture"
     }
     $publisher = $OEM
+    # Human-readable release date for the package description (empty when unknown/unparseable).
+    $releaseDateStamp = ConvertTo-DATReleaseDateStamp -ReleaseDate $ReleaseDate
+    $releaseDateLine = if (-not [string]::IsNullOrEmpty($releaseDateStamp)) {
+        "`nRelease Date: {0}-{1}-{2}" -f $releaseDateStamp.Substring(0, 4), $releaseDateStamp.Substring(4, 2), $releaseDateStamp.Substring(6, 2)
+    } else { '' }
     $description = if ($UpdateType -eq 'BIOS') {
-        "$UpdateType package for $OEM $Model`nArchitecture: $Architecture`nBaseboards/SKU: $Baseboards`nVersion: $version`nCreated by Driver Automation Tool"
+        "$UpdateType package for $OEM $Model`nArchitecture: $Architecture`nBaseboards/SKU: $Baseboards`nVersion: $version$releaseDateLine`nCreated by Driver Automation Tool"
     } else {
-        "$UpdateType package for $OEM $Model`nOS: $OS`nArchitecture: $Architecture`nBaseboards/SKU: $Baseboards`nVersion: $version`nCreated by Driver Automation Tool"
+        "$UpdateType package for $OEM $Model`nOS: $OS`nArchitecture: $Architecture`nBaseboards/SKU: $Baseboards`nVersion: $version$releaseDateLine`nCreated by Driver Automation Tool"
     }
 
     Write-DATLogEntry -Value "[Intune Pipeline] Starting Intune package creation for $OEM $Model" -Severity 1
@@ -10700,14 +11900,24 @@ function Get-DATIntuneAuthStatus {
         Returns current auth status for UI display.
     #>
     [OutputType([hashtable])]
-    param ()
+    param (
+        [switch]$NoRefresh
+    )
+
+    $isAuthenticated = if ($NoRefresh) { Test-DATIntuneAuthTokenValid } else { Test-DATIntuneAuth }
+    $environment = Get-DATIntuneEnvironment
 
     return @{
-        IsAuthenticated = Test-DATIntuneAuth
-        TenantId        = $script:IntuneTenantId
-        Token           = $script:IntuneAuthToken
-        ExpiresOn       = $script:IntuneTokenExpiry
-        MinutesRemaining = if (Test-DATIntuneAuth) {
+        IsAuthenticated              = $isAuthenticated
+        TenantId                     = $script:IntuneTenantId
+        TenantEnvironment            = $environment.Name
+        TenantEnvironmentDisplayName = $environment.DisplayName
+        GraphBaseUrl                 = $environment.GraphBaseUrl
+        GraphResource                = $environment.GraphResource
+        AuthorityHost                = $environment.AuthorityHost
+        Token                        = $script:IntuneAuthToken
+        ExpiresOn                    = $script:IntuneTokenExpiry
+        MinutesRemaining             = if ($isAuthenticated) {
             [math]::Round(($script:IntuneTokenExpiry - (Get-Date)).TotalMinutes, 1)
         } else { 0 }
     }
@@ -11105,14 +12315,14 @@ function Find-DATBiosPackage {
     .SYNOPSIS
         Searches the BIOS catalog for a matching entry by OEM and baseboard values.
         Returns the best match (latest ReleaseDate) or $null if no match found.
-        For Acer, uses the Acer XML catalog directly since BIOS entries are embedded there.
+        All OEMs (including Acer) are matched against the JSON BIOS catalog first; for Acer, the
+        Acer XML catalog is used as a fallback when the JSON catalog is unavailable or has no match.
     .PARAMETER OEM
         Manufacturer name (Dell, HP, Lenovo, Acer).
     .PARAMETER Baseboards
-        Comma-separated baseboard/SystemID values from the model definition.
+        Comma-separated baseboard/SystemID (or Acer product code) values from the model definition.
     .PARAMETER Catalog
         The BIOS catalog array (from Get-DATBiosCatalog). If omitted, calls Get-DATBiosCatalog.
-        Not used for Acer (which has its own XML catalog).
     #>
     [CmdletBinding()]
     param (
@@ -11121,30 +12331,25 @@ function Find-DATBiosPackage {
         [array]$Catalog
     )
 
-    # ── Acer: BIOS entries live in the Acer XML catalog, not the JSON BIOS catalog ──
-    if ($OEM -eq 'Acer') {
-        $modelBoards = @($Baseboards -split '[,;\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        if ($modelBoards.Count -eq 0) {
-            Write-DATLogEntry -Value "[BIOS] No baseboard/model values provided -- cannot match Acer BIOS" -Severity 2
-            return $null
-        }
-        # Verbose -- suppressed to reduce log noise during bulk model refresh
+    # -- Acer XML fallback (used only when the JSON BIOS catalog is unavailable or yields no match).
+    # Matches on the platform product code (the <Model product="..."> attribute, e.g. Trumpet_RBU),
+    # which is what the JSON catalog / driver catalog use in SupportedDevices; falls back to the
+    # model name. Captures the XML's version/date/md5 so the download stays integrity-gated. --
+    function Get-DATAcerBiosFromXml {
+        param([string[]]$ProductCodes)
+        if ($ProductCodes.Count -eq 0) { return $null }
 
-        # Download/cache the Acer XML catalog
         $acerCatalogUrl = 'https://global-download.acer.com/supportfiles/files/support/sourcefile/msepm/AcerCatalog.xml'
-        # Also try the OEM links XML if available
         if ($null -ne $global:OEMLinks) {
             $linkUrl = ($global:OEMLinks.OEM.Manufacturer | Where-Object { $_.Name -match 'Acer' }).Link |
                 Where-Object { $_.Type -eq 'XMLSource' } | Select-Object -ExpandProperty URL -First 1
             if (-not [string]::IsNullOrEmpty($linkUrl)) { $acerCatalogUrl = $linkUrl }
         }
-
         $acerFile = [string]($acerCatalogUrl | Split-Path -Leaf)
         $acerFilePath = Join-Path $global:TempDirectory $acerFile
 
         if (-not (Test-Path $acerFilePath)) {
-            Write-DATLogEntry -Value "[BIOS] Downloading Acer catalog for BIOS lookup..." -Severity 1
-            Write-DATLogEntry -Value "[BIOS] Acer catalog download path: $acerFilePath" -Severity 1
+            Write-DATLogEntry -Value "[BIOS] Downloading Acer catalog for BIOS fallback lookup..." -Severity 1
             try {
                 $proxyParams = Get-DATWebRequestProxy
                 Invoke-WebRequest -Uri $acerCatalogUrl -OutFile $acerFilePath -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop @proxyParams
@@ -11169,99 +12374,102 @@ function Find-DATBiosPackage {
             return $null
         }
 
-        # Match by model name -- try exact then partial
+        # Match on the product code (attribute) first, then the model name; exact then partial.
         $matched = $null
-        foreach ($board in $modelBoards) {
-            $matched = $acerModels | Where-Object { $_.name -eq $board } | Select-Object -First 1
+        foreach ($code in $ProductCodes) {
+            $matched = $acerModels | Where-Object { $_.product -eq $code -or $_.name -eq $code } | Select-Object -First 1
             if ($null -ne $matched) { break }
         }
         if ($null -eq $matched) {
-            foreach ($board in $modelBoards) {
-                $matched = $acerModels | Where-Object { $_.name -like "*$board*" } | Select-Object -First 1
+            foreach ($code in $ProductCodes) {
+                $matched = $acerModels | Where-Object { $_.product -like "*$code*" -or $_.name -like "*$code*" } | Select-Object -First 1
                 if ($null -ne $matched) { break }
             }
         }
-
         if ($null -eq $matched -or $null -eq $matched.BIOS) {
-            Write-DATLogEntry -Value "[BIOS] No Acer BIOS entry found for models: $($modelBoards -join ', ')" -Severity 2
+            Write-DATLogEntry -Value "[BIOS] No Acer BIOS entry found (XML fallback) for: $($ProductCodes -join ', ')" -Severity 2
             return $null
         }
 
-        # Extract BIOS URL and version from the <BIOS version="x.xx">URL</BIOS> element
         $biosUrl = $matched.BIOS.'#text'
         if ([string]::IsNullOrEmpty($biosUrl)) { $biosUrl = [string]$matched.BIOS }
-        $biosVersion = $matched.BIOS.version
-
         if ([string]::IsNullOrEmpty($biosUrl)) {
             Write-DATLogEntry -Value "[BIOS] Acer BIOS entry for '$($matched.name)' has no download URL" -Severity 2
             return $null
         }
-
+        $biosVersion = $matched.BIOS.version
+        $biosDate    = $matched.BIOS.date
+        $biosMd5     = $matched.BIOS.md5
         # FileName must match what Invoke-DATContentDownload saves (query string stripped)
         $fileName = ($biosUrl -split '\?')[0] | Split-Path -Leaf
-        Write-DATLogEntry -Value "[BIOS] Matched Acer: $($matched.name) -- BIOS Version $biosVersion" -Severity 1
+        Write-DATLogEntry -Value "[BIOS] Matched Acer (XML fallback): $($matched.name) [$($matched.product)] -- Version $biosVersion" -Severity 1
 
         return [PSCustomObject]@{
-            DisplayName      = "Acer $($matched.name) BIOS"
+            DisplayName      = [string]$matched.name
             Version          = $biosVersion
             DownloadURL      = $biosUrl
             FileName         = $fileName
-            FileHash         = $null
-            HashMethod       = $null
-            ReleaseDate      = $null
+            FileHash         = if (-not [string]::IsNullOrEmpty($biosMd5))  { $biosMd5 } else { $null }
+            HashMethod       = if (-not [string]::IsNullOrEmpty($biosMd5))  { 'MD5' }   else { $null }
+            ReleaseDate      = if (-not [string]::IsNullOrEmpty($biosDate)) { $biosDate } else { $null }
             Classification   = 'BIOS'
             MinimumVersion   = $null
-            SupportedDevices = $matched.name
+            SupportedDevices = if (-not [string]::IsNullOrEmpty($matched.product)) { [string]$matched.product } else { [string]$matched.name }
         }
     }
 
-    # ── Non-Acer OEMs: use the JSON BIOS catalog ──
-    if (-not $Catalog -or $Catalog.Count -eq 0) {
-        $Catalog = Get-DATBiosCatalog
-    }
-
-    # Split model baseboards (comma, space, or semicolon separated) into a lookup set, trimmed
+    # Split model baseboards (comma, space, or semicolon separated) into a lookup set, trimmed.
     $modelBoards = @($Baseboards -split '[,;\s]+' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
-
     if ($modelBoards.Count -eq 0) {
         Write-DATLogEntry -Value "[BIOS] No baseboard values provided -- cannot match BIOS" -Severity 2
         return $null
     }
 
-    # Verbose -- suppressed to reduce log noise during bulk model refresh
-
-    # Filter catalog by OEM and non-null download URL
-    $oemEntries = @($Catalog | Where-Object {
-        $_.Manufacturer -eq $OEM -and -not [string]::IsNullOrEmpty($_.DownloadURL)
-    })
-
-    if ($oemEntries.Count -eq 0) {
-        Write-DATLogEntry -Value "[BIOS] No $OEM entries with download URLs found in catalog" -Severity 2
-        return $null
-    }
-
-    # Find entries where any of the model's baseboards match any of the entry's SupportedDevices
-    $matches = @()
-    foreach ($entry in $oemEntries) {
-        if ([string]::IsNullOrEmpty($entry.SupportedDevices)) { continue }
-        # SupportedDevices is semicolon-delimited
-        $entryDevices = @($entry.SupportedDevices -split ';' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
-        foreach ($board in $modelBoards) {
-            if ($board -in $entryDevices) {
-                $matches += $entry
-                break
-            }
+    # -- Primary: JSON BIOS catalog (all OEMs, incl. Acer via product code). Softfail if the
+    #    catalog cannot be fetched so the Acer fallback can still run. --
+    if (-not $Catalog -or $Catalog.Count -eq 0) {
+        try {
+            $Catalog = Get-DATBiosCatalog
+        } catch {
+            Write-DATLogEntry -Value "[BIOS] BIOS catalog unavailable: $($_.Exception.Message)" -Severity 2
+            $Catalog = @()
         }
     }
 
-    if ($matches.Count -eq 0) {
-        # No match -- skip logging to reduce noise during bulk refresh
+    $best = $null
+    $oemEntries = @($Catalog | Where-Object {
+        $_.Manufacturer -eq $OEM -and -not [string]::IsNullOrEmpty($_.DownloadURL)
+    })
+    if ($oemEntries.Count -gt 0) {
+        # Find entries where any of the model's baseboards match any of the entry's SupportedDevices
+        $matches = @()
+        foreach ($entry in $oemEntries) {
+            if ([string]::IsNullOrEmpty($entry.SupportedDevices)) { continue }
+            $entryDevices = @($entry.SupportedDevices -split ';' | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ })
+            foreach ($board in $modelBoards) {
+                if ($board -in $entryDevices) { $matches += $entry; break }
+            }
+        }
+        if ($matches.Count -gt 0) {
+            # Pick the entry with the latest ReleaseDate
+            $best = $matches | Sort-Object { try { [datetime]$_.ReleaseDate } catch { [datetime]::MinValue } } -Descending | Select-Object -First 1
+        }
+    }
+
+    # -- Acer fallback: only when the JSON catalog produced no usable match --
+    if ($null -eq $best -and $OEM -eq 'Acer') {
+        Write-DATLogEntry -Value "[BIOS] Acer not found in JSON catalog -- falling back to Acer XML" -Severity 2
+        return Get-DATAcerBiosFromXml -ProductCodes $modelBoards
+    }
+
+    if ($null -eq $best) {
+        # No match (non-Acer, or Acer XML fallback also returned nothing)
         return $null
     }
 
-    # Pick the entry with the latest ReleaseDate
-    $best = $matches | Sort-Object { try { [datetime]$_.ReleaseDate } catch { [datetime]::MinValue } } -Descending | Select-Object -First 1
-    $fileName = ($best.DownloadURL -split '/')[-1]
+    # Strip any query string (e.g. Acer '?acerid=...') before taking the leaf, otherwise the saved
+    # filename would not match what Invoke-DATContentDownload writes to disk.
+    $fileName = (($best.DownloadURL -split '\?')[0] -split '/')[-1]
 
     # Collapse a duplicated leading family token in the catalog display name (e.g. Dell
     # "Latitude Latitude 5540" -> "Latitude 5540"). Some upstream catalog entries repeat the
@@ -11269,7 +12477,6 @@ function Find-DATBiosPackage {
     $bestDisplayName = [string]$best.DisplayName -replace '^(\S+)\s+\1\b', '$1'
 
     Write-DATLogEntry -Value "[BIOS] Matched: $bestDisplayName -- Version $($best.Version), Released $($best.ReleaseDate)" -Severity 1
-
     return [PSCustomObject]@{
         DisplayName      = $bestDisplayName
         Version          = $best.Version
@@ -11535,15 +12742,79 @@ function Get-DATFlash64W {
     if (-not (Test-Path $tempDir)) { New-Item -Path $tempDir -ItemType Directory -Force | Out-Null }
     if (-not (Test-Path $zipExtract)) { New-Item -Path $zipExtract -ItemType Directory -Force | Out-Null }
 
-    # Download (Dell requires browser-like headers)
-    try {
-        $proxyParams = Get-DATWebRequestProxy
-        if ($proxyParams -isnot [hashtable]) { $proxyParams = @{} }
-        $webHeaders = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
-        Invoke-WebRequest -Uri $flash64Url -OutFile $zipFile -UseBasicParsing -TimeoutSec 120 -Headers $webHeaders @proxyParams -ErrorAction Stop
-        Write-DATLogEntry -Value "[Flash64W] Download complete: $([math]::Round((Get-Item $zipFile).Length / 1KB, 1)) KB" -Severity 1
-    } catch {
-        Write-DATLogEntry -Value "[Flash64W] Download failed: $($_.Exception.Message)" -Severity 3
+    # Download the ZIP. Dell's CDN (dl.dell.com / Akamai) rejects PowerShell's
+    # Invoke-WebRequest engine with HTTP 403 even when a browser User-Agent is supplied
+    # (issue #852 / #790). curl.exe negotiates the request like a browser and is the same
+    # engine used for every other OEM download in this tool, so attempt curl first and
+    # only fall back to Invoke-WebRequest if curl is unavailable or also fails.
+    $downloaded = $false
+
+    # Resolve curl: prefer the bundled binary, otherwise the system curl.exe
+    # (built in on Windows 10 1803+).
+    $curlExe = $null
+    if (-not [string]::IsNullOrEmpty($global:ToolsDirectory)) {
+        $curlExe = Get-ChildItem -Path "$global:ToolsDirectory" -Recurse -Filter 'Curl.exe' -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if ([string]::IsNullOrEmpty($curlExe) -or -not (Test-Path -Path $curlExe)) {
+        $systemCurl = Join-Path $env:SystemRoot 'System32\curl.exe'
+        if (Test-Path -Path $systemCurl) { $curlExe = $systemCurl }
+    }
+
+    if (-not [string]::IsNullOrEmpty($curlExe) -and (Test-Path -Path $curlExe)) {
+        $curlProxyCfgFile = New-DATCurlProxyConfigFile
+        try {
+            Write-DATLogEntry -Value "[Flash64W] Downloading via curl: $curlExe" -Severity 1
+            # --fail makes curl exit non-zero on HTTP errors (e.g. 403) so we detect them.
+            # --proto =https prevents a redirect downgrade to HTTP (security fix #12).
+            $curlArgs = @('--location', '--proto', '=https', '--max-redirs', '5',
+                          '--fail', '--silent', '--show-error',
+                          '--connect-timeout', '30', '--retry', '3', '--retry-delay', '5',
+                          '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+                          '--output', $zipFile, '--url', $flash64Url)
+
+            # Apply configured proxy (server only; credentials come from the --config file)
+            try {
+                $proxyCfg = Get-DATProxySettings
+                if ($proxyCfg.Mode -eq 'None') {
+                    $curlArgs += @('--noproxy', '*')
+                } elseif ($proxyCfg.Mode -eq 'Manual' -and -not [string]::IsNullOrWhiteSpace($proxyCfg.Server)) {
+                    $curlArgs += @('--proxy', $proxyCfg.Server)
+                }
+            } catch { }
+            if ($curlProxyCfgFile) { $curlArgs = @('--config', $curlProxyCfgFile) + $curlArgs }
+
+            $curlOutput = & "$curlExe" @curlArgs 2>&1
+            if ($LASTEXITCODE -eq 0 -and (Test-Path -Path $zipFile) -and (Get-Item $zipFile).Length -gt 0) {
+                $downloaded = $true
+                Write-DATLogEntry -Value "[Flash64W] Download complete (curl): $([math]::Round((Get-Item $zipFile).Length / 1KB, 1)) KB" -Severity 1
+            } else {
+                Write-DATLogEntry -Value "[Flash64W] curl download failed (exit $LASTEXITCODE): $($curlOutput -join ' ')" -Severity 2
+            }
+        } catch {
+            Write-DATLogEntry -Value "[Flash64W] curl download error: $($_.Exception.Message)" -Severity 2
+        } finally {
+            if ($curlProxyCfgFile) { Remove-Item -Path $curlProxyCfgFile -Force -ErrorAction SilentlyContinue }
+        }
+    }
+
+    # Fallback: Invoke-WebRequest with browser-like headers
+    if (-not $downloaded) {
+        try {
+            Write-DATLogEntry -Value "[Flash64W] Falling back to Invoke-WebRequest" -Severity 1
+            $proxyParams = Get-DATWebRequestProxy
+            if ($proxyParams -isnot [hashtable]) { $proxyParams = @{} }
+            $webHeaders = @{ 'User-Agent' = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+            Invoke-WebRequest -Uri $flash64Url -OutFile $zipFile -UseBasicParsing -TimeoutSec 120 -Headers $webHeaders @proxyParams -ErrorAction Stop
+            $downloaded = $true
+            Write-DATLogEntry -Value "[Flash64W] Download complete: $([math]::Round((Get-Item $zipFile).Length / 1KB, 1)) KB" -Severity 1
+        } catch {
+            Write-DATLogEntry -Value "[Flash64W] Download failed: $($_.Exception.Message)" -Severity 3
+        }
+    }
+
+    if (-not $downloaded) {
+        Remove-Item -Path $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         return $false
     }
 
@@ -11668,6 +12939,26 @@ function Invoke-DATBiosPackaging {
             $flashProcessNames = @('WinUPTP64', 'WinUPTP', 'wFlashGUIX64', 'wFlashGUI',
                                    'AFUWINx64', 'AFUWIN', 'Flash64', 'InsydeFlash')
 
+            # Lenovo Inno Setup BIOS installers extract their flash payload to hardcoded
+            # system-drive locations (C:\DRIVERS\FLASH, C:\SWTOOLS\FLASH) regardless of the
+            # /DIR argument we pass. Snapshot those roots first so we can remove only the
+            # folders the installer creates, without touching anything already present (#863).
+            $lenovoResidualRoots = @(
+                (Join-Path $env:SystemDrive 'DRIVERS\FLASH'),
+                (Join-Path $env:SystemDrive 'SWTOOLS\FLASH')
+            )
+            $lenovoResidualSnapshot = @{}
+            foreach ($residualRoot in $lenovoResidualRoots) {
+                if (Test-Path $residualRoot) {
+                    $lenovoResidualSnapshot[$residualRoot] = @(
+                        Get-ChildItem -Path $residualRoot -Force -ErrorAction SilentlyContinue |
+                            Select-Object -ExpandProperty FullName)
+                } else {
+                    # Root did not exist before extraction -- flag for full removal afterwards.
+                    $lenovoResidualSnapshot[$residualRoot] = $null
+                }
+            }
+
             try {
                 Unblock-File -Path $BiosFilePath -ErrorAction SilentlyContinue
 
@@ -11758,6 +13049,40 @@ function Invoke-DATBiosPackaging {
                     Remove-Item -Force -ErrorAction SilentlyContinue
             } catch {
                 throw "Lenovo BIOS extraction failed: $($_.Exception.Message)"
+            } finally {
+                # Remove residual folders the Lenovo installer created on the system drive.
+                # These hardcoded C:\DRIVERS\FLASH / C:\SWTOOLS\FLASH payload folders are
+                # created regardless of the /DIR argument and are otherwise never cleaned
+                # up by the build, tool close, or Purge button (#863). Runs on both success
+                # and failure so nothing is left behind.
+                foreach ($residualRoot in $lenovoResidualRoots) {
+                    try {
+                        if (-not (Test-Path $residualRoot)) { continue }
+                        $preExisting = $lenovoResidualSnapshot[$residualRoot]
+                        if ($null -eq $preExisting) {
+                            # Root was created by this extraction -- remove it entirely.
+                            Remove-Item -Path $residualRoot -Recurse -Force -ErrorAction SilentlyContinue
+                            Write-DATLogEntry -Value "[BIOS] Lenovo: Removed residual extraction folder $residualRoot" -Severity 1
+                            # Remove the parent (DRIVERS / SWTOOLS) too if we left it empty.
+                            $residualParent = Split-Path $residualRoot -Parent
+                            if ((Test-Path $residualParent) -and
+                                -not (Get-ChildItem -Path $residualParent -Force -ErrorAction SilentlyContinue)) {
+                                Remove-Item -Path $residualParent -Recurse -Force -ErrorAction SilentlyContinue
+                                Write-DATLogEntry -Value "[BIOS] Lenovo: Removed empty residual folder $residualParent" -Severity 1
+                            }
+                        } else {
+                            # Root pre-existed -- only remove entries the installer newly added.
+                            $newEntries = Get-ChildItem -Path $residualRoot -Force -ErrorAction SilentlyContinue |
+                                Where-Object { $preExisting -notcontains $_.FullName }
+                            foreach ($entry in $newEntries) {
+                                Remove-Item -Path $entry.FullName -Recurse -Force -ErrorAction SilentlyContinue
+                                Write-DATLogEntry -Value "[BIOS] Lenovo: Removed residual extraction item $($entry.FullName)" -Severity 1
+                            }
+                        }
+                    } catch {
+                        Write-DATLogEntry -Value "[BIOS] Lenovo: Could not clean residual folder $residualRoot -- $($_.Exception.Message)" -Severity 2
+                    }
+                }
             }
         }
         default {
@@ -12243,17 +13568,29 @@ function Update-DATHPSoftPaqManifestReference {
 function Get-DATPackageHash {
     <#
     .SYNOPSIS
-        Computes the MD5 hash of a file. Returns the hex string, or $null on failure.
+        Computes the MD5 hash of a file. Returns the hex string, or $null on failure/timeout.
+    .DESCRIPTION
+        The hash is computed on a background runspace guarded by a timeout so a stalled file
+        read -- antivirus real-time scan lock, a lingering wimlib/dismhost handle on a freshly
+        written WIM, or slow/large I/O -- can never block the caller indefinitely (#853). The
+        file is opened with a ReadWrite share so a concurrent reader/scanner does not raise a
+        sharing violation. Because the hash only decorates optional telemetry, a timeout logs a
+        warning and returns $null rather than throwing or hanging the build.
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param (
-        [Parameter(Mandatory)][string]$FilePath
+        [Parameter(Mandatory)][string]$FilePath,
+        # Abandon the hash and return $null after this many seconds (0 or less = no timeout).
+        [int]$TimeoutSeconds = 300
     )
     if (-not (Test-Path -LiteralPath $FilePath)) { return $null }
-    try {
+
+    # Self-contained -- uses only .NET types so it runs in a bare runspace with no module import.
+    $hashScript = {
+        param($Path)
         $md5 = [System.Security.Cryptography.MD5]::Create()
-        $stream = [System.IO.File]::OpenRead($FilePath)
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
         try {
             $hashBytes = $md5.ComputeHash($stream)
             return [BitConverter]::ToString($hashBytes).Replace('-', '')
@@ -12261,9 +13598,49 @@ function Get-DATPackageHash {
             $stream.Close()
             $md5.Dispose()
         }
+    }
+
+    # No timeout requested -- compute inline (legacy behaviour).
+    if ($TimeoutSeconds -le 0) {
+        try {
+            return (& $hashScript $FilePath)
+        } catch {
+            Write-DATLogEntry -Value "[Telemetry] MD5 hash failed for $FilePath`: $($_.Exception.Message)" -Severity 2
+            return $null
+        }
+    }
+
+    # Timeout-guarded: run the read on a background runspace and abandon it if it overruns so a
+    # blocked native file read can never stall the caller. The abandoned thread unwinds when the
+    # underlying I/O finally returns (or with the process); the build proceeds regardless.
+    #
+    # CRITICAL: on timeout we must NOT call the synchronous Stop() or Dispose() -- both block
+    # until the wedged pipeline actually returns, so a stuck native read (AV real-time scan lock,
+    # a lingering wimlib/dismhost handle on a freshly written WIM) would hold the caller for the
+    # full duration of the stall on top of the timeout, defeating the guard entirely (#874). We
+    # instead issue an asynchronous BeginStop and leave the runspace to be reclaimed by GC once
+    # the native I/O finally releases; the build proceeds immediately.
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $timedOut = $false
+    try {
+        [void]$ps.AddScript($hashScript).AddArgument($FilePath)
+        $async = $ps.BeginInvoke()
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))) {
+            $timedOut = $true
+            Write-DATLogEntry -Value "[Telemetry] MD5 hash timed out after ${TimeoutSeconds}s for $FilePath -- skipping hash" -Severity 2
+            # Non-blocking abandon: request an async stop and return at once. Do not wait on it.
+            try { [void]$ps.BeginStop($null, $null) } catch {}
+            return $null
+        }
+        $result = $ps.EndInvoke($async)
+        return ($result | Select-Object -First 1)
     } catch {
         Write-DATLogEntry -Value "[Telemetry] MD5 hash failed for $FilePath`: $($_.Exception.Message)" -Severity 2
         return $null
+    } finally {
+        # Only dispose on the completed/failed paths. On the timeout path Dispose() would block
+        # on the still-wedged pipeline, so the abandoned runspace is left for GC to reclaim.
+        if (-not $timedOut) { try { $ps.Dispose() } catch {} }
     }
 }
 
@@ -12513,7 +13890,7 @@ function Repair-DATBiosPackageNames {
                 })
             } else {
                 $allApps = Get-DATIntuneWin32Apps | Where-Object {
-                    $_.notes -eq 'Created by the Driver Automation Tool' -and
+                    $_.notes -like 'Created by the Driver Automation Tool*' -and
                     ($_.displayName -match '^BIOS\s*-\s*.+\s*-\s*Windows\s' -or
                      $_.displayName -match '^BIOS\s*-\s*.+\s*-\s*(x64|Arm64)\s*$')
                 }
@@ -12957,7 +14334,7 @@ function Repair-DATIntuneDriverPackageNames {
         # Get all driver packages (Win32 apps starting with "Drivers -")
         $allApps = @(Get-DATIntuneWin32Apps | Where-Object {
             $_.displayName -like 'Drivers -*' -and
-            $_.notes -eq 'Created by the Driver Automation Tool'
+            $_.notes -like 'Created by the Driver Automation Tool*'
         })
 
         if ($allApps.Count -eq 0) {
