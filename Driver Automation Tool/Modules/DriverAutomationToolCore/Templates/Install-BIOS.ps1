@@ -118,6 +118,21 @@ function Set-DATInstallStatus {
 
         if ($Result -in @('Success','PendingReboot','AlreadyCurrent')) {
             Set-ItemProperty -Path $RegPath -Name 'LastSuccessUtc' -Value $nowUtc -Force
+            # Successful (or no-op) run -- clear any prior deferral/failure reason so custom
+            # reporting reflects the current healthy state rather than a stale cause.
+            Remove-ItemProperty -Path $RegPath -Name 'Reason' -Force -ErrorAction SilentlyContinue
+        } else {
+            # Deferral (RetryScheduled) or failure (Failed/NoContent) -- surface a single
+            # human-readable reason for reporting. Prefer the supplied message, falling back
+            # to the phase, then the raw result label.
+            $reasonText = if (-not [string]::IsNullOrEmpty($ErrorMessage)) {
+                $ErrorMessage
+            } elseif (-not [string]::IsNullOrEmpty($Phase)) {
+                "$Result ($Phase)"
+            } else {
+                $Result
+            }
+            Set-ItemProperty -Path $RegPath -Name 'Reason' -Value $reasonText -Force
         }
     } catch {
         Write-CMTraceLog "WARNING: Failed to write install status to registry -- $($_.Exception.Message)" -Severity 2
@@ -214,6 +229,11 @@ function Suspend-BitLockerForReboot {
     <#
     .SYNOPSIS
         Suspends BitLocker on the OS drive for one reboot cycle to allow BIOS flashing.
+    .DESCRIPTION
+        Only acts when protection is currently On, so it is safe to call more than once:
+        it is invoked after extraction to suspend for the flash, and again immediately
+        before the restart to re-suspend if a user or external management/compliance script
+        re-enabled protection in the meantime.
     #>
     try {
         $blv = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction SilentlyContinue
@@ -963,9 +983,19 @@ try {
             }
 
             # -- Focus Assist / DND Check Before Restart --
-            # If the user has Focus Assist (Do Not Disturb) active, we must NOT restart
-            # the device regardless of deferral count. The BIOS update is already prestaged
-            # and will apply on the next natural reboot.
+            # If a user is actively working with Focus Assist (Do Not Disturb) engaged, we must
+            # NOT restart the device regardless of deferral count. The BIOS update is already
+            # prestaged and will apply on the next natural reboot.
+            #
+            # IMPORTANT: this script normally runs as SYSTEM in session 0 (Intune Win32 app
+            # default, and required for BIOS flashing). In that context there is no interactive
+            # desktop to query, so SHQueryUserNotificationState returns QUNS_NOT_PRESENT (1).
+            # That is NOT a Do-Not-Disturb condition -- it means no user is present, which is the
+            # SAFEST time to reboot. Only the genuine "user is present but busy" states
+            # (QUNS_BUSY, full-screen D3D, presentation mode, quiet time, running app) should
+            # suppress the restart. Treating state 1 as blocking (the previous behaviour) caused
+            # the automatic reboot to be silently skipped on virtually every unattended/SYSTEM
+            # run, leaving the BIOS prestaged but never applied.
             $focusAssistBlocking = $false
             try {
                 $focusAssistCSharp = 'using System; using System.Runtime.InteropServices; public class DATFocusAssistRestart { [DllImport("shell32.dll")] public static extern int SHQueryUserNotificationState(out int state); }'
@@ -979,9 +1009,14 @@ try {
                 }
                 $focusStateName = if ($focusStateNames.ContainsKey($focusState)) { $focusStateNames[$focusState] } else { "Unknown ($focusState)" }
                 Write-CMTraceLog "[FocusAssist] SHQueryUserNotificationState returned: $focusState ($focusStateName)"
-                if ($focusState -ne 5) {
+                # Only these states represent an interactive user we should not interrupt.
+                # QUNS_NOT_PRESENT (1) and QUNS_ACCEPTS_NOTIFICATIONS (5) both permit the restart.
+                $focusBlockingStates = @(2, 3, 4, 6, 7)
+                if ($focusState -in $focusBlockingStates) {
                     $focusAssistBlocking = $true
-                    Write-CMTraceLog "[FocusAssist] Focus Assist / DND is active -- suppressing automatic restart to avoid interrupting the user" -Severity 2
+                    Write-CMTraceLog "[FocusAssist] Focus Assist / DND is active ($focusStateName) -- suppressing automatic restart to avoid interrupting the user" -Severity 2
+                } else {
+                    Write-CMTraceLog "[FocusAssist] State $focusStateName does not block restart -- proceeding with automatic restart"
                 }
             } catch {
                 Write-CMTraceLog "[FocusAssist] Check failed: $($_.Exception.Message) -- proceeding with restart" -Severity 2
@@ -996,6 +1031,17 @@ try {
             }
 
             Write-CMTraceLog "Scheduling system restart in $RestartDelayMinutes minute(s) ($RestartDelaySeconds seconds) to apply BIOS update"
+
+            # -- Re-verify BitLocker suspension immediately before the restart --------------
+            # Between the flash and this restart a user action or an external management /
+            # compliance script may have re-enabled (resumed) BitLocker protection. If
+            # protection is active when the firmware applies during the reboot, the changed
+            # TPM PCR measurements prevent the key from being released and the device drops to
+            # the BitLocker recovery screen. Re-check the protector state now and re-suspend
+            # for this reboot cycle if it has been turned back on.
+            Write-CMTraceLog "Re-verifying BitLocker protector state before initiating restart..."
+            Suspend-BitLockerForReboot
+
             shutdown.exe /r /t $RestartDelaySeconds /c "BIOS firmware update prestaged by Driver Automation Tool. Your system will restart in $RestartDelayMinutes minute(s) to apply the update. Please save your work." /d p:1:18
             Write-CMTraceLog "Restart scheduled -- shutdown.exe exit code: $LASTEXITCODE"
             Set-DATInstallStatus -RegPath $VersionRegPath -Result 'PendingReboot' -ToolExitCode $flashExitCode -ScriptExitCode 3010 -Phase 'RestartScheduled'

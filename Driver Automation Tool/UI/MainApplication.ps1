@@ -3353,6 +3353,203 @@ function Show-DATBiosNamePromptModal {
     return $script:biosPromptResult
 }
 
+function Show-DATBugNoticeModal {
+    <#
+    .SYNOPSIS
+        Shows a one-time informational modal advising of Intune BIOS update bugs
+        that were corrected in build 10.1.9. Displayed only once per machine,
+        gated by the BugNoticeAcknowledged1019 registry value.
+    #>
+
+    # One-time gate -- do not show again once acknowledged
+    $ackValue = (Get-ItemProperty -Path $global:RegPath -Name 'BugNoticeAcknowledged1019' -ErrorAction SilentlyContinue).BugNoticeAcknowledged1019
+    if ($ackValue -eq 1) { return }
+
+    $theme = Get-DATTheme -ThemeName $script:CurrentTheme
+    $bgColor  = [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBackground'])
+    $fgColor  = [System.Windows.Media.ColorConverter]::ConvertFromString($theme['WindowForeground'])
+    $dimColor = [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder'])
+    $accent   = [System.Windows.Media.ColorConverter]::ConvertFromString($theme['AccentColor'])
+
+    $dlg = [System.Windows.Window]::new()
+    $dlg.WindowStyle = 'None'
+    $dlg.AllowsTransparency = $true
+    $dlg.Background = [System.Windows.Media.Brushes]::Transparent
+    $dlg.Width = 560
+    $dlg.SizeToContent = 'Height'
+    $dlg.Topmost = $true
+    $dlg.ResizeMode = 'NoResize'
+    $dlg.ShowInTaskbar = $false
+    try {
+        $dlg.Owner = $Window
+        $dlg.WindowStartupLocation = 'CenterOwner'
+    } catch {
+        $dlg.WindowStartupLocation = 'CenterScreen'
+    }
+
+    $border = [System.Windows.Controls.Border]::new()
+    $border.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.Color]::FromArgb(245, $bgColor.R, $bgColor.G, $bgColor.B))
+    $border.CornerRadius = [System.Windows.CornerRadius]::new(16)
+    $border.Padding = [System.Windows.Thickness]::new(28, 24, 28, 24)
+    $border.BorderBrush = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['CardBorder']))
+    $border.BorderThickness = [System.Windows.Thickness]::new(1)
+    $shadow = [System.Windows.Media.Effects.DropShadowEffect]::new()
+    $shadow.BlurRadius = 30; $shadow.ShadowDepth = 0; $shadow.Opacity = 0.5
+    $shadow.Color = [System.Windows.Media.Colors]::Black
+    $border.Effect = $shadow
+
+    $panel = [System.Windows.Controls.StackPanel]::new()
+
+    # Yellow bug icon (EBE8 = Bug)
+    $iconText = [System.Windows.Controls.TextBlock]::new()
+    $iconText.Text = [string][char]0xEBE8
+    $iconText.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+    $iconText.FontSize = 34
+    $iconText.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['StatusWarning']))
+    $iconText.HorizontalAlignment = 'Center'
+    $iconText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 12)
+    $panel.Children.Add($iconText) | Out-Null
+
+    # Title
+    $titleText = [System.Windows.Controls.TextBlock]::new()
+    $titleText.Text = "Bug Notice"
+    $titleText.FontSize = 18
+    $titleText.FontWeight = [System.Windows.FontWeights]::Bold
+    $titleText.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
+    $titleText.HorizontalAlignment = 'Center'
+    $titleText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 14)
+    $panel.Children.Add($titleText) | Out-Null
+
+    # Description -- split into readable paragraphs
+    $descParagraphs = @(
+        "In versions prior to 10.1.9 when used with Microsoft Intune, bugs have been identified which could result in devices failing to report the current BIOS version to the requirement script, due to issues in the BIOS update process.",
+        "A separate issue has been identified if the user re-enables BitLocker protection prior to the required BIOS update restart.",
+        "These issues have been corrected in build 10.1.9, and it is suggested that you re-create BIOS packages created with versions prior to this for Microsoft Intune deployments.",
+        "Configuration Manager deployments are unaffected."
+    )
+    for ($i = 0; $i -lt $descParagraphs.Count; $i++) {
+        $descText = [System.Windows.Controls.TextBlock]::new()
+        $descText.Text = $descParagraphs[$i]
+        $descText.FontSize = 13
+        $descText.TextWrapping = [System.Windows.TextWrapping]::Wrap
+        $descText.Foreground = [System.Windows.Media.SolidColorBrush]::new($dimColor)
+        $descText.TextAlignment = [System.Windows.TextAlignment]::Left
+        $descText.LineHeight = 20
+        $bottomMargin = if ($i -eq ($descParagraphs.Count - 1)) { 16 } else { 12 }
+        $descText.Margin = [System.Windows.Thickness]::new(0, 0, 0, $bottomMargin)
+        $panel.Children.Add($descText) | Out-Null
+    }
+
+    # Remediation instructions -- how to clear the BIOS version markers to force a re-check
+    $infoBorder = [System.Windows.Controls.Border]::new()
+    $infoBorder.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.Color]::FromArgb(30, $accent.R, $accent.G, $accent.B))
+    $infoBorder.CornerRadius = [System.Windows.CornerRadius]::new(8)
+    $infoBorder.Padding = [System.Windows.Thickness]::new(14, 12, 14, 12)
+    $infoBorder.Margin = [System.Windows.Thickness]::new(0, 0, 0, 24)
+
+    $infoStack = [System.Windows.Controls.StackPanel]::new()
+
+    $infoHeader = [System.Windows.Controls.TextBlock]::new()
+    $infoHeader.Text = "Force devices to re-check for their BIOS updates"
+    $infoHeader.FontSize = 13
+    $infoHeader.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $infoHeader.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
+    $infoHeader.Margin = [System.Windows.Thickness]::new(0, 0, 0, 6)
+    $infoStack.Children.Add($infoHeader) | Out-Null
+
+    $infoBody = [System.Windows.Controls.TextBlock]::new()
+    $infoBody.Text = "On each affected device, delete the BIOS version markers stored under the registry key below, then re-run the deployment. Clearing the recorded version causes the requirement script to re-evaluate the device as 'update required':"
+    $infoBody.FontSize = 12
+    $infoBody.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $infoBody.Foreground = [System.Windows.Media.SolidColorBrush]::new($dimColor)
+    $infoBody.LineHeight = 18
+    $infoBody.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+    $infoStack.Children.Add($infoBody) | Out-Null
+
+    # Registry path in a mono-style highlighted box
+    $pathBorder = [System.Windows.Controls.Border]::new()
+    $pathBorder.Background = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputBackground']))
+    $pathBorder.CornerRadius = [System.Windows.CornerRadius]::new(4)
+    $pathBorder.Padding = [System.Windows.Thickness]::new(10, 6, 10, 6)
+    $pathBorder.Margin = [System.Windows.Thickness]::new(0, 0, 0, 8)
+    $pathText = [System.Windows.Controls.TextBlock]::new()
+    $pathText.Text = 'HKLM:\SOFTWARE\DriverAutomationTool\BIOS'
+    $pathText.FontFamily = [System.Windows.Media.FontFamily]::new('Consolas')
+    $pathText.FontSize = 12
+    $pathText.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $pathText.Foreground = [System.Windows.Media.SolidColorBrush]::new($fgColor)
+    $pathBorder.Child = $pathText
+    $infoStack.Children.Add($pathBorder) | Out-Null
+
+    $infoNote = [System.Windows.Controls.TextBlock]::new()
+    $infoNote.Text = "Deleting the whole key clears markers for every model. The bundled Remove-DATStaleBIOSMarkers.ps1 script (in the Scripts folder) can do this automatically in SYSTEM context, removing only markers recorded ahead of the installed firmware."
+    $infoNote.FontSize = 11
+    $infoNote.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $infoNote.Foreground = [System.Windows.Media.SolidColorBrush]::new($dimColor)
+    $infoNote.LineHeight = 16
+    $infoStack.Children.Add($infoNote) | Out-Null
+
+    $infoBorder.Child = $infoStack
+    $panel.Children.Add($infoBorder) | Out-Null
+
+    # Disclaimer
+    $disclaimerText = [System.Windows.Controls.TextBlock]::new()
+    $disclaimerText.Text = "Disclaimer: The bundled scripts are provided 'as is', without warranty of any kind and with no liability accepted. Use at your own risk and validate in a test environment first."
+    $disclaimerText.FontSize = 11
+    $disclaimerText.FontStyle = [System.Windows.FontStyles]::Italic
+    $disclaimerText.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $disclaimerText.Foreground = [System.Windows.Media.SolidColorBrush]::new($dimColor)
+    $disclaimerText.TextAlignment = [System.Windows.TextAlignment]::Center
+    $disclaimerText.LineHeight = 16
+    $disclaimerText.Margin = [System.Windows.Thickness]::new(0, 0, 0, 20)
+    $panel.Children.Add($disclaimerText) | Out-Null
+
+    # Acknowledge button (primary, centered)
+    $btnAck = [System.Windows.Controls.Button]::new()
+    $btnAck.Height = 38
+    $btnAck.MinWidth = 170
+    $btnAck.HorizontalAlignment = 'Center'
+    $btnAck.Cursor = [System.Windows.Input.Cursors]::Hand
+    $ackTemplate = [System.Windows.Markup.XamlReader]::Parse(@"
+<ControlTemplate xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" TargetType="Button">
+    <Border x:Name="bd" Background="$($theme['ButtonPrimary'])" CornerRadius="8" Padding="20,8">
+        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+    </Border>
+    <ControlTemplate.Triggers>
+        <Trigger Property="IsMouseOver" Value="True">
+            <Setter TargetName="bd" Property="Background" Value="$($theme['ButtonPrimaryHover'])"/>
+        </Trigger>
+    </ControlTemplate.Triggers>
+</ControlTemplate>
+"@)
+    $btnAck.Template = $ackTemplate
+    $btnAck.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['ButtonPrimaryForeground']))
+    $btnAck.FontSize = 13
+    $btnAck.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $ackContent = [System.Windows.Controls.TextBlock]::new()
+    $ackIconRun = [System.Windows.Documents.Run]::new([string][char]0xE73E)  # CheckMark
+    $ackIconRun.FontFamily = [System.Windows.Media.FontFamily]::new('Segoe MDL2 Assets')
+    $ackLabelRun = [System.Windows.Documents.Run]::new("  Acknowledge")
+    $ackContent.Inlines.Add($ackIconRun) | Out-Null
+    $ackContent.Inlines.Add($ackLabelRun) | Out-Null
+    $btnAck.Content = $ackContent
+    $btnAck.Add_Click({
+        Set-DATRegistryValue -Name 'BugNoticeAcknowledged1019' -Value 1 -Type DWord
+        $dlg.Close()
+    })
+    $panel.Children.Add($btnAck) | Out-Null
+
+    $border.Child = $panel
+    $dlg.Content = $border
+    $dlg.ShowDialog() | Out-Null
+}
+
 function Show-DATBiosNameRepairModal {
     <#
     .SYNOPSIS
@@ -6844,13 +7041,14 @@ function Close-DATBuildProgressModal {
 
 #region Navigation
 
-$allViews = @('view_ModelSelection', 'view_Packages', 'view_ConfigMgr', 'view_Distribution', 'view_IntuneSettings', 'view_IntuneOptions', 'view_ToastNotifications', 'view_IntunePackageMgmt', 'view_BIOSSecurity', 'view_MaintenanceWindow', 'view_CommonSettings', 'view_CustomDriverPack', 'view_Log', 'view_ModernMgmt', 'view_About')
+$allViews = @('view_ModelSelection', 'view_Packages', 'view_ConfigMgr', 'view_Distribution', 'view_XmlLogic', 'view_IntuneSettings', 'view_IntuneOptions', 'view_ToastNotifications', 'view_IntunePackageMgmt', 'view_BIOSSecurity', 'view_MaintenanceWindow', 'view_CommonSettings', 'view_CustomDriverPack', 'view_Log', 'view_ModernMgmt', 'view_About')
 $navMap = @{
     'nav_ModelSelection'       = 'view_ModelSelection'
     'nav_Packages'             = 'view_Packages'
     'nav_ConfigMgr'            = 'view_ConfigMgr'
     'nav_ConfigMgrEnvironment' = 'view_ConfigMgr'
     'nav_Distribution'         = 'view_Distribution'
+    'nav_LogicPackage'         = 'view_XmlLogic'
     'nav_IntuneSettings'       = 'view_IntuneSettings'
     'nav_IntuneAuth'           = 'view_IntuneSettings'
     'nav_IntuneOptions'        = 'view_IntuneOptions'
@@ -6866,7 +7064,7 @@ $navMap = @{
 }
 
 $allNavButtons = @('nav_ModelSelection', 'nav_ConfigMgr', 'nav_IntuneSettings', 'nav_CommonSettings', 'nav_CustomDriverPack', 'nav_Log', 'nav_ModernMgmt', 'nav_About')
-$subNavButtons = @('nav_Packages', 'nav_Distribution', 'nav_ConfigMgrEnvironment', 'nav_IntuneAuth', 'nav_IntuneOptions', 'nav_ToastNotifications', 'nav_IntunePackageMgmt', 'nav_BIOSSecurity', 'nav_MaintenanceWindow')
+$subNavButtons = @('nav_Packages', 'nav_Distribution', 'nav_ConfigMgrEnvironment', 'nav_LogicPackage', 'nav_IntuneAuth', 'nav_IntuneOptions', 'nav_ToastNotifications', 'nav_IntunePackageMgmt', 'nav_BIOSSecurity', 'nav_MaintenanceWindow')
 $configMgrSubPanel = $Window.FindName('panel_ConfigMgrSub')
 $intuneSubPanel = $Window.FindName('panel_IntuneSub')
 
@@ -6894,6 +7092,9 @@ function Set-DATActiveView {
     # Auto-load packages when navigating to Package Management
     if ($ViewName -eq 'view_Packages') {
         Invoke-DATPackageRefresh
+    }
+    elseif ($ViewName -eq 'view_XmlLogic') {
+        try { Invoke-DATRefreshXmlLogicPackageStatus } catch { }
     }
 
     # Update main nav button styles
@@ -6926,7 +7127,7 @@ function Set-DATActiveView {
 
     # Keep ConfigMgr parent highlighted when a sub-item is active
     $configMgrBtn = $Window.FindName('nav_ConfigMgr')
-    if ($NavButtonName -in @('nav_Packages', 'nav_Distribution', 'nav_ConfigMgrEnvironment') -or $NavButtonName -eq 'nav_ConfigMgr') {
+    if ($NavButtonName -in @('nav_Packages', 'nav_Distribution', 'nav_ConfigMgrEnvironment', 'nav_LogicPackage') -or $NavButtonName -eq 'nav_ConfigMgr') {
         $configMgrBtn.Style = $activeStyle
     }
 
@@ -10262,7 +10463,7 @@ $btn_Build.Add_Click({
     $script:BuildPS.Runspace = $script:BuildRunspace
     Add-DATCoreRunspaceBootstrap -PowerShell $script:BuildPS -IntuneAuthContext $intuneAuthContext -ModulePath $resolvedModulePath
     [void]$script:BuildPS.AddScript({
-        param($ScriptDir, $RegPath, $RunningMode, $SelectedModels, $StoragePath, $PackagePath, $DisableToast, $DisableRestart, $SiteServer, $SiteCode, $PackageType, $DPGroups, $DPs, $DistPriority, $EnableBDR, $DebugBuildPath, $CustomBrandingPath, $HPPasswordBinPath, $ToastTimeoutAction, $MaxDeferrals, $BIOSRestartDelayMinutes, $TeamsWebhookUrl, $TeamsNotificationsEnabled, $CustomToastTextsJson, $ConsoleFolderID, $MaintenanceWindowsJson, $AlarmMode, $CreateIntuneWinOnly)
+        param($ScriptDir, $RegPath, $RunningMode, $SelectedModels, $StoragePath, $PackagePath, $DisableToast, $DisableRestart, $SiteServer, $SiteCode, $PackageType, $DPGroups, $DPs, $DistPriority, $EnableBDR, $DebugBuildPath, $CustomBrandingPath, $HPPasswordBinPath, $ToastTimeoutAction, $MaxDeferrals, $BIOSRestartDelayMinutes, $TeamsWebhookUrl, $TeamsNotificationsEnabled, $CustomToastTextsJson, $ConsoleFolderID, $MaintenanceWindowsJson, $AlarmMode, $AlarmSound, $CreateIntuneWinOnly, $GenerateXmlLogicPackage, $ExtractDownloadOnlyContent, $ShowBrandingBannerAllToasts)
         try {
             $procParams = @{
                 ScriptDirectory = $ScriptDir
@@ -10275,7 +10476,11 @@ $btn_Build.Add_Click({
             if ($DisableToast) { $procParams['DisableToast'] = $true }
             if ($DisableRestart) { $procParams['DisableRestart'] = $true }
             if ($AlarmMode) { $procParams['AlarmMode'] = $true }
+            if ($AlarmSound) { $procParams['AlarmSound'] = $true }
             if ($CreateIntuneWinOnly) { $procParams['CreateIntuneWinOnly'] = $true }
+            if ($GenerateXmlLogicPackage) { $procParams['GenerateXmlLogicPackage'] = $true }
+            if (-not $ExtractDownloadOnlyContent) { $procParams['ExtractDownloadOnlyContent'] = $false }
+            if ($ShowBrandingBannerAllToasts) { $procParams['ShowBrandingBannerAllToasts'] = $true }
             if ($ToastTimeoutAction -ne 'RemindMeLater') { $procParams['ToastTimeoutAction'] = $ToastTimeoutAction }
             if ($MaxDeferrals -gt 0) { $procParams['MaxDeferrals'] = $MaxDeferrals }
             if ($BIOSRestartDelayMinutes -gt 0 -and $BIOSRestartDelayMinutes -ne 10) { $procParams['RestartDelaySeconds'] = $BIOSRestartDelayMinutes * 60 }
@@ -10308,6 +10513,9 @@ $btn_Build.Add_Click({
 
     # Read the Critical Notification (alarm mode) state (Intune only) -- bypasses Focus Assist / DND
     $alarmMode = ($selectedPlatform -eq 'Intune') -and ($chk_CriticalNotification.IsChecked -eq $true)
+
+    # Read the audible alarm sound sub-toggle (only relevant when Critical Notification is enabled)
+    $alarmSound = $alarmMode -and ($chk_CriticalNotificationSound.IsChecked -eq $true)
 
     # Read the Create IntuneWin Only state (Intune only) -- builds .intunewin without uploading
     $createIntuneWinOnly = ($selectedPlatform -eq 'Intune') -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
@@ -10366,7 +10574,7 @@ $btn_Build.Add_Click({
     $customToastTextsJson = $null
     if ($selectedPlatform -eq 'Intune') {
         $toastTexts = @{}
-        foreach ($typeKey in @('Toast_Drivers', 'Toast_BIOS', 'Toast_Success', 'Toast_BIOSSuccess', 'Toast_Issues', 'Toast_BIOSIssues')) {
+        foreach ($typeKey in @('Toast_Drivers', 'Toast_BIOS', 'Toast_Success', 'Toast_BIOSSuccess', 'Toast_Issues', 'Toast_BIOSIssues', 'Toast_BIOSACPower', 'Toast_BIOSFinalNotice')) {
             $tTitle    = (Get-ItemProperty -Path $global:RegPath -Name "${typeKey}_Title" -ErrorAction SilentlyContinue)."${typeKey}_Title"
             $tBody     = (Get-ItemProperty -Path $global:RegPath -Name "${typeKey}_Body" -ErrorAction SilentlyContinue)."${typeKey}_Body"
             $tGreeting = (Get-ItemProperty -Path $global:RegPath -Name "${typeKey}_Greeting" -ErrorAction SilentlyContinue)."${typeKey}_Greeting"
@@ -10402,11 +10610,34 @@ $btn_Build.Add_Click({
     }
     [void]$script:BuildPS.AddArgument($maintenanceWindowsJson)
 
+    # Auto-generate XML logic package after ConfigMgr builds when enabled in Package Options
+    $generateXmlLogicPackage = $false
+    if ($selectedPlatform -eq 'Configuration Manager') {
+        $xmlLogicEnabled = (Get-ItemProperty -Path $global:RegPath -Name 'XmlLogicCreatePackage' -ErrorAction SilentlyContinue).XmlLogicCreatePackage
+        $generateXmlLogicPackage = ($xmlLogicEnabled -eq 1)
+    }
+
     # Critical Notification / alarm mode (Intune only) -- last positional argument
     [void]$script:BuildPS.AddArgument($alarmMode)
 
+    # Audible alarm sound sub-toggle (Intune only)
+    [void]$script:BuildPS.AddArgument($alarmSound)
+
     # Create IntuneWin Only (Intune only) -- build .intunewin without uploading to Intune
     [void]$script:BuildPS.AddArgument($createIntuneWinOnly)
+
+    # XML Logic Package auto-refresh (ConfigMgr only)
+    [void]$script:BuildPS.AddArgument($generateXmlLogicPackage)
+
+    # Download Only extraction behaviour (default: extract content after download)
+    $extractDownloadOnlyContent = $true
+    $dlExtractRegVal = (Get-ItemProperty -Path $global:RegPath -Name 'DownloadOnlyExtractContent' -ErrorAction SilentlyContinue).DownloadOnlyExtractContent
+    if ($null -ne $dlExtractRegVal -and $dlExtractRegVal -eq 0) { $extractDownloadOnlyContent = $false }
+    [void]$script:BuildPS.AddArgument($extractDownloadOnlyContent)
+
+    # Show branding banner on all toast notifications (Intune status toasts)
+    $showBrandingBannerAllToasts = ($null -ne $chk_ToastBrandingAllNotifications) -and ($chk_ToastBrandingAllNotifications.IsChecked -eq $true)
+    [void]$script:BuildPS.AddArgument($showBrandingBannerAllToasts)
 
     $script:BuildAsyncResult = $script:BuildPS.BeginInvoke()
 
@@ -12348,13 +12579,103 @@ $chk_XmlLogicCreatePackage = $Window.FindName('chk_XmlLogicCreatePackage')
 $txt_XmlLogicCreatePackageState = $Window.FindName('txt_XmlLogicCreatePackageState')
 $btn_GenerateXmlLogicPackage = $Window.FindName('btn_GenerateXmlLogicPackage')
 $txt_XmlLogicStatus = $Window.FindName('txt_XmlLogicStatus')
+$txt_XmlLogicPackageName = $Window.FindName('txt_XmlLogicPackageName')
+$txt_XmlLogicPackageId = $Window.FindName('txt_XmlLogicPackageId')
+$grid_XmlLogicContents = $Window.FindName('grid_XmlLogicContents')
+$txt_XmlLogicContentsCount = $Window.FindName('txt_XmlLogicContentsCount')
+$txt_XmlLogicContentsEmpty = $Window.FindName('txt_XmlLogicContentsEmpty')
+
+function Update-DATXmlLogicContentsGrid {
+    # Populate the "XML Package Contents" table from the locally generated DriverPackages.xml.
+    # This reads the actual XML the package contains, so it works regardless of ConfigMgr state.
+    if ($null -eq $grid_XmlLogicContents) { return }
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    $regConfig = Get-ItemProperty -Path $global:RegPath -ErrorAction SilentlyContinue
+    $pkgStoragePath = if ($regConfig -and -not [string]::IsNullOrEmpty($regConfig.PackageStoragePath)) { $regConfig.PackageStoragePath } else { $null }
+
+    if (-not [string]::IsNullOrEmpty($pkgStoragePath)) {
+        $xmlFile = Join-Path $pkgStoragePath 'DriverAutomationTool\XML Package\DriverPackages.xml'
+        if (Test-Path -Path $xmlFile) {
+            try {
+                [xml]$doc = Get-Content -Path $xmlFile -Raw -ErrorAction Stop
+                foreach ($pkg in @($doc.ArrayOfCMPackage.CMPackage)) {
+                    if ($null -eq $pkg) { continue }
+                    # Baseboards / supported platform IDs are embedded in the package description
+                    # as "(Models included: <id>,<id>) (Release Date:...)" for BIOS packages.
+                    # Capture only the board IDs -- stop at the closing paren so the release date
+                    # (and anything after it) is excluded from the Baseboard column.
+                    $baseboards = ''
+                    $desc = [string]$pkg.Description
+                    if ($desc -match '(?i)Models included:\s*([^)]+)') { $baseboards = $matches[1].Trim() }
+                    # Normalise the source date for display where possible
+                    $srcDate = [string]$pkg.SourceDate
+                    $parsedDate = [datetime]::MinValue
+                    if ([datetime]::TryParse($srcDate, [ref]$parsedDate)) { $srcDate = $parsedDate.ToString('yyyy-MM-dd HH:mm') }
+                    $rows.Add([PSCustomObject]@{
+                        Name         = [string]$pkg.Name
+                        PackageID    = [string]$pkg.PackageID
+                        Manufacturer = [string]$pkg.Manufacturer
+                        Baseboards   = $baseboards
+                        SourceDate   = $srcDate
+                    })
+                }
+            } catch {
+                Write-DATLogEntry -Value "[XML Logic] Failed to read package contents: $($_.Exception.Message)" -Severity 2
+            }
+        }
+    }
+
+    $grid_XmlLogicContents.ItemsSource = $rows
+    $grid_XmlLogicContents.Visibility = if ($rows.Count -gt 0) { 'Visible' } else { 'Collapsed' }
+    if ($null -ne $txt_XmlLogicContentsCount) {
+        $txt_XmlLogicContentsCount.Text = if ($rows.Count -gt 0) { "$($rows.Count) package(s)" } else { '' }
+    }
+    if ($null -ne $txt_XmlLogicContentsEmpty) {
+        $txt_XmlLogicContentsEmpty.Visibility = if ($rows.Count -gt 0) { 'Collapsed' } else { 'Visible' }
+    }
+}
+
+function Invoke-DATRefreshXmlLogicPackageStatus {
+    $defaultPkgName = 'Driver Automation Tool XML Package'
+    if ($null -eq $txt_XmlLogicPackageName -or $null -eq $txt_XmlLogicPackageId) { return }
+
+    # Load the local XML package contents table (independent of ConfigMgr connectivity).
+    Update-DATXmlLogicContentsGrid
+
+    # Show persisted values first so the view has useful context even before connection.
+    $savedXmlPkgName = (Get-ItemProperty -Path $global:RegPath -Name 'XmlLogicPackageName' -ErrorAction SilentlyContinue).XmlLogicPackageName
+    $savedXmlPkgId = (Get-ItemProperty -Path $global:RegPath -Name 'XmlLogicPackageID' -ErrorAction SilentlyContinue).XmlLogicPackageID
+    $txt_XmlLogicPackageName.Text = if (-not [string]::IsNullOrEmpty($savedXmlPkgName)) { $savedXmlPkgName } else { "$defaultPkgName (not detected)" }
+    $txt_XmlLogicPackageId.Text = if (-not [string]::IsNullOrEmpty($savedXmlPkgId)) { $savedXmlPkgId } else { '--' }
+
+    if ([string]::IsNullOrEmpty($global:SiteServer) -or [string]::IsNullOrEmpty($global:SiteCode)) { return }
+
+    try {
+        $smsNs = "root\SMS\Site_$($global:SiteCode)"
+        $xmlPkg = @(Invoke-DATRemoteQuery -CimSession $global:DATCimSession -ComputerName $global:SiteServer -Namespace $smsNs -Query "SELECT Name, PackageID FROM SMS_Package WHERE Name = 'Driver Automation Tool XML Package'") | Select-Object -First 1
+        if ($xmlPkg) {
+            $txt_XmlLogicPackageName.Text = [string]$xmlPkg.Name
+            $txt_XmlLogicPackageId.Text = [string]$xmlPkg.PackageID
+            Set-DATRegistryValue -Name 'XmlLogicPackageName' -Value ([string]$xmlPkg.Name) -Type String
+            Set-DATRegistryValue -Name 'XmlLogicPackageID' -Value ([string]$xmlPkg.PackageID) -Type String
+        } else {
+            $txt_XmlLogicPackageName.Text = "$defaultPkgName (not detected)"
+            $txt_XmlLogicPackageId.Text = '--'
+        }
+    } catch {
+        # Keep persisted values when live lookup fails.
+    }
+}
 
 if ($null -ne $chk_XmlLogicCreatePackage) {
     $chk_XmlLogicCreatePackage.Add_Checked({
         Set-DATRegistryValue -Name 'XmlLogicCreatePackage' -Value 1 -Type DWord
         if ($null -ne $txt_XmlLogicCreatePackageState) {
             $txt_XmlLogicCreatePackageState.Text = 'Create & distribute as package'
-            $txt_XmlLogicCreatePackageState.Foreground = $Window.FindResource('AccentColor')
+            # AccentTextColor is tuned for readable accent text on card backgrounds in both themes
+            # (base AccentColor is too dim as text on the dark card surface).
+            $txt_XmlLogicCreatePackageState.Foreground = $Window.FindResource('AccentTextColor')
         }
     })
     $chk_XmlLogicCreatePackage.Add_Unchecked({
@@ -12404,7 +12725,7 @@ if ($null -ne $btn_GenerateXmlLogicPackage) {
         $enableBDR = ($chk_BinaryDiffReplication.IsChecked -eq $true)
 
         $btn_GenerateXmlLogicPackage.IsEnabled = $false
-        $txt_XmlLogicStatus.Text = 'Generating XML Logic Package...'
+        $txt_XmlLogicStatus.Text = 'Generating XML Logic Package (Drivers + BIOS)...'
         $txt_XmlLogicStatus.Foreground = $Window.FindResource('InputPlaceholder')
 
         # Run generation in a background runspace to keep the UI responsive. State and timer
@@ -12425,6 +12746,7 @@ if ($null -ne $btn_GenerateXmlLogicPackage) {
                     SiteCode    = $SiteCode
                     PackagePath = $PackagePath
                     Priority    = $Priority
+                    PackageScope = 'All'
                 }
                 if ($CreatePkg) {
                     $params['CreatePackage'] = $true
@@ -12466,7 +12788,7 @@ if ($null -ne $btn_GenerateXmlLogicPackage) {
                     $r = $script:XmlLogicState.Result
                     switch ($r.Status) {
                         'NoPackages' {
-                            $txt_XmlLogicStatus.Text = 'No matching driver packages found in ConfigMgr.'
+                            $txt_XmlLogicStatus.Text = 'No matching driver or BIOS packages found in ConfigMgr.'
                             $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusWarning')
                         }
                         'Failed' {
@@ -12474,9 +12796,21 @@ if ($null -ne $btn_GenerateXmlLogicPackage) {
                             $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusError')
                         }
                         default {
+                            $scopeLabel = switch ($r.PackageScope) {
+                                'Drivers' { 'Drivers only' }
+                                'BIOS'    { 'BIOS only' }
+                                default   { 'Drivers + BIOS' }
+                            }
                             $pkgNote = if ($r.PackageID) { " | Package $($r.PackageID) ($($r.Status))" } else { '' }
-                            $txt_XmlLogicStatus.Text = "Done. $($r.PackageCount) package(s) written to DriverPackages.xml$pkgNote"
+                            $txt_XmlLogicStatus.Text = "Done. $($r.PackageCount) package(s) [$scopeLabel] written to DriverPackages.xml$pkgNote"
                             $txt_XmlLogicStatus.Foreground = $Window.FindResource('StatusSuccess')
+                            if ($r.PackageID) {
+                                if ($null -ne $txt_XmlLogicPackageName) { $txt_XmlLogicPackageName.Text = 'Driver Automation Tool XML Package' }
+                                if ($null -ne $txt_XmlLogicPackageId) { $txt_XmlLogicPackageId.Text = [string]$r.PackageID }
+                                Set-DATRegistryValue -Name 'XmlLogicPackageName' -Value 'Driver Automation Tool XML Package' -Type String
+                                Set-DATRegistryValue -Name 'XmlLogicPackageID' -Value ([string]$r.PackageID) -Type String
+                            }
+                            Invoke-DATRefreshXmlLogicPackageStatus
                         }
                     }
                 } else {
@@ -12488,6 +12822,8 @@ if ($null -ne $btn_GenerateXmlLogicPackage) {
         $script:XmlLogicTimer.Start()
     })
 }
+
+Invoke-DATRefreshXmlLogicPackageStatus
 
 # --- Source Folder Cleanup toggle ---
 $chk_DeleteSourceFolder = $Window.FindName('chk_DeleteSourceFolder')
@@ -14613,7 +14949,63 @@ $chk_TelemetryOptOut.Add_Unchecked({
     $btn_IntuneReportIssue.IsEnabled = $false
 })
 
-# ── DAT API Catalog Source toggle ──
+# -- Environment profile dropdowns (device count + management platform) --
+$cmb_DeviceCountRange   = $Window.FindName('cmb_DeviceCountRange')
+$cmb_ManagementPlatform = $Window.FindName('cmb_ManagementPlatform')
+
+$datEnvRangeOptions = @(
+    @{ Label = 'Prefer not to say'; Value = '' }
+    @{ Label = '1 - 250';           Value = '1-250' }
+    @{ Label = '251 - 500';         Value = '251-500' }
+    @{ Label = '501 - 1,000';       Value = '501-1000' }
+    @{ Label = '1,001 - 5,000';     Value = '1001-5000' }
+    @{ Label = '5,001 - 10,000';    Value = '5001-10000' }
+    @{ Label = '10,001 - 25,000';   Value = '10001-25000' }
+    @{ Label = '25,001 - 50,000';   Value = '25001-50000' }
+    @{ Label = '50,001 - 100,000';  Value = '50001-100000' }
+    @{ Label = '100,001 - 150,000'; Value = '100001-150000' }
+    @{ Label = '150,000+';          Value = '150000+' }
+)
+$datEnvPlatformOptions = @(
+    @{ Label = 'Prefer not to say';     Value = '' }
+    @{ Label = 'Intune';                Value = 'Intune' }
+    @{ Label = 'Configuration Manager'; Value = 'ConfigMgr' }
+    @{ Label = 'Co-Managed';            Value = 'CoManaged' }
+    @{ Label = 'Standalone';            Value = 'Standalone' }
+)
+
+if ($null -ne $cmb_DeviceCountRange -and $null -ne $cmb_ManagementPlatform) {
+    foreach ($opt in $datEnvRangeOptions) {
+        $item = [System.Windows.Controls.ComboBoxItem]::new()
+        $item.Content = $opt.Label
+        $item.Tag     = $opt.Value
+        $null = $cmb_DeviceCountRange.Items.Add($item)
+    }
+    foreach ($opt in $datEnvPlatformOptions) {
+        $item = [System.Windows.Controls.ComboBoxItem]::new()
+        $item.Content = $opt.Label
+        $item.Tag     = $opt.Value
+        $null = $cmb_ManagementPlatform.Items.Add($item)
+    }
+
+    # Pre-select from stored registry values (before wiring change handlers so the
+    # initial selection does not trigger a redundant save)
+    $envProfileInit = Get-DATEnvironmentProfile
+    $rangeSel = $cmb_DeviceCountRange.Items | Where-Object { [string]$_.Tag -eq $envProfileInit.DeviceCountRange } | Select-Object -First 1
+    $cmb_DeviceCountRange.SelectedItem = if ($null -ne $rangeSel) { $rangeSel } else { $cmb_DeviceCountRange.Items[0] }
+    $platSel = $cmb_ManagementPlatform.Items | Where-Object { [string]$_.Tag -eq $envProfileInit.ManagementPlatform } | Select-Object -First 1
+    $cmb_ManagementPlatform.SelectedItem = if ($null -ne $platSel) { $platSel } else { $cmb_ManagementPlatform.Items[0] }
+
+    $persistEnvProfile = {
+        $r = if ($null -ne $cmb_DeviceCountRange.SelectedItem)   { [string]$cmb_DeviceCountRange.SelectedItem.Tag }   else { '' }
+        $p = if ($null -ne $cmb_ManagementPlatform.SelectedItem) { [string]$cmb_ManagementPlatform.SelectedItem.Tag } else { '' }
+        Set-DATEnvironmentProfile -DeviceCountRange $r -ManagementPlatform $p
+    }
+    $cmb_DeviceCountRange.Add_SelectionChanged($persistEnvProfile)
+    $cmb_ManagementPlatform.Add_SelectionChanged($persistEnvProfile)
+}
+
+# -- DAT API Catalog Source toggle --
 $chk_UseDATAPICatalog = $Window.FindName('chk_UseDATAPICatalog')
 $panel_DATAPIStatus = $Window.FindName('panel_DATAPIStatus')
 $txt_DATAPIStatusIcon = $Window.FindName('txt_DATAPIStatusIcon')
@@ -14816,6 +15208,17 @@ $chk_CleanTempOnExit.Add_Unchecked({
     Write-DATActivityLog "Clean temp on exit disabled" -Level Info
 })
 
+# Download Only extraction behaviour toggle
+$chk_DownloadOnlyExtractContent = $Window.FindName('chk_DownloadOnlyExtractContent')
+$chk_DownloadOnlyExtractContent.Add_Checked({
+    Set-DATRegistryValue -Name "DownloadOnlyExtractContent" -Value 1 -Type DWord
+    Write-DATActivityLog "Download Only extraction enabled" -Level Info
+})
+$chk_DownloadOnlyExtractContent.Add_Unchecked({
+    Set-DATRegistryValue -Name "DownloadOnlyExtractContent" -Value 0 -Type DWord
+    Write-DATActivityLog "Download Only extraction disabled (download files only)" -Level Info
+})
+
 # Teams Notifications save handlers
 $chk_TeamsNotifications.Add_Checked({
     Set-DATRegistryValue -Name "TeamsNotificationsEnabled" -Value 1 -Type DWord
@@ -14908,6 +15311,12 @@ $btn_Schedule.Add_Click({
     if ($minIdx -ge 12) { $minIdx = 0 }
     $cmb_ScheduleMinute.SelectedIndex = $minIdx
 
+    # Populate the day-of-month picker once (1-28 so a monthly run fires in every month).
+    if ($null -ne $cmb_ScheduleDayOfMonth -and $cmb_ScheduleDayOfMonth.Items.Count -eq 0) {
+        1..28 | ForEach-Object { [void]$cmb_ScheduleDayOfMonth.Items.Add($_) }
+        $cmb_ScheduleDayOfMonth.SelectedIndex = 0
+    }
+
     $overlay_Schedule.Visibility = 'Visible'
     $Window.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{})
 
@@ -14924,6 +15333,14 @@ $btn_Schedule.Add_Click({
                     $cmb_ScheduleFrequency.SelectedIndex = 1
                 } elseif ($t.CimClass.CimClassName -eq 'MSFT_TaskWeeklyTrigger') {
                     $cmb_ScheduleFrequency.SelectedIndex = 2
+                } elseif ($t.CimClass.CimClassName -eq 'MSFT_TaskMonthlyTrigger') {
+                    $cmb_ScheduleFrequency.SelectedIndex = 3
+                    # DaysOfMonth is a bitmask (bit 0 = day 1); recover the first selected day.
+                    if ($t.DaysOfMonth) {
+                        for ($d = 1; $d -le 28; $d++) {
+                            if ($t.DaysOfMonth -band (1 -shl ($d - 1))) { $cmb_ScheduleDayOfMonth.SelectedIndex = $d - 1; break }
+                        }
+                    }
                 }
                 if ($t.StartBoundary) {
                     try {
@@ -14942,6 +15359,7 @@ $btn_Schedule.Add_Click({
 $cmb_ScheduleFrequency.Add_SelectionChanged({
     $selectedFreq = $cmb_ScheduleFrequency.SelectedItem.Content
     $panel_ScheduleDay.Visibility = if ($selectedFreq -eq 'Weekly') { 'Visible' } else { 'Collapsed' }
+    $panel_ScheduleDayOfMonth.Visibility = if ($selectedFreq -eq 'Monthly') { 'Visible' } else { 'Collapsed' }
 })
 
 $btn_ScheduleCancel.Add_Click({
@@ -15005,6 +15423,7 @@ $btn_ScheduleSave.Add_Click({
     $schedDisableToast = ($schedPlatform -eq 'Intune') -and ($chk_DisableToastPrompt.IsChecked -eq $true)
     $schedDisableRestart = ($schedPlatform -eq 'Intune') -and ($chk_DisableBIOSRestart.IsChecked -eq $true)
     $schedCreateWinOnly = ($schedPlatform -eq 'Intune') -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
+    $schedBrandingAllToasts = ($null -ne $chk_ToastBrandingAllNotifications) -and ($chk_ToastBrandingAllNotifications.IsChecked -eq $true)
     $schedTimeoutAction = if ($cmb_BIOSTimeoutAction.SelectedIndex -eq 1) { 'InstallNow' } else { 'RemindMeLater' }
     $schedMaxDeferrals = if (($chk_EnableMaxDeferrals.IsChecked -eq $true) -and ($txt_MaxDeferrals.Text -match '^\d+$')) { [int]$txt_MaxDeferrals.Text } else { 0 }
     $schedBIOSRestartDelay = if (($txt_BIOSRestartDelay.Text -match '^\d+$')) { [int]$txt_BIOSRestartDelay.Text } else { 10 }
@@ -15014,6 +15433,7 @@ $btn_ScheduleSave.Add_Click({
     $schedTempPath = if ($regConfig -and -not [string]::IsNullOrEmpty($regConfig.TempStoragePath)) { $regConfig.TempStoragePath } else { '' }
     $schedPkgPath = if ($regConfig -and -not [string]::IsNullOrEmpty($regConfig.PackageStoragePath)) { $regConfig.PackageStoragePath } else { '' }
     $schedCleanTemp = -not ($regConfig -and $null -ne $regConfig.CleanTempOnExit -and $regConfig.CleanTempOnExit -eq 0)
+    $schedDownloadOnlyExtract = ($null -eq $chk_DownloadOnlyExtractContent -or $chk_DownloadOnlyExtractContent.IsChecked -ne $false)
 
     # ConfigMgr settings
     $schedCM = @{
@@ -15056,7 +15476,9 @@ $btn_ScheduleSave.Add_Click({
             -Intune $schedIntune `
             -MaintenanceWindowEnabled $schedMWEnabled -MaintenanceWindowMode $schedMWMode -MaintenanceWindows $schedMWindows `
             -CleanTempOnExit $schedCleanTemp `
+            -DownloadOnlyExtractContent $schedDownloadOnlyExtract `
             -CreateIntuneWinOnly $schedCreateWinOnly `
+            -ShowBrandingBannerAllToasts $schedBrandingAllToasts `
             -PackageRetentionEnabled $schedRetentionEnabled -PackageRetentionCount $schedRetentionCount `
             -DeleteSourceFolderOnRemoval $schedDeleteSourceFolder
     } catch {
@@ -15075,13 +15497,18 @@ $btn_ScheduleSave.Add_Click({
     if ($frequency -eq 'Weekly') {
         $regParams['DayOfWeek'] = $cmb_ScheduleDay.SelectedItem.Content
     }
+    if ($frequency -eq 'Monthly') {
+        $regParams['DayOfMonth'] = [int]$cmb_ScheduleDayOfMonth.SelectedItem
+    }
 
     try {
         $result = Register-DATScheduledBuild @regParams
         Write-DATActivityLog "Scheduled build registered: $($result.Frequency) at $($result.Time)" -Level Info
         $overlay_Schedule.Visibility = 'Collapsed'
         $txt_Status.Text = "Scheduled build saved: $frequency at $time"
-        $dayInfo = if ($frequency -eq 'Weekly') { " on $($cmb_ScheduleDay.SelectedItem.Content)" } else { '' }
+        $dayInfo = if ($frequency -eq 'Weekly') { " on $($cmb_ScheduleDay.SelectedItem.Content)" }
+                   elseif ($frequency -eq 'Monthly') { " on day $($cmb_ScheduleDayOfMonth.SelectedItem) of each month" }
+                   else { '' }
         $onceNote = if ($frequency -eq 'Once Off') { "`n`nThis is a one-time build. The scheduled task will automatically remove itself after completion." } else { '' }
         Show-DATInfoDialog -Title "Schedule Saved" `
             -Message "Your $($frequency.ToLower()) build has been scheduled$dayInfo at $time.`n`nThe task will run under SYSTEM in the '\Driver Automation Tool\' task folder.$onceNote" `
@@ -15175,6 +15602,12 @@ $btn_PurgeDownloads.Add_Click({
         $items = Get-ChildItem -Path $tempPath -Force -ErrorAction SilentlyContinue
         $removedCount = 0
         foreach ($item in $items) {
+            # Preserve the Configuration Manager (Offline) export folder -- it is a deliverable,
+            # not transient download/extract content, and is cleared at the start of each offline run.
+            if ($item.PSIsContainer -and $item.Name -eq 'ConfigMgr Offline') {
+                Write-DATActivityLog "Skipped offline export folder (preserved): $($item.Name)" -Level Info
+                continue
+            }
             try {
                 # Security fix #11: handle reparse points (junctions/symlinks) without
                 # following them into their targets — delete the link itself only.
@@ -16022,6 +16455,9 @@ $btn_CustomBuild.Add_Click({
     # Read the Critical Notification (alarm mode) state (Intune only) -- bypasses Focus Assist / DND
     $alarmMode = ($platform -eq 'Intune') -and ($chk_CriticalNotification.IsChecked -eq $true)
 
+    # Read the audible alarm sound sub-toggle (only relevant when Critical Notification is enabled)
+    $alarmSound = $alarmMode -and ($chk_CriticalNotificationSound.IsChecked -eq $true)
+
     # Read the Create IntuneWin Only state (Intune only) -- builds .intunewin without uploading
     $createIntuneWinOnly = ($platform -eq 'Intune') -and ($chk_CreateIntuneWinOnly.IsChecked -eq $true)
 
@@ -16051,7 +16487,7 @@ $btn_CustomBuild.Add_Click({
     [void]$script:CustomBuildPS.AddScript({
         param($Make, $Model, $BaseBoard, $Platform, $TempStorage, $PackageStorage, $RegPath,
               $OSLabel, $Architecture, $Version, $ScriptDir, $SiteServer, $SiteCode, $DisableToast, $TotalSteps,
-              $Method, $DriverFolderPath, $DPGroups, $DPs, $DistPriority, $DebugBuildPath, $CustomBrandingPath, $AlarmMode, $CreateIntuneWinOnly)
+              $Method, $DriverFolderPath, $DPGroups, $DPs, $DistPriority, $DebugBuildPath, $CustomBrandingPath, $MaintenanceWindowsJson, $AlarmMode, $AlarmSound, $CreateIntuneWinOnly)
 
         $global:ScriptDirectory = $ScriptDir
         $global:RegPath = $RegPath
@@ -16539,7 +16975,9 @@ $btn_CustomBuild.Add_Click({
                 }
                 if (-not [string]::IsNullOrEmpty($DebugBuildPath)) { $intuneCreateParams['DebugBuildPath'] = $DebugBuildPath }
                 if (-not [string]::IsNullOrEmpty($CustomBrandingPath)) { $intuneCreateParams['CustomBrandingPath'] = $CustomBrandingPath }
+                if (-not [string]::IsNullOrEmpty($MaintenanceWindowsJson)) { $intuneCreateParams['MaintenanceWindowsJson'] = $MaintenanceWindowsJson }
                 if ($AlarmMode) { $intuneCreateParams['AlarmMode'] = $true }
+                if ($AlarmSound) { $intuneCreateParams['AlarmSound'] = $true }
                 if ($CreateIntuneWinOnly) { $intuneCreateParams['CreateIntuneWinOnly'] = $true }
                 $packageResult = Invoke-DATIntunePackageCreation @intuneCreateParams
                 if ($CreateIntuneWinOnly) {
@@ -16651,7 +17089,20 @@ $btn_CustomBuild.Add_Click({
     [void]$script:CustomBuildPS.AddArgument($customDistPriority)
     [void]$script:CustomBuildPS.AddArgument($debugBuildPath)
     [void]$script:CustomBuildPS.AddArgument($script:CustomBrandingImagePath)
+
+    # Maintenance window schedule (Intune only) -- pass stored JSON when enabled
+    $maintenanceWindowsJson = $null
+    if ($platform -eq 'Intune') {
+        $mwEnabledVal = (Get-ItemProperty -Path $global:RegPath -Name 'MaintenanceWindowEnabled' -ErrorAction SilentlyContinue).MaintenanceWindowEnabled
+        if ($mwEnabledVal -eq 1) {
+            $mwJsonReg = (Get-ItemProperty -Path $global:RegPath -Name 'MaintenanceWindows' -ErrorAction SilentlyContinue).MaintenanceWindows
+            if (-not [string]::IsNullOrWhiteSpace($mwJsonReg)) { $maintenanceWindowsJson = $mwJsonReg }
+        }
+    }
+    [void]$script:CustomBuildPS.AddArgument($maintenanceWindowsJson)
+
     [void]$script:CustomBuildPS.AddArgument($alarmMode)
+    [void]$script:CustomBuildPS.AddArgument($alarmSound)
     [void]$script:CustomBuildPS.AddArgument($createIntuneWinOnly)
     $script:CustomBuildAsyncResult = $script:CustomBuildPS.BeginInvoke()
 
@@ -17114,11 +17565,22 @@ $chk_DisableToastPrompt.Add_Unchecked({
 
 $chk_CriticalNotification.Add_Checked({
     Set-DATRegistryValue -Name "ToastCriticalNotification" -Value 1 -Type DWord
+    $panel_CriticalNotificationSound.Visibility = 'Visible'
     Write-DATActivityLog "Critical notification (Focus Assist bypass): Enabled" -Level Info
 })
 $chk_CriticalNotification.Add_Unchecked({
     Set-DATRegistryValue -Name "ToastCriticalNotification" -Value 0 -Type DWord
+    $panel_CriticalNotificationSound.Visibility = 'Collapsed'
     Write-DATActivityLog "Critical notification (Focus Assist bypass): Disabled" -Level Info
+})
+
+$chk_CriticalNotificationSound.Add_Checked({
+    Set-DATRegistryValue -Name "ToastCriticalNotificationSound" -Value 1 -Type DWord
+    Write-DATActivityLog "Critical notification audible alarm sound: Enabled" -Level Info
+})
+$chk_CriticalNotificationSound.Add_Unchecked({
+    Set-DATRegistryValue -Name "ToastCriticalNotificationSound" -Value 0 -Type DWord
+    Write-DATActivityLog "Critical notification audible alarm sound: Disabled" -Level Info
 })
 
 $chk_EnableMaxDeferrals.Add_Checked({
@@ -17311,16 +17773,46 @@ $cmb_BIOSTimeoutAction.Add_SelectionChanged({
 
 $chk_DeployAllDevices = $Window.FindName('chk_DeployAllDevices')
 $txt_DeployAllState = $Window.FindName('txt_DeployAllState')
+$txt_DeployWarning = $Window.FindName('txt_DeployWarning')
+
+# Reflects the TRUE deployment outcome, accounting for BOTH the Deploy toggle and the
+# Automatic Assignment Filter -- the filter path deploys independently of the Deploy toggle,
+# so turning off 'Deploy to All Devices' alone does not guarantee that nothing is deployed.
+function Update-DATDeployWarning {
+    if ($null -eq $txt_DeployWarning) { return }
+    $deployOn = $chk_DeployAllDevices.IsChecked -eq $true
+    $filterOn = ($null -ne $chk_AutoAssignmentFilter) -and ($chk_AutoAssignmentFilter.IsChecked -eq $true)
+    $targetName = (Get-ItemProperty -Path $global:RegPath -Name 'DeployTargetGroupName' -ErrorAction SilentlyContinue).DeployTargetGroupName
+    if ([string]::IsNullOrWhiteSpace($targetName)) { $targetName = 'All Devices' }
+
+    if ($deployOn -and $filterOn) {
+        $txt_DeployWarning.Foreground = $Window.FindResource('StatusWarning')
+        $txt_DeployWarning.Text = "Warning: Every driver and BIOS package built will be automatically deployed to matching devices via an assignment filter (target: '$targetName'). Devices install them automatically, and BIOS packages may trigger a restart -- with no further approval step."
+    } elseif ($deployOn) {
+        $txt_DeployWarning.Foreground = $Window.FindResource('StatusWarning')
+        $txt_DeployWarning.Text = "Warning: Every driver and BIOS package built will be automatically assigned as Required to '$targetName'. Matching devices download and install them automatically, and BIOS packages may trigger a restart -- with no further approval step."
+    } elseif ($filterOn) {
+        $txt_DeployWarning.Foreground = $Window.FindResource('InputPlaceholder')
+        $txt_DeployWarning.Text = "Packages will be created and uploaded to Intune but not assigned to any devices. The Automatic Assignment Filter below is inactive because 'Deploy to All Devices' is off -- turn deployment on to activate it."
+    } else {
+        $txt_DeployWarning.Foreground = $Window.FindResource('InputPlaceholder')
+        $txt_DeployWarning.Text = "Packages will be created and uploaded to Intune but not assigned to any devices. You must assign them manually in the Intune portal."
+    }
+    $txt_DeployWarning.Visibility = 'Visible'
+}
+
 $chk_DeployAllDevices.Add_Checked({
     Set-DATRegistryValue -Name "DeployAllDevices" -Value 1 -Type DWord
     $txt_DeployAllState.Text = 'On'
     $txt_DeployAllState.Foreground = $Window.FindResource('AccentColor')
+    Update-DATDeployWarning
     Write-DATActivityLog "Package Deployment: Deploy to All Devices enabled" -Level Info
 })
 $chk_DeployAllDevices.Add_Unchecked({
     Set-DATRegistryValue -Name "DeployAllDevices" -Value 0 -Type DWord
     $txt_DeployAllState.Text = 'Off'
     $txt_DeployAllState.Foreground = $Window.FindResource('InputPlaceholder')
+    Update-DATDeployWarning
     Write-DATActivityLog "Package Deployment: Deploy to All Devices disabled" -Level Info
 })
 
@@ -17482,6 +17974,8 @@ if ($null -ne $cmb_Platform) {
 $chk_AutoAssignmentFilter = $Window.FindName('chk_AutoAssignmentFilter')
 $txt_AutoFilterState = $Window.FindName('txt_AutoFilterState')
 $cmb_FilterMode = $Window.FindName('cmb_FilterMode')
+$cmb_IMENotifications = $Window.FindName('cmb_IMENotifications')
+$txt_IMENotificationsHint = $Window.FindName('txt_IMENotificationsHint')
 $txt_FilterCount = $Window.FindName('txt_FilterCount')
 $txt_FilterRemaining = $Window.FindName('txt_FilterRemaining')
 $txt_FilterWarning = $Window.FindName('txt_FilterWarning')
@@ -17532,14 +18026,19 @@ $chk_AutoAssignmentFilter.Add_Checked({
     Set-DATRegistryValue -Name "AutoAssignmentFilter" -Value 1 -Type DWord
     $txt_AutoFilterState.Text = 'On'
     $txt_AutoFilterState.Foreground = $Window.FindResource('AccentColor')
+    Update-DATDeployWarning
     Write-DATActivityLog "Assignment Filters: Auto-create enabled" -Level Info
 })
 $chk_AutoAssignmentFilter.Add_Unchecked({
     Set-DATRegistryValue -Name "AutoAssignmentFilter" -Value 0 -Type DWord
     $txt_AutoFilterState.Text = 'Off'
     $txt_AutoFilterState.Foreground = $Window.FindResource('InputPlaceholder')
+    Update-DATDeployWarning
     Write-DATActivityLog "Assignment Filters: Auto-create disabled" -Level Info
 })
+
+# Initialise the deployment warning to reflect the current toggle states on load
+Update-DATDeployWarning
 
 $cmb_FilterMode.Add_SelectionChanged({
     $selected = $cmb_FilterMode.SelectedItem
@@ -17563,6 +18062,31 @@ $cmb_FilterMode.Add_SelectionChanged({
         Write-DATActivityLog "Assignment filter mode set to: $mode" -Level Info
     }
 })
+
+# IME toast notification behaviour (applied to Intune app assignments)
+function Update-DATIMENotificationsHint {
+    $sel = $cmb_IMENotifications.SelectedItem
+    $tag = if ($sel) { $sel.Tag } else { 'showAll' }
+    switch ($tag) {
+        'hideAll'    { $txt_IMENotificationsHint.Text = 'Only DAT toasts shown to users' }
+        'showReboot' { $txt_IMENotificationsHint.Text = 'Only reboot prompts shown' }
+        default      { $txt_IMENotificationsHint.Text = 'Default Intune behaviour' }
+    }
+}
+
+$cmb_IMENotifications.Add_SelectionChanged({
+    $selected = $cmb_IMENotifications.SelectedItem
+    if ($selected) {
+        $mode = $selected.Tag
+        Set-DATRegistryValue -Name "IMENotifications" -Value $mode -Type String
+        Update-DATIMENotificationsHint
+        Write-DATActivityLog "IME toast notifications set to: $mode" -Level Info
+    }
+})
+
+# Initial hint
+Update-DATIMENotificationsHint
+
 
 # Filter name template persistence and live preview
 $txt_FilterNameTemplate.Add_TextChanged({
@@ -18120,6 +18644,9 @@ $script:PreviewUserDisplayName = try {
 } catch { 'User' }
 
 $img_ToastBanner          = $Window.FindName('img_ToastBanner')
+$img_ToastStatusBanner    = $Window.FindName('img_ToastStatusBanner')
+$bd_ToastStatusBanner     = $Window.FindName('bd_ToastStatusBanner')
+$row_ToastStatusStrip     = $Window.FindName('row_ToastStatusStrip')
 $txt_ToastHeading         = $Window.FindName('txt_ToastHeading')
 $txt_ToastBody            = $Window.FindName('txt_ToastBody')
 $cmb_ToastPreviewType     = $Window.FindName('cmb_ToastPreviewType')
@@ -18158,6 +18685,7 @@ function Set-DATToastBannerImage {
         $bitmap.EndInit()
         $bitmap.Freeze()
         $img_ToastBanner.ImageSource = $bitmap
+        if ($null -ne $img_ToastStatusBanner) { $img_ToastStatusBanner.ImageSource = $bitmap }
     }
 }
 
@@ -18249,6 +18777,25 @@ $btn_ClearCustomBranding.Add_Click({
     Set-DATRegistryValue -Name 'CustomBrandingPath' -Value '' -Type String
     Remove-ItemProperty -Path $global:RegPath -Name 'CustomBrandingPath' -ErrorAction SilentlyContinue
 })
+
+# Show branding banner on all notifications (status toasts) toggle
+$chk_ToastBrandingAllNotifications = $Window.FindName('chk_ToastBrandingAllNotifications')
+if ($null -ne $chk_ToastBrandingAllNotifications) {
+    $savedBrandingAllToasts = (Get-ItemProperty -Path $global:RegPath -Name 'ToastBrandingAllNotifications' -ErrorAction SilentlyContinue).ToastBrandingAllNotifications
+    if ($null -ne $savedBrandingAllToasts -and $savedBrandingAllToasts -eq 1) { $chk_ToastBrandingAllNotifications.IsChecked = $true }
+    $chk_ToastBrandingAllNotifications.Add_Checked({
+        Set-DATRegistryValue -Name 'ToastBrandingAllNotifications' -Value 1 -Type DWord
+        Write-DATActivityLog "Branding banner on all notifications: Enabled" -Level Info
+        $selectedType = if ($null -ne $cmb_ToastPreviewType.SelectedItem) { $cmb_ToastPreviewType.SelectedItem.Content } else { 'Driver Update' }
+        Update-DATToastPreview -Type $selectedType
+    })
+    $chk_ToastBrandingAllNotifications.Add_Unchecked({
+        Set-DATRegistryValue -Name 'ToastBrandingAllNotifications' -Value 0 -Type DWord
+        Write-DATActivityLog "Branding banner on all notifications: Disabled" -Level Info
+        $selectedType = if ($null -ne $cmb_ToastPreviewType.SelectedItem) { $cmb_ToastPreviewType.SelectedItem.Content } else { 'Driver Update' }
+        Update-DATToastPreview -Type $selectedType
+    })
+}
 
 # Intune Package Icon -- custom PNG used as the Win32 app large icon
 $txt_IntunePackageIconPath    = $Window.FindName('txt_IntunePackageIconPath')
@@ -18359,6 +18906,8 @@ function Get-DATToastRegistryPrefix {
         'BIOS Prestaged'     { return 'Toast_BIOSSuccess' }
         'Driver Issues'      { return 'Toast_Issues' }
         'BIOS Issues'        { return 'Toast_BIOSIssues' }
+        'BIOS AC Power'      { return 'Toast_BIOSACPower' }
+        'BIOS Deferral Expired' { return 'Toast_BIOSFinalNotice' }
         default              { return 'Toast_Drivers' }
     }
 }
@@ -18368,9 +18917,11 @@ $script:ToastDefaults = @{
     'Toast_Drivers'     = @{ Title = 'Driver Updates Pending'; Body = 'Your device has pending updates which are required for security / stability reasons. Pressing the Update button can result in temporary network or display interruption.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Update Now'; DismissButton = 'Remind Me Later' }
     'Toast_BIOS'        = @{ Title = 'BIOS Update Pending'; Body = 'Your device has pending updates which are required for security / stability reasons. Pressing the Update button will trigger a restart of your device. DO NOT power off the device during the update process.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Update Now'; DismissButton = 'Remind Me Later' }
     'Toast_Success'     = @{ Title = 'Drivers Successfully Updated'; Body = 'Your device drivers have been successfully updated. No restart is required unless indicated by your IT department.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Close'; DismissButton = '' }
-    'Toast_BIOSSuccess' = @{ Title = 'BIOS Firmware Prestaged'; Body = 'Your system has a pending BIOS update and will be restarted in {{MINUTES}} minute(s). Please save your work. Do NOT power off the device during the update process.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Close'; DismissButton = 'Restart Now' }
+    'Toast_BIOSSuccess' = @{ Title = 'BIOS Firmware Prestaged'; Body = 'Your system has a pending BIOS update and will be restarted in {{MINUTES}} minute(s), alternatively you can restart your device now or before this time to speed up the process. Please DO NOT power off the device during the update process.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Close'; DismissButton = 'Restart Now' }
     'Toast_Issues'      = @{ Title = 'Driver Update Issues Detected'; Body = 'One or more driver updates encountered errors during installation. Please contact your IT department or check the device logs for details.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Close'; DismissButton = '' }
     'Toast_BIOSIssues'  = @{ Title = 'BIOS Update Issues Detected'; Body = 'The BIOS firmware update encountered errors during installation. Please contact your IT department or check the device logs for details.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Close'; DismissButton = '' }
+    'Toast_BIOSACPower' = @{ Title = 'BIOS Update Paused - Connect Power'; Body = 'Your device needs to install a BIOS firmware update, but it must be connected to AC power first. Please plug in your charger - the update will continue automatically the next time it runs.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Close'; DismissButton = '' }
+    'Toast_BIOSFinalNotice' = @{ Title = 'Final Reminder - BIOS Update Pending'; Body = 'You have reached the maximum number of allowed deferrals. This BIOS update is now being pre-staged and will be applied on your next restart. Please save your work. Do NOT power off the device during the update process.'; Greeting = 'Hi'; Subtitle = 'Driver Automation Tool V10'; ActionButton = 'Close'; DismissButton = '' }
 }
 
 # Suppress TextChanged events during programmatic loads
@@ -18582,12 +19133,58 @@ function Update-DATToastPreview {
             $txt_ToastStatusHeading.Text           = if (-not [string]::IsNullOrEmpty($customTitle)) { $customTitle } else { $defaults.Title }
             $txt_ToastStatusBody.Text              = if (-not [string]::IsNullOrEmpty($customBody)) { $customBody } else { $defaults.Body }
         }
+        'BIOS AC Power' {
+            $panel_ToastUpdateMockup.Visibility = 'Collapsed'
+            $panel_ToastStatusMockup.Visibility = 'Visible'
+            $accentAmber = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#D97706'))
+            $iconBg      = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#451a03'))
+            $iconFg      = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#F59E0B'))
+            $bd_ToastStatusOuter.BorderBrush      = $accentAmber
+            $bd_ToastStatusStrip.Background        = $accentAmber
+            $bd_ToastStatusIcon.Background         = $iconBg
+            $txt_ToastStatusIcon.Foreground        = $iconFg
+            $txt_ToastStatusIcon.Text              = [char]0xE83E   # BatteryCharging (connect power)
+            $txt_ToastStatusHeading.Text           = if (-not [string]::IsNullOrEmpty($customTitle)) { $customTitle } else { $defaults.Title }
+            $txt_ToastStatusBody.Text              = if (-not [string]::IsNullOrEmpty($customBody)) { $customBody } else { $defaults.Body }
+        }
+        'BIOS Deferral Expired' {
+            $panel_ToastUpdateMockup.Visibility = 'Collapsed'
+            $panel_ToastStatusMockup.Visibility = 'Visible'
+            $accentAmber = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#D97706'))
+            $iconBg      = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#451a03'))
+            $iconFg      = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString('#F59E0B'))
+            $bd_ToastStatusOuter.BorderBrush      = $accentAmber
+            $bd_ToastStatusStrip.Background        = $accentAmber
+            $bd_ToastStatusIcon.Background         = $iconBg
+            $txt_ToastStatusIcon.Foreground        = $iconFg
+            $txt_ToastStatusIcon.Text              = [char]0xE7BA   # Warning / final notice
+            $txt_ToastStatusHeading.Text           = if (-not [string]::IsNullOrEmpty($customTitle)) { $customTitle } else { $defaults.Title }
+            $txt_ToastStatusBody.Text              = if (-not [string]::IsNullOrEmpty($customBody)) { $customBody } else { $defaults.Body }
+        }
         default {
             # Driver Update
             $panel_ToastUpdateMockup.Visibility = 'Visible'
             $panel_ToastStatusMockup.Visibility = 'Collapsed'
             $txt_ToastHeading.Text = if (-not [string]::IsNullOrEmpty($customTitle)) { $customTitle } else { $defaults.Title }
             $txt_ToastBody.Text    = if (-not [string]::IsNullOrEmpty($customBody)) { $customBody } else { $defaults.Body }
+        }
+    }
+
+    # Show the hero banner on status toasts when 'branding on all notifications' is enabled,
+    # mirroring how the generated status-toast scripts render when the option is active. The
+    # coloured accent strip is hidden when the banner is present so there is no bar between
+    # the logo and the message.
+    if ($null -ne $bd_ToastStatusBanner) {
+        $showStatusBanner = ($panel_ToastStatusMockup.Visibility -eq 'Visible') -and
+            ($null -ne $chk_ToastBrandingAllNotifications) -and ($chk_ToastBrandingAllNotifications.IsChecked -eq $true)
+        if ($showStatusBanner) {
+            $bd_ToastStatusBanner.Visibility = 'Visible'
+            $bd_ToastStatusStrip.Visibility = 'Collapsed'
+            if ($null -ne $row_ToastStatusStrip) { $row_ToastStatusStrip.Height = [System.Windows.GridLength]::new(0) }
+        } else {
+            $bd_ToastStatusBanner.Visibility = 'Collapsed'
+            $bd_ToastStatusStrip.Visibility = 'Visible'
+            if ($null -ne $row_ToastStatusStrip) { $row_ToastStatusStrip.Height = [System.Windows.GridLength]::new(4) }
         }
     }
 }
@@ -18658,7 +19255,7 @@ $btn_ShowToastPreview.Add_Click({
     $restartMins = if (($txt_BIOSRestartDelay.Text -match '^\d+$')) { [int]$txt_BIOSRestartDelay.Text } else { 10 }
     $body = $body -replace '\{\{MINUTES\}\}', $restartMins
 
-    $isStatusType = $selectedType -in @('Successfully Updated', 'BIOS Prestaged', 'Driver Issues', 'BIOS Issues')
+    $isStatusType = $selectedType -in @('Successfully Updated', 'BIOS Prestaged', 'Driver Issues', 'BIOS Issues', 'BIOS AC Power')
 
     # Determine status type colors/icons
     $statusIcon = [char]0xE930; $iconColor = '#22C55E'; $accentColor = '#16A34A'; $iconBackground = '#052e16'
@@ -18666,6 +19263,7 @@ $btn_ShowToastPreview.Add_Click({
         'BIOS Prestaged'     { $statusIcon = [char]0xE835; $iconColor = '#3B82F6'; $accentColor = '#2563EB'; $iconBackground = '#172554' }
         'Driver Issues'      { $statusIcon = [char]0xE7BA; $iconColor = '#F59E0B'; $accentColor = '#D97706'; $iconBackground = '#451a03' }
         'BIOS Issues'        { $statusIcon = [char]0xE7BA; $iconColor = '#F59E0B'; $accentColor = '#D97706'; $iconBackground = '#451a03' }
+        'BIOS AC Power'      { $statusIcon = [char]0xE83E; $iconColor = '#F59E0B'; $accentColor = '#D97706'; $iconBackground = '#451a03' }
     }
 
     # Build the preview window
@@ -19219,15 +19817,16 @@ function Invoke-DATIntuneAssignmentWithProgress {
     $script:AssignPS = [powershell]::Create()
     Add-DATCoreRunspaceBootstrap -PowerShell $script:AssignPS -CaptureIntuneAuthContext
     $script:AssignPS.AddScript({
-        param ($State, $AppList, $GroupId, $Intent, $FilterId, $FilterType)
+        param ($State, $AppList, $GroupId, $Intent, $FilterId, $FilterType, $IMENotifications)
+        $imeNotify = if ([string]::IsNullOrEmpty($IMENotifications)) { 'showAll' } else { $IMENotifications }
         foreach ($app in $AppList) {
             $entry = @{ AppId = $app.AppId; DisplayName = $app.DisplayName; Success = $false; Error = '' }
             try {
                 if (-not [string]::IsNullOrEmpty($FilterId)) {
                     $effectiveFilterType = if ([string]::IsNullOrEmpty($FilterType)) { 'include' } else { $FilterType }
-                    Set-DATIntuneAppAssignmentWithFilter -AppId $app.AppId -GroupId $GroupId -Intent $Intent -FilterId $FilterId -FilterType $effectiveFilterType
+                    Set-DATIntuneAppAssignmentWithFilter -AppId $app.AppId -GroupId $GroupId -Intent $Intent -FilterId $FilterId -FilterType $effectiveFilterType -IMENotifications $imeNotify
                 } else {
-                    Set-DATIntuneAppAssignment -AppId $app.AppId -GroupId $GroupId -Intent $Intent
+                    Set-DATIntuneAppAssignment -AppId $app.AppId -GroupId $GroupId -Intent $Intent -IMENotifications $imeNotify
                 }
                 $entry.Success = $true
             } catch {
@@ -19237,12 +19836,14 @@ function Invoke-DATIntuneAssignmentWithProgress {
         }
         $State.Status = 'Complete'
     })
+    $imeNotificationsPref = (Get-ItemProperty -Path $global:RegPath -Name 'IMENotifications' -ErrorAction SilentlyContinue).IMENotifications
     [void]$script:AssignPS.AddArgument($script:AssignState)
     [void]$script:AssignPS.AddArgument($appList)
     [void]$script:AssignPS.AddArgument($GroupResult.GroupId)
     [void]$script:AssignPS.AddArgument($Intent)
     [void]$script:AssignPS.AddArgument($GroupResult.FilterId)
     [void]$script:AssignPS.AddArgument($GroupResult.FilterType)
+    [void]$script:AssignPS.AddArgument($imeNotificationsPref)
     $script:AssignAsync = $script:AssignPS.BeginInvoke()
 
     # Poll timer to update icons as each assignment completes
@@ -23273,6 +23874,191 @@ function Show-DATTelemetryConsentModal {
     $linkTb.Inlines.Add($linkPostRun) | Out-Null
     $panel.Children.Add($linkTb) | Out-Null
 
+    # -- Optional environment profile (device count + management platform) --
+    $envHeader = [System.Windows.Controls.TextBlock]::new()
+    $envHeader.Text       = 'Optional: tell us about your environment'
+    $envHeader.FontSize   = 13
+    $envHeader.FontWeight = [System.Windows.FontWeights]::SemiBold
+    $envHeader.Foreground = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['WindowForeground']))
+    $envHeader.Margin     = [System.Windows.Thickness]::new(0, 0, 0, 6)
+    $panel.Children.Add($envHeader) | Out-Null
+
+    $envNote = [System.Windows.Controls.TextBlock]::new()
+    $envNote.Text         = 'This helps us understand the size and management model of environments using the tool. No device names or exact counts are collected, and you can change or clear these later in Common Settings.'
+    $envNote.FontSize     = 11
+    $envNote.TextWrapping = [System.Windows.TextWrapping]::Wrap
+    $envNote.Foreground   = [System.Windows.Media.SolidColorBrush]::new(
+        [System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
+    $envNote.Margin       = [System.Windows.Thickness]::new(0, 0, 0, 12)
+    $panel.Children.Add($envNote) | Out-Null
+
+    # Explicit theme colours (modal has no resource dictionary, so the pill
+    # ComboBox style used elsewhere is rebuilt here with literal theme values).
+    $cbBg    = $theme['ComboBackground']
+    $cbFg    = $theme['ComboForeground']
+    $cbBd    = $theme['ComboBorder']
+    $cbPri   = $theme['ButtonPrimary']
+    $cbHov   = $theme['SidebarHover']
+    $cbPriFg = $theme['ButtonPrimaryForeground']
+    $lblFg   = [System.Windows.Media.SolidColorBrush]::new([System.Windows.Media.ColorConverter]::ConvertFromString($theme['InputPlaceholder']))
+
+    function New-ModalComboLabel {
+        param([string]$Text)
+        $tb = [System.Windows.Controls.TextBlock]::new()
+        $tb.Text       = $Text
+        $tb.FontSize   = 11
+        $tb.FontWeight = [System.Windows.FontWeights]::SemiBold
+        $tb.Foreground = $lblFg
+        $tb.Margin     = [System.Windows.Thickness]::new(0, 0, 0, 4)
+        return $tb
+    }
+
+    # Pill ComboBox style (mirrors the default ComboBox style in MainWindow.xaml)
+    $comboStyleXaml = @"
+<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+       xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='ComboBox'>
+    <Setter Property='Foreground' Value='$cbFg'/>
+    <Setter Property='FontSize' Value='13'/>
+    <Setter Property='FontFamily' Value='Segoe UI'/>
+    <Setter Property='SnapsToDevicePixels' Value='True'/>
+    <Setter Property='Template'>
+        <Setter.Value>
+            <ControlTemplate TargetType='ComboBox'>
+                <Grid>
+                    <ToggleButton x:Name='ToggleButton' Focusable='False' ClickMode='Press'
+                                  IsChecked='{Binding Path=IsDropDownOpen, Mode=TwoWay, RelativeSource={RelativeSource TemplatedParent}}'>
+                        <ToggleButton.Template>
+                            <ControlTemplate TargetType='ToggleButton'>
+                                <Border x:Name='border' Background='$cbBg' BorderBrush='$cbBd' BorderThickness='1'
+                                        CornerRadius='17' Padding='14,0,10,0' Cursor='Hand' SnapsToDevicePixels='True'>
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width='*'/>
+                                            <ColumnDefinition Width='Auto'/>
+                                        </Grid.ColumnDefinitions>
+                                        <ContentPresenter Grid.Column='0' VerticalAlignment='Center' HorizontalAlignment='Stretch'/>
+                                        <Path x:Name='arrow' Grid.Column='1' Data='M0,0 L4,4 L8,0' Stroke='$cbFg'
+                                              StrokeThickness='1.5' VerticalAlignment='Center' Margin='8,1,4,0' StrokeLineJoin='Round'/>
+                                    </Grid>
+                                </Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property='IsMouseOver' Value='True'>
+                                        <Setter TargetName='border' Property='BorderBrush' Value='$cbPri'/>
+                                    </Trigger>
+                                    <Trigger Property='IsChecked' Value='True'>
+                                        <Setter TargetName='border' Property='BorderBrush' Value='$cbPri'/>
+                                        <Setter TargetName='arrow' Property='RenderTransform'>
+                                            <Setter.Value>
+                                                <RotateTransform Angle='180' CenterX='4' CenterY='2'/>
+                                            </Setter.Value>
+                                        </Setter>
+                                    </Trigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate>
+                        </ToggleButton.Template>
+                    </ToggleButton>
+                    <ContentPresenter x:Name='ContentSite' IsHitTestVisible='False'
+                                      Content='{TemplateBinding SelectionBoxItem}'
+                                      ContentTemplate='{TemplateBinding SelectionBoxItemTemplate}'
+                                      ContentStringFormat='{TemplateBinding SelectionBoxItemStringFormat}'
+                                      VerticalAlignment='Center' HorizontalAlignment='Left' Margin='16,0,28,0'/>
+                    <Popup x:Name='Popup' Placement='Bottom' IsOpen='{TemplateBinding IsDropDownOpen}'
+                           AllowsTransparency='True' Focusable='False' PopupAnimation='Slide' VerticalOffset='4'>
+                        <Border x:Name='DropDownBorder' Background='$cbBg' BorderBrush='$cbBd' BorderThickness='1'
+                                CornerRadius='12' Padding='4' MinWidth='{TemplateBinding ActualWidth}'
+                                MaxHeight='{TemplateBinding MaxDropDownHeight}' SnapsToDevicePixels='True'>
+                            <ScrollViewer SnapsToDevicePixels='True'>
+                                <StackPanel IsItemsHost='True' KeyboardNavigation.DirectionalNavigation='Contained'/>
+                            </ScrollViewer>
+                        </Border>
+                    </Popup>
+                </Grid>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
+</Style>
+"@
+
+    $comboItemStyleXaml = @"
+<Style xmlns='http://schemas.microsoft.com/winfx/2006/xaml/presentation'
+       xmlns:x='http://schemas.microsoft.com/winfx/2006/xaml' TargetType='ComboBoxItem'>
+    <Setter Property='Foreground' Value='$cbFg'/>
+    <Setter Property='FontSize' Value='13'/>
+    <Setter Property='FontFamily' Value='Segoe UI'/>
+    <Setter Property='SnapsToDevicePixels' Value='True'/>
+    <Setter Property='Template'>
+        <Setter.Value>
+            <ControlTemplate TargetType='ComboBoxItem'>
+                <Border x:Name='itemBorder' Background='Transparent' CornerRadius='8' Padding='12,7' Margin='0,1' Cursor='Hand'>
+                    <ContentPresenter VerticalAlignment='Center'/>
+                </Border>
+                <ControlTemplate.Triggers>
+                    <Trigger Property='IsMouseOver' Value='True'>
+                        <Setter TargetName='itemBorder' Property='Background' Value='$cbHov'/>
+                    </Trigger>
+                    <Trigger Property='IsSelected' Value='True'>
+                        <Setter TargetName='itemBorder' Property='Background' Value='$cbPri'/>
+                        <Setter Property='Foreground' Value='$cbPriFg'/>
+                    </Trigger>
+                </ControlTemplate.Triggers>
+            </ControlTemplate>
+        </Setter.Value>
+    </Setter>
+</Style>
+"@
+
+    $comboStyle     = [System.Windows.Markup.XamlReader]::Parse($comboStyleXaml)
+    $comboItemStyle = [System.Windows.Markup.XamlReader]::Parse($comboItemStyleXaml)
+
+    function New-ModalCombo {
+        param([array]$Options, [string]$SelectedValue)
+        $c = [System.Windows.Controls.ComboBox]::new()
+        $c.Style              = $comboStyle
+        $c.ItemContainerStyle = $comboItemStyle
+        $c.Height             = 34
+        $c.Margin             = [System.Windows.Thickness]::new(0, 0, 0, 12)
+        foreach ($opt in $Options) {
+            $item = [System.Windows.Controls.ComboBoxItem]::new()
+            $item.Content = $opt.Label
+            $item.Tag     = $opt.Value
+            $null = $c.Items.Add($item)
+            if ($opt.Value -eq $SelectedValue) { $c.SelectedItem = $item }
+        }
+        if ($null -eq $c.SelectedItem) { $c.SelectedIndex = 0 }
+        return $c
+    }
+
+    $existingProfile = Get-DATEnvironmentProfile
+    $rangeOptions = @(
+        @{ Label = 'Prefer not to say'; Value = '' }
+        @{ Label = '1 - 250';           Value = '1-250' }
+        @{ Label = '251 - 500';         Value = '251-500' }
+        @{ Label = '501 - 1,000';       Value = '501-1000' }
+        @{ Label = '1,001 - 5,000';     Value = '1001-5000' }
+        @{ Label = '5,001 - 10,000';    Value = '5001-10000' }
+        @{ Label = '10,001 - 25,000';   Value = '10001-25000' }
+        @{ Label = '25,001 - 50,000';   Value = '25001-50000' }
+        @{ Label = '50,001 - 100,000';  Value = '50001-100000' }
+        @{ Label = '100,001 - 150,000'; Value = '100001-150000' }
+        @{ Label = '150,000+';          Value = '150000+' }
+    )
+    $platformOptions = @(
+        @{ Label = 'Prefer not to say';     Value = '' }
+        @{ Label = 'Intune';                Value = 'Intune' }
+        @{ Label = 'Configuration Manager'; Value = 'ConfigMgr' }
+        @{ Label = 'Co-Managed';            Value = 'CoManaged' }
+        @{ Label = 'Standalone';            Value = 'Standalone' }
+    )
+
+    $panel.Children.Add((New-ModalComboLabel -Text 'Approximate device count')) | Out-Null
+    $cmbRange = New-ModalCombo -Options $rangeOptions -SelectedValue $existingProfile.DeviceCountRange
+    $panel.Children.Add($cmbRange) | Out-Null
+
+    $panel.Children.Add((New-ModalComboLabel -Text 'Primary management platform')) | Out-Null
+    $cmbPlatform = New-ModalCombo -Options $platformOptions -SelectedValue $existingProfile.ManagementPlatform
+    $panel.Children.Add($cmbPlatform) | Out-Null
+
     # Helper: build a rounded button with explicit colours (modal has no resource dictionary)
     function New-ModalButton {
         param([string]$Label, [string]$IconChar, [string]$BgColor, [string]$BgHover, [string]$FgColor)
@@ -23321,7 +24107,7 @@ function Show-DATTelemetryConsentModal {
     $col0 = [System.Windows.Controls.ColumnDefinition]::new(); $col0.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
     $col1 = [System.Windows.Controls.ColumnDefinition]::new(); $col1.Width = [System.Windows.GridLength]::new(16)
     $col2 = [System.Windows.Controls.ColumnDefinition]::new(); $col2.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
-    $btnGrid.ColumnDefinitions.Add($col0); $btnGrid.ColumnDefinitions.Add($col1); $btnGrid.ColumnDefinitions.Add($col2)
+    [void]$btnGrid.ColumnDefinitions.Add($col0); [void]$btnGrid.ColumnDefinitions.Add($col1); [void]$btnGrid.ColumnDefinitions.Add($col2)
 
     # Opt-Out button (secondary)
     $btnOptOut = New-ModalButton -Label 'No Thanks' -IconChar ([string][char]0xE711) `
@@ -23343,20 +24129,35 @@ function Show-DATTelemetryConsentModal {
     $dlg.Content   = $wrapper
 
     $btnOptIn.Add_Click({
+        # Persist the optional environment profile (harmless if left as defaults)
+        $selRange    = if ($cmbRange.SelectedItem)    { [string]$cmbRange.SelectedItem.Tag }    else { '' }
+        $selPlatform = if ($cmbPlatform.SelectedItem) { [string]$cmbPlatform.SelectedItem.Tag } else { '' }
+        Set-DATEnvironmentProfile -DeviceCountRange $selRange -ManagementPlatform $selPlatform
         # Opt in -- generate GUID if needed then set the toggle on
         $chk_TelemetryOptOut.IsChecked = $true   # fires Add_Checked which handles all state
         Write-DATActivityLog 'Telemetry: User opted in via consent modal' -Level Info
+        $dlg.Tag = 'Confirmed'   # signals the caller a choice was made
         $dlg.Close()
     })
 
     $btnOptOut.Add_Click({
+        # Still persist any environment profile the user selected -- it is only
+        # ever transmitted when telemetry is enabled, so this is safe when opted out.
+        $selRange    = if ($cmbRange.SelectedItem)    { [string]$cmbRange.SelectedItem.Tag }    else { '' }
+        $selPlatform = if ($cmbPlatform.SelectedItem) { [string]$cmbPlatform.SelectedItem.Tag } else { '' }
+        Set-DATEnvironmentProfile -DeviceCountRange $selRange -ManagementPlatform $selPlatform
         Set-DATRegistryValue -Name 'TelemetryOptOut' -Value 0 -Type DWord
         $chk_TelemetryOptOut.IsChecked = $false
         Write-DATActivityLog 'Telemetry: User opted out via consent modal' -Level Info
+        $dlg.Tag = 'Confirmed'   # signals the caller a choice was made
         $dlg.Close()
     })
 
-    $dlg.ShowDialog() | Out-Null
+    # Returns $true only when the user explicitly clicked Opt In or No Thanks.
+    # If the dialog is dismissed any other way (e.g. Alt+F4), $dlg.Tag stays unset
+    # so the caller will re-prompt on the next launch.
+    $null = $dlg.ShowDialog()
+    return ($dlg.Tag -eq 'Confirmed')
 }
 
 #region EULA Agreement
@@ -23396,7 +24197,13 @@ $btn_AgreeEula.Add_Click({
     # Show telemetry consent modal only if preference not already set
     $existingTelePref = (Get-ItemProperty -Path $global:RegPath -Name "TelemetryOptOut" -ErrorAction SilentlyContinue).TelemetryOptOut
     if ($null -eq $existingTelePref) {
-        Show-DATTelemetryConsentModal
+        $consentConfirmed = Show-DATTelemetryConsentModal
+        # Mark the one-time environment-profile prompt as shown only when the user
+        # actually made a choice. If they dismissed it, the startup forced-prompt
+        # path will re-display it on the next launch.
+        if ($consentConfirmed) {
+            Set-DATRegistryValue -Name "EnvProfilePromptShown" -Value 1 -Type DWord
+        }
     }
 })
 
@@ -23748,6 +24555,18 @@ try {
         }
         Update-DATFilterExample
 
+        # Restore IME toast notification behaviour
+        Write-Host "  IME Toasts    : " -NoNewline -ForegroundColor DarkGray
+        if (-not [string]::IsNullOrEmpty($savedConfig.IMENotifications)) {
+            foreach ($item in $cmb_IMENotifications.Items) {
+                if ($item.Tag -eq $savedConfig.IMENotifications) { $item.IsSelected = $true; break }
+            }
+            Write-Host $savedConfig.IMENotifications -ForegroundColor Cyan
+        } else {
+            Write-Host "showAll (default)" -ForegroundColor DarkYellow
+        }
+        Update-DATIMENotificationsHint
+
         # Restore Package Retention
         Write-Host "  Pkg Retention : " -NoNewline -ForegroundColor DarkGray
         if ($null -ne $savedConfig.PackageRetentionEnabled -and $savedConfig.PackageRetentionEnabled -eq 1) {
@@ -23837,6 +24656,13 @@ try {
             Write-Host "Enabled" -ForegroundColor Green
         } else {
             Write-Host "Disabled" -ForegroundColor DarkYellow
+        }
+        # Audible alarm sound sub-toggle (only meaningful when Critical Notification is enabled).
+        # Defaults to ON when never explicitly saved so existing critical-notification users keep the sound.
+        if ($null -ne $savedConfig.ToastCriticalNotificationSound -and $savedConfig.ToastCriticalNotificationSound -eq 0) {
+            $chk_CriticalNotificationSound.IsChecked = $false
+        } else {
+            $chk_CriticalNotificationSound.IsChecked = $true
         }
         Write-Host "  Toast Deferrals: " -NoNewline -ForegroundColor DarkGray
         if ($null -ne $savedConfig.BIOSMaxDeferralsEnabled -and $savedConfig.BIOSMaxDeferralsEnabled -eq 1) {
@@ -23985,6 +24811,17 @@ try {
         } else {
             $chk_CleanTempOnExit.IsChecked = $true
             Write-Host "Enabled (Default)" -ForegroundColor Green
+        }
+
+        # Restore Download Only extract content behaviour
+        Write-Host "  DL Extract    : " -NoNewline -ForegroundColor DarkGray
+        if ($null -ne $savedConfig.DownloadOnlyExtractContent -and $savedConfig.DownloadOnlyExtractContent -eq 0) {
+            $chk_DownloadOnlyExtractContent.IsChecked = $false
+            Write-Host "Disabled (download files only)" -ForegroundColor DarkYellow
+        } else {
+            # Default ON for new installs
+            $chk_DownloadOnlyExtractContent.IsChecked = $true
+            Write-Host "Enabled (download + extract)" -ForegroundColor Green
         }
 
         # Restore Teams Notifications
@@ -24528,7 +25365,7 @@ if (Test-Path $logoPath) {
 
 # Read version from module manifest
 $manifestPath = Join-Path $AppRoot "Modules\DriverAutomationToolCore\DriverAutomationToolCore.psd1"
-$script:versionString = "v10.1.8"
+$script:versionString = "v10.2.1"
 if (Test-Path $manifestPath) {
     $manifestData = Import-PowerShellDataFile $manifestPath
     $ver = [version]$manifestData.ModuleVersion
@@ -25473,6 +26310,11 @@ $Window.Add_Closing({
                 $shutdownWin.Dispatcher.Invoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{})
 
                 foreach ($item in $tempItems) {
+                    # Preserve the Configuration Manager (Offline) export -- it is a deliverable.
+                    if ($item.PSIsContainer -and $item.Name -eq 'ConfigMgr Offline') {
+                        Write-DATLogEntry -Value "Cleanup: Preserved offline export folder - $($item.FullName)" -Severity 1
+                        continue
+                    }
                     try {
                         $itemName = $item.Name
                         $itemType = if ($item.PSIsContainer) { 'folder' } else { 'file' }
@@ -25505,6 +26347,47 @@ $Window.Add_ContentRendered({
         Set-DATActiveView -ViewName 'view_About' -NavButtonName 'nav_About'
         $txt_EulaWarning.Visibility = 'Visible'
         Write-DATActivityLog "EULA not accepted -- navigated to About page on startup" -Level Warn
+    }
+
+    # One-time Bug Notice modal (Intune BIOS update fixes in 10.1.9)
+    try {
+        Show-DATBugNoticeModal
+    } catch {
+        Write-DATActivityLog "Bug notice modal failed to display: $($_.Exception.Message)" -Level Warn
+    }
+
+    # Telemetry consent / environment-profile modal. Forced once for every user
+    # who has already accepted the EULA. This covers upgraders who were never
+    # asked about telemetry, and gives existing (already opted-in or opted-out)
+    # users a one-time opportunity to provide the optional environment profile
+    # (device count / management platform). The EnvProfilePromptShown marker
+    # guarantees it is only ever forced a single time.
+    try {
+        if ($eulaAtStartup -eq "True") {
+            $envPromptShown = (Get-ItemProperty -Path $global:RegPath -Name "EnvProfilePromptShown" -ErrorAction SilentlyContinue).EnvProfilePromptShown
+            if ($envPromptShown -ne 1) {
+                $consentConfirmed = Show-DATTelemetryConsentModal
+                if ($consentConfirmed) {
+                    Set-DATRegistryValue -Name "EnvProfilePromptShown" -Value 1 -Type DWord
+                    Write-DATActivityLog "Telemetry/environment-profile consent modal confirmed (one-time forced prompt)" -Level Info
+                    # The Common Settings dropdowns were pre-selected from the registry during
+                    # window setup, before this modal ran. Re-sync them from the values the modal
+                    # just saved so they no longer show defaults until a relaunch (and so a later
+                    # SelectionChanged does not overwrite the freshly saved profile with defaults).
+                    if ($null -ne $cmb_DeviceCountRange -and $null -ne $cmb_ManagementPlatform) {
+                        $envProfilePostModal = Get-DATEnvironmentProfile
+                        $rangeSelPost = $cmb_DeviceCountRange.Items | Where-Object { [string]$_.Tag -eq $envProfilePostModal.DeviceCountRange } | Select-Object -First 1
+                        if ($null -ne $rangeSelPost) { $cmb_DeviceCountRange.SelectedItem = $rangeSelPost }
+                        $platSelPost = $cmb_ManagementPlatform.Items | Where-Object { [string]$_.Tag -eq $envProfilePostModal.ManagementPlatform } | Select-Object -First 1
+                        if ($null -ne $platSelPost) { $cmb_ManagementPlatform.SelectedItem = $platSelPost }
+                    }
+                } else {
+                    Write-DATActivityLog "Telemetry/environment-profile consent modal dismissed without a choice -- will re-prompt next launch" -Level Warn
+                }
+            }
+        }
+    } catch {
+        Write-DATActivityLog "Telemetry consent modal failed to display: $($_.Exception.Message)" -Level Warn
     }
 
     # Connectivity check on startup with progress overlay
